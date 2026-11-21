@@ -267,7 +267,12 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
+        first = [True]
+
         def chunk(delta, finish=None, extra=None):
+            if first[0]:   # the role goes with the first text: a chunk sent before the prompt is read looks like the first token
+                first[0] = False   # to a client that times it (llama-benchy's prompt speed came out near zero)
+                delta = {"role": "assistant", **delta}
             obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "hy4-flash-iq3xxs",
                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             if extra:
@@ -275,7 +280,6 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
             self.wfile.flush()
 
-        chunk({"role": "assistant", "content": ""})
         sp = Splitter(eff in ("high", "max"))
 
         def send(parts):

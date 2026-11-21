@@ -27,6 +27,9 @@ bash engine-hy4/run.sh /data/hy4         # OpenAI-compatible API on http://127.0
 python3 engine-hy4/bench.py              # on a freshly started engine: our numbers below
 ```
 
+With more than two P100, `run.sh` takes two from different CPUs by itself; `--gpu 1,2` names them (as nvidia-smi numbers
+them), and `run.sh /data/hy4 --check` prints the cards and slots it would use without starting anything.
+
 If you already have the files: `HY4_TRUNK=/path/Hy4-flash-IQ3_XXS-00001-of-00002.gguf
 HY4_ENGRAM=/path/Hy4-flash-Q3_K_M-EIQ4_NL-00002-of-00002.gguf bash engine-hy4/setup.sh /data/hy4` links them instead of
 downloading (and still checks their SHA-256).
@@ -125,6 +128,11 @@ the one before it (`bench_dec` on random data, the same answers on our prompts).
 
 - `reasoning_effort` `high` or `max` (top level or in `chat_template_kwargs`) turns thinking on; anything else is no_think.
 - **Greedy only** (temperature and sampling are ignored), **one request at a time**, `usage` and llama-server-style `timings`.
+  The last stream chunk's `timings` (`prompt_per_second`, `predicted_per_second`) are the engine's own clocks. The time to
+  the first chunk also holds `llama-tokenize` and the template.
+- **The first stream chunk carries the role together with the first text** (since 21 Nov). Before, a chunk with only the
+  role went out before the prompt was read, so a benchmark that times the first chunk (a user's llama-benchy) got a
+  meaningless prompt speed.
 - `"lookup": N` in the request sets the drafted tokens for that request (0 = off).
 - Tokenizing goes through llama.cpp's `llama-tokenize` (one process a request); the chat template is the GGUF's.
 
@@ -171,6 +179,14 @@ Environment variables of the engine; all are off or at the measured default.
 
 - **Linux x86-64**, **two Tesla P100 16 GB (PCIe)**, ideally each on a Gen3 x16 link. Other cards are untested (the build is
   sm_60 and sizes its cache for 16 GB).
+- **Both cards free of other work.** `--ctx 65536 --slots 7700` and `--ctx 32768 --slots 8100` fill a 16 GB P100. On a user's
+  machine a desktop held about 1 GiB of the first card, and the engine stopped with "out of memory" after a minute of
+  loading. Since 21 Nov, `run.sh` takes VRAM that other processes hold off the slots and says so; 1 GiB costs about 770
+  slots, and fewer slots mean more copies while writing.
+- **With more than two cards, one card per CPU.** Two cards behind one PCIe switch share its link to memory, and writing
+  waits on expert copies (see Speed). On that user's machine with four P100:
+  - Hy4 wrote 21.6 tok/s on two cards behind one switch.
+  - On the same machine, Flash-Next on the main engine went from 45 tok/s on such a pair to 58 tok/s with one card per CPU.
 - **96 GB of RAM:** 53 GiB of experts are pinned, and the Engram table (33 GiB) is read once into the page cache after
   loading (`HY4_PREREAD=0` skips that). We ran it with the table in `/dev/shm`; from an SSD with less RAM it has not been
   measured.

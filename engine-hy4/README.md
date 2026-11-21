@@ -7,7 +7,7 @@ Our own engine for Hy4 flash, not a patch of `engine/`. The story, the numbers, 
 |---|---|
 | `build.sh` | builds `build/hy4_v1` (the engine), `build/bench_dec` and `build/bench_bw` for sm_60 with nvcc |
 | `setup.sh DATA` | the model from Xylolabs/Hy4-flash-GGUF (pinned revision, SHA-256), a Python venv, the GGUF's chat template, llama.cpp's `llama-tokenize` (PR #32517's commit, CPU) |
-| `run.sh DATA` | the engine on a Unix socket plus the OpenAI-compatible wrapper on port 8080 |
+| `run.sh DATA` | the engine on a Unix socket plus the OpenAI-compatible wrapper on port 8080; `--gpu A,B` the two P100, `--check` the cards and slots it would use (VRAM other processes hold comes off the slots) |
 | `bench.py [URL]` | fresh writing, two edits and a long read through the API, as in docs/HY4.md |
 | `src/hy4_v1.cu` | model loading, the two-card engine (writing path, LRU, the socket server) |
 | `src/hy4_kern.cuh` | the first version's kernels: IQ3_XXS and Q8 GEMVs, norms, iHC, attention, Engram, the cross-card sums |
