@@ -7,10 +7,15 @@ with tool calls and pictures. Fresh writing 56.6 tok/s (78.8 with drafts), edits
 **256k** (KV f16) or **512k** (KV int8 past 32k, the first 32k bit for bit as 256k, same speed); llama.cpp on the same cards:
 13.0 / 143. The full write-up: [docs/INKLING2.md](../docs/INKLING2.md).
 
+**Two Tesla M40 24 GB** (sm_52) run the same sources: `build.sh --m40`, and the 24 GB cards hold `512k-f16` (every KV row in
+f16, 19.14 GiB a card); 38.4 tok/s writing, 429 tok/s reading 37.6k, checked against the same references:
+[docs/INKLING2-M40.md](../docs/INKLING2-M40.md).
+
 ```bash
 bash engine-inkling2/build.sh                 # build/ink2_v1, build/ink2_vis + llama-tokenize (CPU)
+bash engine-inkling2/build.sh --m40           # the same for two Tesla M40 24 GB (sm_52)
 bash engine-inkling2/setup.sh /data/inkling2  # model 17.6 GB + drafter 0.4 GB + projector 0.64 GB (--no-pictures: without), a venv
-bash engine-inkling2/run.sh /data/inkling2 [CTX=32768|256k|512k] [PORT=8080]
+bash engine-inkling2/run.sh /data/inkling2 [CTX=32768|256k|512k|512k-f16] [PORT=8080]   # 512k-f16: 24 GB cards only
 python3 engine-inkling2/tools/bench.py http://127.0.0.1:8080
 python3 engine-inkling2/tools/picture_check.py http://127.0.0.1:8080
 ```

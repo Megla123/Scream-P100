@@ -1,5 +1,6 @@
 #!/bin/bash
-# engine-inkling2/build.sh: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60) and,
+# engine-inkling2/build.sh [--m40]: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60;
+# with --m40 for two Tesla M40 24 GB, sm_52: the same sources, docs/INKLING2-M40.md) and,
 # from llama.cpp at commit 690b87d on the CPU (no CUDA in that build): llama-tokenize and gguf-py for the server's tokenizer,
 # libmtmd for build/ink2_vis, the picture encoder (the vision projector runs on the CPU; the cards are full of the engine).
 # Needs CUDA 12.x (nvcc, cuBLAS), a host compiler nvcc accepts (CUDA 12.4: g++ <= 13; set HOST_CXX=g++-13 if your default is
@@ -9,8 +10,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 H=$(pwd); B=$H/build; mkdir -p "$B"
 HOST_CXX=${HOST_CXX:-g++}
-echo "== ink2_v1 (nvcc, host compiler $HOST_CXX)"
-(cd src && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -o "$B/ink2_v1" ink2_v1.cu gguf_min.cpp -lcublas)
+ARCH=sm_60; [ "${1:-}" = --m40 ] && ARCH=sm_52
+echo "== ink2_v1 (nvcc $ARCH, host compiler $HOST_CXX)"
+(cd src && nvcc -O2 -std=c++17 -arch=$ARCH -ccbin "$HOST_CXX" -o "$B/ink2_v1" ink2_v1.cu gguf_min.cpp -lcublas)
 LC=690b87d; LB=$B/llama.cpp
 if [ ! -f "$LB/CMakeLists.txt" ]; then
   echo "== llama.cpp $LC: sources"

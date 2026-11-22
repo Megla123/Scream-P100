@@ -443,7 +443,7 @@ def reply(ids, mx, req, on_part=None, mode="c"):
 
 def engine_lines(req):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(7200)
+    s.settimeout(14400)   # a 500k read takes over an hour on two Tesla M40 (4227 s for 495k; the P100s 3041 s)
     s.connect(A.sock)
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""

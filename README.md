@@ -21,6 +21,10 @@ Inkling 2 Mini (`ink2`, exact): **~79 tok/s writing · 100-127 tok/s edits · ~8
 
 </div>
 
+> 🟢 **This branch (`inkling2-m40`): the same Inkling 2 engine on two Tesla M40 24 GB.** `build.sh --m40`, a 512k context
+> with every KV row in f16, 38.4 tok/s writing and 429 tok/s reading 37.6k on 2015 cards, the answers checked against the
+> P100's references: [docs/INKLING2-M40.md](docs/INKLING2-M40.md).
+
 > 🦑 **New: Inkling 2 Mini on the same two P100s**, with an engine of its own (`ink2`): the whole model in VRAM, every sum
 > exact, 78.8 tok/s writing with its DSpark drafter, ~800 tok/s reading, up to 256k context; llama.cpp did 13 / 143 on the
 > same cards. On branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2): [what it is and how to run it](#-inkling-2-mini-an-engine-of-its-own).
