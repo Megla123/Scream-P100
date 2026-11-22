@@ -1,5 +1,7 @@
 # Inkling 2 Mini on two Tesla M40 24 GB
 
+![Inkling 2 Mini on two Tesla M40 24 GB, 22 Nov 2026](inkling2-m40-scream.jpg)
+
 The `ink2` engine of [docs/INKLING2.md](INKLING2.md) also runs on two **Tesla M40 24 GB** (Maxwell, sm_52, 2015). The
 sources are the same, byte for byte, as the P100 build (p19e); only the compile target changes (`build.sh --m40`). Measured on
 22 Nov 2026 on our second server: HPE DL380 Gen10, 2× Tesla M40 24 GB, each on its own PCIe 3.0 x16 link, app clock
