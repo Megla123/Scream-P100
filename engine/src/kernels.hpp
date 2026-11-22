@@ -290,6 +290,8 @@ struct RouteTail {
     void* dev = nullptr;
     size_t gu_bytes = 0, dn_bytes = 0;
     const unsigned* keep = nullptr;   // FNX_EXPERT_MASK (maska_patch.py): the layer's kept experts, a bit each (null: every one)
+    int* cpu = nullptr;               // FNX_CPU_EXPERTS (cpu_patch.py): the plan's misses for the card's socket, [0] how many
+    int cpu_max = 0, cpu_nmax = 0;
 };
 void router_route(const uint16_t* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,

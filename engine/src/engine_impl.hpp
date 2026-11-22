@@ -34,6 +34,8 @@ struct CardBuf {
     cudaEvent_t fork, join;
     cudaStream_t st3 = nullptr;       // FNX_P100_OVERLAP: the missing experts' copy, beside the row kernels
     void* dma = nullptr;              // FNX_P100_DMA: the copy engine's thread for them instead (p100_dma.cuh)
+    void* cpu = nullptr;              // FNX_CPU_EXPERTS (cpu_patch.py): the socket's workers (cpu_moe.cu)
+    int* cpu_list = nullptr;          // their list from the router's plan
     cudaEvent_t fork2 = nullptr, join2 = nullptr;
     float *R, *mixed, *bo_a, *bo_f, *inj_a, *inj_f, *hcs;
     float* cvec = nullptr;            // FNX_CVEC: NL x N directions (Engine::cvec_), null without a vector

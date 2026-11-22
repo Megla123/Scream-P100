@@ -290,6 +290,7 @@ __global__ void __launch_bounds__(BT) k_moe_rows(RowArgs a) {
             }
         }
     }
+    if (__ldg(&J->n) == 0) return;   // cpu_patch.py: a job of the card's socket (FNX_CPU_EXPERTS)
     const Tabs t = a.t;
     stage_tabs<TY>(t, tab, tid, BT);
     __syncthreads();

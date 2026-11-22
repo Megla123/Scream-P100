@@ -2,6 +2,7 @@
 #include "engine_parts.hpp"
 #include "env.hpp"
 #include "p100_over.hpp"
+#include "cpu_moe.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -480,6 +481,7 @@ Engine::~Engine() {
     for (CardBuf* b : cb_) {
         cudaSetDevice(b->dev);
         cudaDeviceSynchronize();
+        if (b->cpu) cpu_moe_stop(b->cpu), b->cpu = nullptr;   // cpu_patch.py
         if (b->dma) p100_dma_stop(b->dma), b->dma = nullptr;
         for (auto* slots : {&b->win_graphs, &b->mtp_graphs, &b->batch_graphs})
             for (CardBuf::GraphSlot& s : *slots)

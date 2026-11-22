@@ -21,8 +21,10 @@ template <int T> constexpr int rr_rows() { return RR_THREADS / 32 / RR_WPR * rr_
 // slot of the layer's pool that the pool's CLOCK hand reaches first with ref 0 (a ref 1 it passes drops to 0), its old
 // expert pointing back at RAM. The hand goes round the pool's slots past its lent ones. list: how many took a slot,
 // then their ids
-__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
+__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list, int* cpu = nullptr, int cpu_max = 0,
+                           int cpu_nmax = 0) {
     const int lane = threadIdx.x & 31, base = layer * NEXP, p = ec.pool_of[layer], lent = ec.lent[p];
+    if (cpu && lane == 0) cpu[0] = 0;   // cpu_patch.py
     // an arena's pools hold every expert until it lends, and then only its own pool's experts can be missing
     if (ec.arena_full && (p != ec.arena_pool || lent == 0)) {
         if (lane == 0) list[0] = 0;
@@ -70,14 +72,54 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
         // victim's bookkeeping (split41: the same victims, refs, hand and lists as one miss at a time, which waited on a few
         // dependent loads of lane 0 a miss)
         __shared__ int mlist[MAXT * TOPK];
+        __shared__ int mjob[MAXT * TOPK];   // cpu_patch.py: each miss's job
         int m = 0;
         for (int j0 = 0; j0 < nj; j0 += 32) {
             const bool mi = j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] < 0;
             const unsigned miss = __ballot_sync(0xffffffffu, mi);
-            if (mi) mlist[m + __popc(miss & ((1u << lane) - 1u))] = base + jobs[j0 + lane].w;
+            if (mi) {
+                const int at = m + __popc(miss & ((1u << lane) - 1u));
+                mlist[at] = base + jobs[j0 + lane].w;
+                mjob[at] = j0 + lane;
+            }
             m += __popc(miss);
         }
         __syncwarp();
+        // FNX_CPU_EXPERTS (cpu_patch.py): the misses of 1, 2, ... cpu_nmax rows (job order within each) go to the card's socket, at most
+        // cpu_max; they take no slot (their tables keep pointing at RAM, their jobs get 0 rows in k_cpu_pub), the rest go on as before
+        if (cpu && cpu_max > 0 && m > 0) {
+            int c = 0;
+            for (int want = 1; want <= cpu_nmax && c < cpu_max; ++want)
+                for (int i0 = 0; i0 < m && c < cpu_max; i0 += 32) {
+                    const int i = i0 + lane;
+                    const bool pick = i < m && mjob[i] >= 0 && jobs[mjob[i]].n == want;
+                    const unsigned b = __ballot_sync(0xffffffffu, pick);
+                    const int r = __popc(b & ((1u << lane) - 1u));
+                    __syncwarp();
+                    if (pick && c + r < cpu_max) {
+                        cpu[1 + c + r] = mjob[i];
+                        mjob[i] = -1;
+                    }
+                    c = min(cpu_max, c + __popc(b));
+                    __syncwarp();
+                }
+            if (c > 0) {
+                int k2 = 0;
+                for (int i0 = 0; i0 < m; i0 += 32) {
+                    const int i = i0 + lane;
+                    const bool keep = i < m && mjob[i] >= 0;
+                    const int g = keep ? mlist[i] : 0;
+                    const unsigned b = __ballot_sync(0xffffffffu, keep);
+                    __syncwarp();
+                    if (keep) mlist[k2 + __popc(b & ((1u << lane) - 1u))] = g;
+                    k2 += __popc(b);
+                    __syncwarp();
+                }
+                m = k2;
+                if (lane == 0) cpu[0] = c;
+            }
+            __syncwarp();
+        }
         while (k < m) {
             const int idx = s0 + (hand + lane) % n;
             const unsigned char r = ec.ref[idx];
@@ -149,7 +191,8 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
             }
         }
     }
-    for (int j = lane; j < nj; j += 32) ec.ref[ec.slot_of[base + jobs[j].w]] = 1;
+    for (int j = lane; j < nj; j += 32)
+        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 1;   // cpu_patch.py: the CPU's have none
     if (lane == 0) {
         ec.hand[p] = s0 + hand;
         list[0] = k;
@@ -463,7 +506,7 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const uint16_t* __r
     if (rr_t && e == 0) rr_tt[rr_tn & 4095u][3] = rr_now();
     if (!ec.n_slots) return;
     __syncthreads();
-    if (warp == 0) cache_plan(gu, nj, layer, ec, list);
+    if (warp == 0) cache_plan(gu, nj, layer, ec, list, rt.cpu, rt.cpu_max, rt.cpu_nmax);
     if (rr_t && e == 0) rr_tt[rr_tn & 4095u][4] = rr_now();
     if (!rt.box) return;
     // FNX_FOLD 1: the list to the copy engine (k_dma_publish) and the listed experts' jobs marked (k_jobs_split), launches of their own before

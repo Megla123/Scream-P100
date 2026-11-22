@@ -6,6 +6,7 @@
 #include "env.hpp"
 #include "peer_probe.hpp"
 #include "p100_over.hpp"
+#include "cpu_moe.hpp"
 
 #include <cuda_runtime.h>
 #include <sys/mman.h>
@@ -219,6 +220,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             ck(cudaStreamCreateWithFlags(&b->st3, cudaStreamNonBlocking), "stream");
             own_stream(b->st3);
             if (p100_dma_on()) b->dma = p100_dma_start(b->dev);
+            if (b->dma && cpu_moe_on()) b->cpu = cpu_moe_start(b->dev, c);   // cpu_patch.py
             ck(cudaEventCreateWithFlags(&b->fork2, cudaEventDisableTiming), "event");
             own_event(b->fork2);
             ck(cudaEventCreateWithFlags(&b->join2, cudaEventDisableTiming), "event");
@@ -278,6 +280,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             ck(cudaMemcpy(b->dense[T], &j, sizeof j, cudaMemcpyHostToDevice), "dense job");
         }
         if (w.ec.n_slots) b->cache_list = dalloc<int>(1 + P);
+        if (b->cpu) b->cpu_list = dalloc<int>(1 + CPU_JOBS);   // cpu_patch.py
         b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
         b->part = dalloc<float>((size_t) (P + MAXT) * N);
         if (p100_rows_on()) {
@@ -1635,6 +1638,9 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     if (b.ekeep && lyr >= 0 && lyr < NL) rt.keep = b.ekeep + (size_t) lyr * (NEXP / 32);   // FNX_EXPERT_MASK (maska_patch.py)
     if (over && dma && (fold & 1)) rt.box = p100_dma_box(b.dma), rt.dev = p100_dma_dev(b.dma), rt.gu_bytes = L.gu_e_stride, rt.dn_bytes = L.down_e_stride;
     if (over && (fold & 2) && !lat) rt.xh = b.xh16;
+    // FNX_CPU_EXPERTS (cpu_patch.py): the plan gives the card's socket its share of the misses
+    const bool cpu_go = b.cpu && b.cpu_list && over && dma && !lat && !sh_in && T >= cpu_moe_min_t() && lyr >= 0 && lyr < NL;
+    if (cpu_go) rt.cpu = b.cpu_list, rt.cpu_max = cpu_moe_max(), rt.cpu_nmax = cpu_moe_nmax();
     prof_mark(b, PK_ROUTER);
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
                  lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, &rt);
@@ -1674,6 +1680,9 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         // first the experts that stayed in VRAM, while the copy runs; then wait for it, and the copied ones
         if (lat) lat_in();
         else if (!rt.xh) p100_f32_f16(b.mixed, (size_t) T * N, b.xh16, b.st);
+        if (cpu_go)   // cpu_patch.py: the socket's jobs and the window's f16 rows to its mailbox, their jobs to 0 rows
+            cpu_moe_publish(b.cpu, b.jobs_gu, b.jobs_dn, b.njobs, b.cpu_list, w.ec, lyr, b.xh16, T, (int) L.gu_e.type, (int) L.down_e.type, ffs,
+                            L.gu_e.row_bytes, L.down_e.row_bytes, b.st);
         // FNX_NOC_FILE split (IDEJE 31): the copier sends gate|up parts first, so gate|up waits for those only and down for the rest
         const bool split = dma && noc_mode().split;
         const bool split2 = dma && noc_mode().split == 2;   // perexp_patch.py: phase 2's blocks wait for their own expert's part
@@ -1747,6 +1756,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     if (memo_stat_ && &b == cb_[0] && lyr >= 0 && lyr < NL && cache_live() && b.memo_guess)   // memo_patch.py: the counts of fnx: noc
         memo_stat(b.topi, b.memo_guess, b.memo_probe, b.cache_list, lyr, T,
                   prefetch_ && T >= prefetch_min_t_ && over && dma && !sh_in && lyr + 1 < NL, b.pf_list, memo_stat_, b.st);
+    if (cpu_go) cpu_moe_land(b.cpu, b.part, b.st);   // cpu_patch.py: the socket's pairs into part before the ring
     prof_mark(b, PK_SUM);
     RingMoe m;
     m.part = b.part;

@@ -64,7 +64,10 @@ endif()
 set(_sp ${CMAKE_CURRENT_SOURCE_DIR})
 set(_sp_engine
     ${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/moe_mma.cu ${_sp}/src/p100_moe.cu ${_sp}/src/engine.cu
-    ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
+    ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp
+    ${_sp}/src/cpu_moe.cu)
+# cpu_patch.py: FNX_CPU_EXPERTS needs ggml's CPU dots, a static libggml-cpu.a and libggml-base.a built for this machine
+set(FNX_CPU_GGML_LIBS "" CACHE STRING "libggml-cpu.a;libggml-base.a for FNX_CPU_EXPERTS (empty: the switch is off)")
 if(_fnx_hip)
   list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp)
 endif()
@@ -118,6 +121,10 @@ foreach(_n ${STRATA_SPLIT_CARDS})
   find_package(Threads REQUIRED)
   find_package(CUDAToolkit REQUIRED)
   target_link_libraries(${_t} PRIVATE CUDA::cublas CUDA::cuda_driver Threads::Threads)
+  if(FNX_CPU_GGML_LIBS)   # cpu_patch.py
+    target_link_libraries(${_t} PRIVATE ${FNX_CPU_GGML_LIBS})
+    target_compile_definitions(${_t} PRIVATE FNX_CPU_GGML=1)
+  endif()
   # libcudart shared: every runtime call the binary can make is then visible to `nm -D --undefined-only` (the no-peer test reads it)
   set_target_properties(${_t} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endforeach()
