@@ -157,6 +157,8 @@ another one ([checkpoints and parked conversations](#conversations-keep-their-pl
 
 ## Attention at depth and two reading chunks at once (p59, p61, PR #15, 26 Nov)
 
+[![Inkling 2 Mini, p59 + p61 + PR #15: reading 981 to 1,031 tok/s at 4k, writing at 240k 33.2 to 38.4 tok/s, the same output, 185 W a card](inkling2-kand9b.jpg)](#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)
+
 `src/` (`build/ink2_v1`) now writes up to **16 % faster at a depth of 240k tokens** and reads **5 % faster** (over 1,000
 tok/s at 4k for the first time on our machine), again with **the same output**: every answer of the 56 prompts below, every
 read's tokens and logits, and every step's logits hashed with drafts at 512k are those of p47-p57 (and of p41). Three changes,
