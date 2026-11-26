@@ -138,7 +138,9 @@ NVFP4 experts with a scale per expert, the last four layers Q8_0, the rest Q8_0 
 [`dspark-Inkling-2-Mini-Q8_0.gguf`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), the model's own MTP drafter, and
 Xylolabs's `mmproj-Inkling-2-Mini-BF16.gguf` (same repository as the model), its vision projector. The
 model is Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini); its license applies to
-the weights.
+the weights. Both GGUFs were renamed on Hugging Face on 22-23 Nov (the same bytes): the model is `Inkling-2-Mini-NVFP4-Lite.gguf`
+there now and the drafter `dspark-Inkling-2-Mini-Q8_0_Old.gguf` (today's `dspark-Inkling-2-Mini-Q8_0.gguf` is another file, which
+this engine was not checked with). `setup.sh` downloads them by those names and keeps the first names in DATA.
 
 The server (`serve/ink2_server.py`) answers `/v1/chat/completions` (streamed or not; the thinking part as
 `reasoning_content`), `/v1/models`, `/health`, `/props`, `/slots`, `/tokenize` and `/apply-template`, so llama-server

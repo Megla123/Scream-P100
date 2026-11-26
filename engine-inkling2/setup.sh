@@ -13,9 +13,11 @@ get() {   # url file sha256
   curl -fL -C - -o "$2" "$1"
   [ "$(sha256sum "$2" | cut -c1-64)" = "$3" ] || { echo "SHA-256 of $2 does not match" >&2; exit 1; }
 }
-get https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-NVFP4-Q8_0.gguf \
+# Both files were renamed on Hugging Face on 22-23 Nov 2026 (the same bytes: the SHA-256 below are the ones of 21 Nov). They
+# keep their first names in DATA, which run.sh uses. Unsloth's dspark-Inkling-2-Mini-Q8_0.gguf of today is another file
+get https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-NVFP4-Lite.gguf \
     Inkling-2-Mini-NVFP4-Q8_0.gguf d4fcaf47c7f3efbbe057bcf2e516076b7a517017308284b2032c92851edfbd37
-get https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/dspark-Inkling-2-Mini-Q8_0.gguf \
+get https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/dspark-Inkling-2-Mini-Q8_0_Old.gguf \
     dspark-Inkling-2-Mini-Q8_0.gguf 2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773
 if [ $PICTURES = 1 ]; then
   get https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF/resolve/main/mmproj-Inkling-2-Mini-BF16.gguf \
