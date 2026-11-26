@@ -155,6 +155,52 @@ local path; checked with one picture a message). Limits: **greedy only** (no sam
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
 
+## One P100: 27 % faster writing, the same bits (26 Nov evening)
+
+`build/ink2_1c` is now built from `src/`, the two-card engine's sources with `-DINK2_NC=1 -DINK2_RING=2048` (they kept every
+one-card path), so today's exact patches (p38-p41, p47-p57, p59, p61) are in the [one-card build](#one-p100-ink2_1c-23-nov)
+too; PR #15's two reading chunks switch themselves off on one card. On top of them, and on in `run.sh` with `INK2_CARDS=1`:
+
+- **p63, cache slots also in the reading path's buffers** (`INK2_1C_SHARE=1`; 0 = the old cache). With one card the reading
+  path keeps 877 MiB (a chunk's rows, the experts' inputs and outputs, the attention's pieces, the staging of RAM experts)
+  that the writing path never touches. 0.79 GiB of slots of the experts' size are cut out of them and given to the layers by
+  the cache's own weights, after each layer's slots in the cache's block. Before a prompt is read, only those slots are emptied
+  (their experts' tables point to RAM again); the cache's own slots keep their experts. On our writing traces the bytes over
+  PCIe a token went from 51.6 to 25.0 MB.
+- **No p34 scratch** (`INK2_1C_SCRATCH_MB=0`; the engine's default stays 256): with the bigger cache a pick seldom finds no free
+  slot; such an expert is then read over PCIe straight from RAM (the same sums), and the 256 MiB go to the experts in VRAM.
+
+Speed on one card (185 W, `tools/bench.py` through the API at CTX 40960, no drafter, plan `data/plan_1c.txt`; each number is
+the mean of the same run on card 0 and on card 1 of our machine, run side by side, each under `numactl` on its own node):
+
+| | fresh writing | the edit | 34,701-token read / writing after it | RAM for experts |
+|---|---|---|---|---|
+| the build of 23 Nov (VRAM margin 400 MiB) | 38.9 | 54.7 | 380 / 31.0 | 5.24 GiB |
+| + today's two-card patches | 41.1 | 60.8 | 381 / 33.5 | 5.24 GiB |
+| + p63 | 47.0 | 72.8 | 380 / 38.2 | 5.24 GiB |
+| **+ margin 150 MiB, no scratch (`run.sh` now)** | **49.4** | **78.9** | 382 / **40.2** | **4.75 GiB** |
+| the same with `INK2_1C_CACHE_MB=3072` | 50.1 | 80.7 | 376 / 40.8 | 6.25 GiB |
+| (lossy) the same with `INK2_LOSSY=1`, 3072 | 54.6 | 95.1 | 391 / 45.1 | 4.35 GiB |
+
+The edit test here repeats the `serve/ink2_server.py` of a clone of 23 Nov, so compare its numbers only inside this table.
+Every written token and every step's logits are the same as the 23 Nov build's (`p38_ab.py`, with drafts: the kodachat prompt
+and 256 tokens, the first 30,000 tokens of a long text and 256 after them, all logits hashed), at a cache of 1536 and of 3072.
+With drafts (MTP 3 + n-grams 15) the 30k text writes 29.7 → 39.1 tok/s.
+
+Tried the same evening and left out:
+- the cache split by the layers' missed counts: on the writing traces, with the engine's real static set, worse than the
+  split by the plan's weights (81.6 against 74.2 MB a token);
+- the copy into the cache on a second stream beside gate_up of the experts already on the card (the same bits): 9 % slower;
+- a ring of 3072 rows (reading chunks of 2,048 tokens): reading 34.7k +16 % (430 tok/s), writing 2-5 % slower; a choice for
+  long prompts, not the default;
+- the drafter on one card: fresh writing +3-5 %, the edit 10-14 % slower, so it stays off;
+- binding the server to the other NUMA node or to none: no difference;
+- (lossy) the RAM experts as 2-bit copies (the cache's slots 44 % smaller): no faster, since the last 4 layers' Q8 experts
+  carry most misses, and the edit broke (78.8 → 50.8: the model no longer copied the file exactly) although the KL of short
+  prompts stayed small (en 1.6e-3, code 5.5e-6).
+
+[![Inkling 2 Mini on one P100, 26 Nov evening: writing 38.9 to 49.4 tok/s, edits 54.7 to 78.9, every token the same](inkling2-1c-p63.jpg)](#one-p100-27--faster-writing-the-same-bits-26-nov-evening)
+
 ## Attention at depth and two reading chunks at once (p59, p61, PR #15, 26 Nov)
 
 [![Inkling 2 Mini, p59 + p61 + PR #15: reading 981 to 1,031 tok/s at 4k, writing at 240k 33.2 to 38.4 tok/s, the same output, 185 W a card](inkling2-kand9b.jpg)](#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)
@@ -581,8 +627,12 @@ totals are lower. The gain from more conversations is the same:
 
 ## One P100 (`ink2_1c`, 23 Nov)
 
-The same engine for **one Tesla P100 16 GB** and as little RAM as it takes: `build/ink2_1c` (from `src-1c/`, built by
-`build.sh`), run with `INK2_CARDS=1 bash engine-inkling2/run.sh DATA [CTX]`. The whole model does not fit on one card (experts
+**Since 26 Nov evening the one-card build is faster with the same bits; see
+[One P100: 27 % faster writing](#one-p100-27--faster-writing-the-same-bits-26-nov-evening). This section describes how it
+works and the numbers of 23 Nov.**
+
+The same engine for **one Tesla P100 16 GB** and as little RAM as it takes: `build/ink2_1c` (from `src/` with `-DINK2_NC=1`
+since 26 Nov, before from `src-1c/`; built by `build.sh`), run with `INK2_CARDS=1 bash engine-inkling2/run.sh DATA [CTX]`. The whole model does not fit on one card (experts
 15.4 GiB, the rest ~3.5 GiB with a 32k context), so the experts that are used most stay in VRAM and the others wait in RAM:
 
 - **Placement:** after everything else is on the card, the experts fill what is left in the order of `data/plan_1c.txt`
@@ -639,8 +689,9 @@ the page cache while loading. With the drafter 6 GB was too little.
 Switches (environment of `run.sh`): `INK2_CARDS=1`, `INK2_LOSSY=1`, `CUDA_VISIBLE_DEVICES` (the card, default 0),
 `INK2_1C_CACHE_MB` (the cache of RAM experts, 1536), `INK2_1C_MARGIN_MB` (VRAM left free, 150), `INK2_1C_PLAN` (the order),
 `INK2_1C_EXP_MB` (at most this much for the static experts), `INK2_1C_STAGE_MB` (64, the reading path's two staging buffers),
-`INK2_1C_SCRATCH_MB` (256, a window's RAM experts beyond the cache), `INK2_RTRACE=FILE` (the writing path's routing, for
-`tools/plan_1c.py`).
+`INK2_1C_SCRATCH_MB` (256 in the engine, 0 in `run.sh` since 26 Nov: a window's RAM experts beyond the cache),
+`INK2_1C_SHARE` (0 in the engine, 1 in `run.sh` since 26 Nov: cache slots also in the reading path's buffers, p63),
+`INK2_RTRACE=FILE` (the writing path's routing, for `tools/plan_1c.py`).
 
 Checked from a clean clone of this branch on our machine (23 Nov, CUDA 12.4, `HOST_CXX=g++-13`, card 0): `build.sh` in 2 min
 (now also `build/ink2_1c`), then `INK2_CARDS=1 run.sh DATA 40960` and the same with `INK2_LOSSY=1`:

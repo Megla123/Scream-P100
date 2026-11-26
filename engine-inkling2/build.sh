@@ -1,6 +1,7 @@
 #!/bin/bash
 # engine-inkling2/build.sh: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60), its
-# one-card build (build/ink2_1c from src-1c/: one P100, the experts that do not fit in VRAM in RAM; run.sh INK2_CARDS=1), the
+# one-card build (build/ink2_1c from src/ with -DINK2_NC=1 since 26 Nov, src-1c/ is the older one-card source: one P100, the
+# experts that do not fit in VRAM in RAM; run.sh INK2_CARDS=1), the
 # two test builds for several conversations at once (build/ink2_tpb from src-tpb/: production's layout with conversation slots
 # and batches; build/ink2_pp from src-pp/: a pipeline, half of the layers on each card; run.sh INK2_MULTI=tpb|pp) and,
 # from llama.cpp at commit 690b87d on the CPU (no CUDA in that build): llama-tokenize and gguf-py for the server's tokenizer,
@@ -16,8 +17,7 @@ HOST_CXX=${HOST_CXX:-g++}
 echo "== ink2_v1 (nvcc, host compiler $HOST_CXX)"
 (cd src && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -o "$B/ink2_v1" ink2_v1.cu gguf_min.cpp -lcublas)
 echo "== ink2_1c (one P100, nvcc, host compiler $HOST_CXX)"
-(cd src-1c && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -DINK2_NC=1 -DINK2_RING=2048 -I../src -o "$B/ink2_1c" ink2_v1.cu \
-  ../src/gguf_min.cpp -lcublas)
+(cd src && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -DINK2_NC=1 -DINK2_RING=2048 -o "$B/ink2_1c" ink2_v1.cu gguf_min.cpp -lcublas)
 echo "== ink2_tpb (several conversations at once: slots and batches, nvcc, host compiler $HOST_CXX)"
 (cd src-tpb && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -I../src -o "$B/ink2_tpb" ink2_tpb.cu ../src/gguf_min.cpp -lcublas -lpthread)
 echo "== ink2_pp (several conversations at once: a pipeline over the two cards, nvcc, host compiler $HOST_CXX)"

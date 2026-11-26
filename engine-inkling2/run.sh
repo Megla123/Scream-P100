@@ -15,7 +15,8 @@
 # a machine with less RAM).
 # One P100 (docs/INKLING2.md "One P100"): INK2_CARDS=1 runs build/ink2_1c on CUDA_VISIBLE_DEVICES (default 0) without the drafter:
 # the experts that fit stay in VRAM in data/plan_1c.txt's order, the rest in RAM (~5 GiB at 32k; checkpoints up to 2048 MiB, no
-# parked conversations), with an on-card cache of RAM experts (INK2_1C_CACHE_MB, 1536). INK2_LOSSY=1 (one card only) requantizes
+# parked conversations), with an on-card cache of RAM experts (INK2_1C_CACHE_MB, 1536; since 26 Nov also slots in the reading
+# path's buffers, INK2_1C_SHARE=1, and no p34 scratch, INK2_1C_SCRATCH_MB=0: the same bits). INK2_LOSSY=1 (one card only) requantizes
 # the last 4 layers' Q8 experts to NVFP4 at load: ~18 % faster writing and ~2 GiB less RAM, but the output changes (see the docs).
 # The context costs the card's room for experts: 32768 is the default, 65536 still runs well; above that writing slows.
 # Several conversations at once (test builds, docs/INKLING2.md "Several conversations at once"): INK2_MULTI=tpb runs build/ink2_tpb
@@ -41,7 +42,8 @@ ENG=$B/ink2_v1; DRAFT=(--mtp "$D/dspark-Inkling-2-Mini-Q8_0.gguf" --draft-vocab 
 if [ "${INK2_CARDS:-2}" = 1 ]; then   # one P100: build/ink2_1c, no drafter (on one card its rejected drafts cost PCIe transfers too)
   ENG=$B/ink2_1c; DRAFT=(); MODE="one card"
   export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} INK2_1C_PLAN=${INK2_1C_PLAN:-$H/data/plan_1c.txt} \
-    INK2_1C_CACHE_MB=${INK2_1C_CACHE_MB:-1536} INK2_1C_MARGIN_MB=${INK2_1C_MARGIN_MB:-150}
+    INK2_1C_CACHE_MB=${INK2_1C_CACHE_MB:-1536} INK2_1C_MARGIN_MB=${INK2_1C_MARGIN_MB:-150} \
+    INK2_1C_SHARE=${INK2_1C_SHARE:-1} INK2_1C_SCRATCH_MB=${INK2_1C_SCRATCH_MB:-0}
   if [ "${INK2_LOSSY:-0}" = 1 ]; then export INK2_1C_Q8_FP4=1; MODE="one card, lossy (last 4 layers NVFP4)"; fi
   [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
 fi

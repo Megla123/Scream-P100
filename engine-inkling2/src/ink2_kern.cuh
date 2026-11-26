@@ -1238,6 +1238,8 @@ struct ECache {
     size_t scr_bytes = 0;
     int* scr_list = nullptr;              // p34: [MAXT * TOPK] this layer's experts the tables point at the scratch for, nscr of them
     int* nscr = nullptr;
+    uint8_t* const* sp = nullptr;         // p63: [S] the slots' addresses (the cache's block, then pieces of the reading path's buffers)
+    int S0 = 0;                           // p63: slots from S0 on lie in the reading path's buffers (emptied before a prompt is read)
 };
 __global__ void k_cache_assign(ECache c, const int* topi, int nj, const unsigned* stamp, const uint8_t** gt, const uint8_t** dt) {
     if (threadIdx.x || blockIdx.x) return;
@@ -1297,8 +1299,8 @@ __global__ void k_cache_assign(ECache c, const int* topi, int nj, const unsigned
         c.exp_of[v] = e;
         c.slot_of[e] = v;
         c.used[v] = st;
-        gt[e] = c.mem + (size_t) v * c.eb;
-        dt[e] = c.mem + (size_t) v * c.eb + c.gb;
+        gt[e] = c.sp[v];   // p63
+        dt[e] = c.sp[v] + c.gb;
         c.fill[2 * nf] = e;
         c.fill[2 * nf + 1] = v;
         ++nf;
@@ -1311,9 +1313,21 @@ __global__ void __launch_bounds__(256) k_cache_fill(ECache c) {   // block (x, j
     if (j >= *c.nfill) return;
     const uint4* src = (const uint4*) c.hb[c.fill[2 * j]];
     const int d = c.fill[2 * j + 1];
-    uint4* dst = (uint4*) (d >= 0 ? c.mem + (size_t) d * c.eb : c.scr + (size_t) (-1 - d) * 16);
+    uint4* dst = (uint4*) (d >= 0 ? c.sp[d] : c.scr + (size_t) (-1 - d) * 16);   // p63
     const size_t n16 = c.eb / 16;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x * blockDim.x) dst[i] = src[i];
+}
+// p63: the slots in the reading path's buffers emptied (their experts' tables back to the RAM bases) before a prompt is read
+__global__ void k_cache_drop(ECache c, const uint8_t** gt, const uint8_t** dt) {
+    for (int s = c.S0 + (int) threadIdx.x; s < c.S; s += blockDim.x) {
+        const int e = c.exp_of[s];
+        if (e < 0) continue;
+        c.slot_of[e] = -1;
+        gt[e] = c.hb[e];
+        dt[e] = c.hb[e] + c.gb;
+        c.exp_of[s] = -1;
+        c.used[s] = 0;
+    }
 }
 
 // planar NVFP4 rows (p4d): a row of NBLK blocks stored as all 32-byte code runs, then all 4-byte scale words (the same 36 bytes a

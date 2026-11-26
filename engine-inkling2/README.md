@@ -8,7 +8,8 @@ card); context
 **256k** (KV f16) or **512k** (KV int8 past 32k, the first 32k bit for bit as 256k, same speed); llama.cpp on the same cards:
 13.0 / 143. A conversation keeps its place: checkpoints and parked conversations in RAM, so a chat's next turn reads only
 its new messages, a 128-token piece in 336 ms (23 Nov). **One P100** (`build/ink2_1c`, `INK2_CARDS=1`): the most used experts in
-VRAM, the rest in RAM with an on-card cache, 40 tok/s fresh writing within 8 GB of RAM (exact) or 48 within 6 GB (`INK2_LOSSY=1`).
+VRAM, the rest in RAM with an on-card cache, 49 tok/s fresh writing since 26 Nov (exact, 40 before; 4.8 GiB of RAM for experts)
+or 48 within 6 GB on 23 Nov (`INK2_LOSSY=1`, output changes).
 **Several chats at once** (test builds `build/ink2_tpb` and `build/ink2_pp`, `INK2_MULTI=tpb|pp`): up to 4-6 conversations
 write together, 121 / 136 tok/s in all with 2 / 4 (`ink2_tpb`, alone bit for bit `ink2_v1`) or 148 / 162-166 with 4 / 6
 (`ink2_pp`, a pipeline), each answer the same as alone.
@@ -28,14 +29,14 @@ python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # wit
 
 | Path | What |
 |---|---|
-| `src/ink2_v1.cu` | the engine: loading and splitting, the writing path, the reading path (2,048-token chunks), drafts, checkpoints and parked conversations, the socket server; since 24 Nov the one-card code (`src-1c/`) built for two cards with p38-p41 (the reading exchange's buffers on each card's NUMA node, `INK2_NUMA`) |
+| `src/ink2_v1.cu` | the engine: loading and splitting, the writing path, the reading path (2,048-token chunks), drafts, checkpoints and parked conversations, the socket server; since 24 Nov the one-card code (`src-1c/`) built for two cards with p38-p41 (the reading exchange's buffers on each card's NUMA node, `INK2_NUMA`); since 26 Nov also `build/ink2_1c` (`-DINK2_NC=1`), with p63 (one card: cache slots in the reading path's buffers, `INK2_1C_SHARE`) |
 | `src/ink2_fuse.cuh` | merged launches of the writing path (the loop controllers, the norms and Q8 matrices), the same bits |
 | `src/ink2_kern.cuh` | writing kernels: Q8 GEMVs, NVFP4 expert rows, attention by KV head, the fused exchange / convolution kernels |
 | `src/ink2_pf.cuh` | reading kernels: NVFP4 and Q8 expert tile GEMMs, convolutions over a chunk, softmax with the relative bias and sink |
 | `src/ink2_dspark.cuh` | the DSpark drafter's kernels (NeoX RoPE, block attention, the Markov head) |
 | `src/ink2_vis.cpp` | the picture encoder: llama.cpp's mtmd (the vision projector) on the CPU, rows to a file |
 | `src/ink2_tok.cpp` | llama.cpp's tokenizer as a process that stays up (the server's `--tok`) |
-| `src-1c/` | the one-card build (`-DINK2_NC=1 -DINK2_RING=2048`, `gguf_min.*` from `src/`): experts placed by a plan, staged reading, the on-card cache of RAM experts, the lossy requantizing |
+| `src-1c/` | the one-card build of 23 Nov (`-DINK2_NC=1 -DINK2_RING=2048`, `gguf_min.*` from `src/`): experts placed by a plan, staged reading, the on-card cache of RAM experts, the lossy requantizing; kept for reference, `build.sh` builds `ink2_1c` from `src/` since 26 Nov |
 | `src-tpb/` | several chats at once in production's layout (`ink2_tpb.cu` over a copy of the engine with `INK2_PP`): conversation slots, batches of up to 4 conversations' writing pieces, reading chunks interleaved with the waiting writers |
 | `src-pp/` | several chats at once as a pipeline (`ink2_pp.cu`, one-card kernels, `-DINK2_RING=2048`): half of the layers on each card, 8 segments a token, a thread and a queue a card, the drafter on card 1 |
 | `src/gguf_min.*` | a small GGUF reader (NVFP4 = type 40) |

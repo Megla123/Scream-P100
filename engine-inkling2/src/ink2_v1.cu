@@ -145,6 +145,8 @@ struct Card {
     __half *kc[NSLOT], *vc[NSLOT];
     KV8 q8[NSLOT];   // p18: the full slots' int8 caches (INK2_KV8); window slots and the f16 mode leave them null
     size_t part_n = 0;   // p18: K.part's floats (the reading path's S shares it in the int8 mode)
+    bool pf_rec = false;   // p63: alloc() records the reading path's allocations (alloc_pf) in pf_regions
+    std::vector<std::pair<uint8_t*, size_t>> pf_regions;
     float *sk[NSLOT], *sv[NSLOT], *sa[NSLOT], *sf[NSLOT];
     // scratch
     float *x0, *cur, *B[MAXB], *prel, *bankS, *bankO, *X3, *MS, *XC[4], *xm, *g64, *gp, *fpp, *NQ, *NK, *NV, *q, *k, *v, *kcv, *vcv, *r,
@@ -253,6 +255,7 @@ struct Engine {
     std::FILE* fdump = nullptr;   // p43: the featdump request's file (card 0 writes every reading chunk's features)
     __half *fd_dev = nullptr, *fd_host = nullptr;
     bool force_pf = false;        // p43: every piece through the reading path
+    bool share1c = NC == 1 && getenv("INK2_1C_SHARE") && atoi(getenv("INK2_1C_SHARE")) != 0;   // p63: cache slots in the reading path's buffers
     float s_invT = 0.0f;               // p36: 1 / temperature of this request (0: greedy)
     unsigned long long s_seed = 0;     // p36: its seed
     int n_past = 0;
@@ -308,6 +311,7 @@ struct Engine {
         CK(cudaMalloc(&p, bytes));
         K.vram += bytes;
         vtag[K.c][vt[K.c]] += bytes;
+        if (K.pf_rec) K.pf_regions.push_back({(uint8_t*) p, bytes});   // p63
         return p;
     }
     float* dev(Card& K, size_t floats) {
@@ -704,22 +708,71 @@ struct Engine {
         std::string slots;
         vt[K.c] = "predpomnilnik";
         uint8_t* scr = scratch > 0 ? (uint8_t*) alloc(K, (size_t) scratch) : nullptr;   // p34
+        std::vector<std::vector<uint8_t*>> shs(NPHYS);   // p63: each layer's slots in the reading path's buffers
+        size_t sh_bytes = 0;
+        if (share1c && mwt > 0) {
+            std::vector<std::pair<size_t, uint8_t*>> rg;   // (bytes left, next free address), 256-byte aligned
+            size_t sh_all = 0;
+            for (auto [p, b] : K.pf_regions) {
+                const size_t a = ((uintptr_t) p + 255) / 256 * 256 - (uintptr_t) p;
+                if (b > a) {
+                    rg.push_back({b - a, p + a});
+                    sh_all += b - a;
+                }
+            }
+            std::vector<int> want(NPHYS, 0), ord;
+            for (int lp = 0; lp < NPHYS; ++lp) {
+                const int s0 = std::min(NE - K.L[lp].nres, (int) ((double) cache * mw[lp] / mwt / (double) expert_bytes(lp)));
+                want[lp] = std::max(0, std::min(NE - K.L[lp].nres - s0, (int) ((double) sh_all * mw[lp] / mwt / (double) expert_bytes(lp))));
+                ord.push_back(lp);
+            }
+            std::sort(ord.begin(), ord.end(), [&](int a, int b) { return expert_bytes(a) > expert_bytes(b); });   // the big slots first
+            for (bool more = true; more;) {   // a slot a layer in turn, so a short buffer list shares out evenly
+                more = false;
+                for (int lp : ord) {
+                    if ((int) shs[lp].size() >= want[lp]) continue;
+                    const size_t eb = expert_bytes(lp), need = (eb + 255) / 256 * 256;
+                    std::sort(rg.begin(), rg.end(), [](auto& a, auto& b) { return a.first < b.first; });   // the tightest piece that fits
+                    auto it = std::find_if(rg.begin(), rg.end(), [&](auto& r) { return r.first >= eb; });
+                    if (it == rg.end()) {
+                        want[lp] = (int) shs[lp].size();
+                        continue;
+                    }
+                    shs[lp].push_back(it->second);
+                    sh_bytes += eb;
+                    const size_t take = std::min(need, it->first);
+                    it->first -= take;
+                    it->second += take;
+                    more = true;
+                }
+            }
+        }
         for (int lp = 0; lp < NPHYS; ++lp) {
             LW& L = K.L[lp];
             ECache& c = L.ec;
             c.eb = expert_bytes(lp);
             c.gb = (size_t) (L.h_dn[0] - L.h_gu[0]);
             c.S = mwt > 0 ? std::min(NE - L.nres, (int) ((double) cache * mw[lp] / mwt / (double) c.eb)) : 0;
-            slots += " " + std::to_string(c.S);
-            if (L.nres == NE) continue;   // p34: a layer with RAM experts gets the assign kernel even with no slot (the scratch)
             c.S = std::max(c.S, 0);
+            c.S0 = c.S;   // p63
+            c.S += (int) shs[lp].size();
+            slots += " " + std::to_string(c.S0) + (shs[lp].empty() ? "" : "+" + std::to_string(shs[lp].size()));
+            if (L.nres == NE) continue;   // p34: a layer with RAM experts gets the assign kernel even with no slot (the scratch)
             c.scr = scr;
             c.scr_bytes = (size_t) std::max(0LL, scratch);
             c.scr_list = (int*) alloc(K, (size_t) MAXT * TOPK * 4);
             c.nscr = (int*) alloc(K, 4);
             CK(cudaMemset(c.nscr, 0, 4));
-            c.mem = c.S ? (uint8_t*) alloc(K, (size_t) c.S * c.eb) : nullptr;
-            cache_bytes += (size_t) c.S * c.eb;
+            c.mem = c.S0 ? (uint8_t*) alloc(K, (size_t) c.S0 * c.eb) : nullptr;
+            cache_bytes += (size_t) c.S0 * c.eb;
+            {   // p63: the slots' addresses
+                std::vector<uint8_t*> a(std::max(c.S, 1), nullptr);
+                for (int s = 0; s < c.S0; ++s) a[s] = c.mem + (size_t) s * c.eb;
+                for (int s = c.S0; s < c.S; ++s) a[s] = shs[lp][s - c.S0];
+                void* d = alloc(K, a.size() * sizeof(void*));
+                CK(cudaMemcpy(d, a.data(), a.size() * sizeof(void*), cudaMemcpyHostToDevice));
+                c.sp = (uint8_t* const*) d;
+            }
             c.slot_of = (int*) alloc(K, NE * 4);
             CK(cudaMemset(c.slot_of, 0xFF, NE * 4));
             c.exp_of = (int*) alloc(K, (size_t) std::max(c.S, 1) * 4);
@@ -740,8 +793,8 @@ struct Engine {
         vt[K.c] = "ostalo";
         const std::string who = NC == 1 ? "ink2_1c" : "ink2_v1: kartica " + std::to_string(K.c);   // p40
         if (NC == 1 || cache_bytes)
-            std::fprintf(stderr, "%s: predpomnilnik strokovnjakov iz RAM-a %.2f GiB, reze po plasteh:%s\n", who.c_str(), cache_bytes / 1073741824.0,
-                         slots.c_str());
+            std::fprintf(stderr, "%s: predpomnilnik strokovnjakov iz RAM-a %.2f GiB (+ %.2f GiB v medpomnilnikih branja, INK2_1C_SHARE), reze po plasteh:%s\n",
+                         who.c_str(), cache_bytes / 1073741824.0, sh_bytes / 1073741824.0, slots.c_str());
         std::string per;
         for (int lp = 0; lp < NPHYS; ++lp) per += " " + std::to_string(K.L[lp].nres);
         std::fprintf(stderr, "%s: strokovnjaki v VRAM %.2f GiB, v RAM-u %.2f GiB (prosto je bilo %.2f GiB, rezerva %lld MiB); po plasteh:%s\n",
@@ -1925,6 +1978,7 @@ struct Engine {
     void alloc_pf(Card& K) {
         CK(cudaSetDevice(K.dev));
         vt[K.c] = "branje";
+        K.pf_rec = share1c;   // p63
         PFB& P = K.P;
         const size_t C = pfc, CN = C * N;
         P.C = pfc;
@@ -2064,6 +2118,7 @@ struct Engine {
         }
         P.h_cnt.resize(NE);
         P.h_offs.resize(NE + 1);
+        K.pf_rec = false;   // p63
     }
     // y[C][rows] = x[C][cols] . W^T, W row-major f32 [rows][cols]
     void sgemm(Card& K, const float* W, int rows, int cols, const float* x, int ldx, float* y, int ldy, int C) {
@@ -2960,8 +3015,18 @@ struct Engine {
     // feeds tokens (windows of MAXT); returns the logits rows of the last window (all its rows when all_rows)
     int feed(const int* ids, int n, bool all_rows) {
         int T = 0;
+        bool dropped = false;   // p63
         for (int i = 0; i < n; i += T) {
             if (!all_rows && (n - i >= pf_min || force_pf)) {   // p3: the reading path, chunks of up to pfc (p43: always while dumping)
+                if (share1c && !dropped) {   // p63: the cache's slots in the reading path's buffers are emptied first
+                    dropped = true;
+                    Card& K = cards[0];
+                    CK(cudaSetDevice(K.dev));
+                    CK(cudaStreamSynchronize(K.st));   // the staging copies (their own stream) overwrite slots only after the last write read them
+                    for (int lp = 0; lp < NPHYS; ++lp)
+                        if (K.L[lp].ec.S > K.L[lp].ec.S0)
+                            k_cache_drop<<<1, 64, 0, K.st>>>(K.L[lp].ec, (const uint8_t**) K.L[lp].gu_t, (const uint8_t**) K.L[lp].dn_t);
+                }
                 T = std::min(pfc, n - i);
                 if (n_past + T > ctx) throw std::runtime_error("context full");
                 for (int t = 0; t < T; ++t) {
