@@ -152,6 +152,8 @@ another one ([checkpoints and parked conversations](#conversations-keep-their-pl
 
 ## Writing faster: the argmax on the cards and less waiting (p47-p57, 26 Nov)
 
+[![Inkling 2 Mini, patches p47-p57: writing 79.9 to 91.6 tok/s at 512k with the same output, 185 W a card](inkling2-patches-185w.jpg)](#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov)
+
 `src/` (`build/ink2_v1`) writes **15 % faster** with drafts and without them, and up to 22 % faster deep into a long context,
 with **the same output as before**: on the 56 prompts below every answer is the same text, reads of 4k / 30k / 128k tokens
 give the same tokens and logits, and with every step's logits hashed (drafts on, 512k) the hashes are p41's. A build of this
