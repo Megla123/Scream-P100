@@ -13,14 +13,23 @@ has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
 "Thinking effort level". One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
-generation. SIGTERM stops the engine too when INK2_ENGINE_PID is set (run.sh does). A reasoning that falls into repeating
-itself word for word (greedy decoding can) is cut after its first copy and the model writes its answer (Loop, reply())."""
+generation, also in a part that streams nothing (a tool call). SIGTERM stops the engine too when INK2_ENGINE_PID is set
+(run.sh does). A reasoning that falls into repeating itself word for word (greedy decoding can) is cut after its first copy
+and the model writes its answer; an answer or a tool call that does so for over 16,000 characters (INK2_LOOP_TEXT) ends the
+reply (Loop, reply()). While a request runs, the log gets a line every minute (INK2_LOG_EVERY).
+A conversation that ends in the same tool call with the same result 3 times (INK2_LOOP_TURNS) gets a system message that
+says so before the model's turn, and the same call written anyway is dropped
+(turn_loop(), chat()). A reasoning whose copies differ only in numbers is cut too (INK2_LOOP_MASK), an answer or a call that
+repeats a paragraph after 3 copies (INK2_LOOP_PAR), and the loop across turns also sees cycles of 2-3 steps and results that
+differ only in numbers (turn_loop2)."""
 import argparse
 import base64
 import codecs
 import hashlib
 import json
 import os
+import re
+import select
 import socket
 import subprocess
 import sys
@@ -77,7 +86,9 @@ T_END = next(i for i, t in SPECIAL.items() if t == "<|end_message|>")
 T_IMGPH = next(i for i, t in SPECIAL.items() if t == "<|unused_200054|>")
 
 LOCK = threading.Lock()
-STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0}
+STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0, "part": "",
+         "t_note": 0.0}
+LOG_EVERY = float(os.environ.get("INK2_LOG_EVERY", "60"))
 
 
 def token_bytes(i):
@@ -342,49 +353,189 @@ def periodic_tail(t, min_p, max_p, min_span, min_copies):
     return None
 
 
+def paragraph_tail(t):
+    """(start, p) when an answer's or a call's tail repeats a paragraph: a block of 200-8,000 characters 3 times or one of
+    48-199 characters 8 times, back to back over 1,500 characters, p the block's own length (a long key finds a multiple of
+    a shorter block); not a block of table rows (a table can repeat a row: the 16,000 rule watches those). Else None."""
+    for min_p, max_p, copies in ((200, 8000, 3), (48, 199, 8)):
+        hit = periodic_tail(t, min_p, max_p, 1500, copies)
+        if hit is None:
+            continue
+        start, p = hit
+        tail = t[start:]
+        p = next((p // k for k in range(p // 8, 1, -1) if p % k == 0 and tail[p // k:] == tail[:-(p // k)]), p)
+        rows = (tail[:p].replace("\\n", "\n") * 2).split("\n")[1:-1]   # a call's JSON has its newlines as \n
+        if not rows or not all(r.lstrip().startswith("|") for r in rows if r.strip()):
+            return start, p
+    return None
+
+
+_MASKED = re.compile(r"\d+|\s+")
+
+
+def masked_tail(t, min_p, max_p, min_span, min_copies):
+    """periodic_tail() on t's last 40,000 characters with every run of digits read as "#" and of white space as " ": a
+    reasoning that goes over the same points again under new numbers (at 131k of context Inkling 2 Mini went over the same 13
+    points of its code as items 16 to 257, 53k characters and no answer). (start, p) in t's own characters, else None."""
+    off = max(0, len(t) - 40000)
+    hit = periodic_tail(re.sub(r"\s+", " ", re.sub(r"\d+", "#", t[off:])), min_p, max_p, min_span, min_copies)
+    if hit is None:
+        return None
+    pos, i = [], off   # pos[k]: where the masked text's character k is in t
+    for x in _MASKED.finditer(t, off):
+        pos.extend(range(i, x.start()))
+        pos.append(x.start())
+        i = x.end()
+    pos.extend(range(i, len(t) + 1))
+    return pos[hit[0]], pos[hit[0] + hit[1]] - pos[hit[0]]
+
+
 class Loop:
     """The engine has no sampler, and a long greedy reasoning can fall into repeating itself word for word (seen on 22 Nov
     after ~20 tool calls: two lines 194 times over and a list 21 times, 84k characters, no answer). Watches
-    the reply's current reasoning part; step() gives how many of the reply's tokens to keep when its tail repeats one block
-    of 32 to 8,000 characters at least 3 times back to back and over 2,000 characters: the reasoning up to the end of the
-    block's first copy."""
+    the reply's current part; step() gives how many of the reply's tokens to keep when its tail repeats one block
+    of 32 to 8,000 characters at least 3 times back to back and over 2,000 characters in a reasoning, at least 4 times and
+    over TEXT_SPAN characters in an answer or a tool call (a table or a file can repeat a row legitimately; 0: not watched):
+    the part up to the end of the block's first copy. A tool call's text (its name, its JSON) is watched as its bytes."""
     MIN_P, MAX_P, MIN_SPAN, MIN_COPIES, EVERY = 32, 8000, 2000, 3, 128
+    TEXT_SPAN, TEXT_COPIES = 16000, 4
+    PAR = 1   # INK2_LOOP_PAR: also a block of >= 200 characters 3 times or of 48-199 8 times, over 1,500 (answers, calls)
+    MASK = 1  # INK2_LOOP_MASK: a reasoning's rule also with its digits masked (masked_tail)
 
     def __init__(self):
         self.mode, self.text, self.ends, self.checked, self.hit = None, "", [], 0, None
 
-    def step(self, mode, evs, n_out):
+    def step(self, mode, evs, n_out, raw=b""):
         if mode != self.mode:
             self.mode, self.text, self.ends, self.checked = mode, "", [(0, n_out - 1)], 0
-        if mode != "r":
+        if mode == "r":
+            span, copies = self.MIN_SPAN, self.MIN_COPIES
+        elif self.TEXT_SPAN > 0:
+            span, copies = self.TEXT_SPAN, self.TEXT_COPIES
+        else:
             return None
-        self.text += "".join(v for k, v in evs if k == "r")
+        self.text += "".join(v for k, v in evs if k == mode) if mode in ("r", "c") else raw.decode("latin-1")
         self.ends.append((len(self.text), n_out))
         if len(self.text) - self.checked < self.EVERY:
             return None
         self.checked = len(self.text)
-        self.hit = periodic_tail(self.text, self.MIN_P, self.MAX_P, self.MIN_SPAN, self.MIN_COPIES)
+        self.hit = None
+        if mode != "r" and self.PAR:   # a repeated paragraph is a loop long before 16,000 characters
+            self.hit = paragraph_tail(self.text)
+        self.hit = self.hit or periodic_tail(self.text, self.MIN_P, self.MAX_P, span, copies)
+        if self.hit is None and mode == "r" and self.MASK:   # a loop whose copies differ only in numbers
+            self.hit = masked_tail(self.text, self.MIN_P, self.MAX_P, span, copies)
         if self.hit is None:
             return None
         upto = self.hit[0] + self.hit[1]
+        if mode == "c" and self.text[upto - 1:upto] != "\n":   # an answer keeps whole lines (the first copy's last)
+            nl = self.text.find("\n", upto, upto + self.hit[1])
+            upto = nl + 1 if nl >= 0 else upto
         return next(k for c, k in reversed(self.ends) if c <= upto)
 
 
 # what closes a looping reasoning before the answer is forced (the reasoning is in English)
 NUDGE = "\n\nI am repeating the same lines. I have enough to answer, so I stop thinking here and write the answer now."
 NUDGE_IDS = []
+Loop.TEXT_SPAN = int(os.environ.get("INK2_LOOP_TEXT", Loop.TEXT_SPAN))
+Loop.PAR = int(os.environ.get("INK2_LOOP_PAR", Loop.PAR))
+Loop.MASK = int(os.environ.get("INK2_LOOP_MASK", Loop.MASK))
+PART = {"r": "the reasoning", "c": "the answer", "tool": "a tool call", "head": "a tool call"}
+# a loop across turns (turn_loop()): the system message before the model's turn (LOOP_MODE s) or the note its reasoning
+# starts with (r), and the text of a reply whose only call was the looping one again (dropped)
+LOOP_TURNS = int(os.environ.get("INK2_LOOP_TURNS", "3"))
+LOOP_CYCLE = int(os.environ.get("INK2_LOOP_CYCLE", "2"))   # a cycle of 2-3 steps repeated so many times
+LOOP_NORM = int(os.environ.get("INK2_LOOP_NORM", "4"))     # the same call so many times, results the same but for digits
+LOOP_SYSTEM2 = ("You have repeated the same tool calls ({what}) {n} times without getting anything new: the results were the "
+                "same each time{why}. You are in a loop. Do not make these calls again. Use the results you already have, change "
+                "the commands to get what is missing, or tell the user what is blocking you.")
+_DIGITS = re.compile(r"\d+")
+LOOP_DROP = int(os.environ.get("INK2_LOOP_DROP", "1"))
+LOOP_MODE = os.environ.get("INK2_LOOP_MODE", "s")   # where the note goes: s a system message, r the reasoning, sr both
+LOOP_SYSTEM = os.environ.get("INK2_LOOP_SYSTEM") or (
+    "You have called {what} with exactly the same arguments {n} times in a row and got the same result each time: you are in a "
+    "loop. Do not make that call again. Use the result you already have, change the command to get what is missing, or tell the "
+    "user what is blocking you.")
+LOOP_NOTE = os.environ.get("INK2_LOOP_NOTE") or (
+    "I have already run {what} with exactly these arguments {n} times in a row, and the result was the same every time. "
+    "Running it again will not tell me anything new. I will use what the result already shows, change the call to get what "
+    "is missing, or tell the user what is blocking me.\n\n")
+LOOP_STOP = ("[ink2_server] I stopped here: I was about to run {what} with the same arguments again ({n} times already, the same "
+             "result each time). Tell me how to go on.")
 
 
-def reply(ids, mx, req, on_part=None, mode="c"):
+def _canon_call(name, args):
+    return str(name), _tojson(args, sort_keys=True, separators=(",", ":"))
+
+
+def turn_loop(messages):
+    """(n, calls) when the conversation ends in n >= LOOP_TURNS steps back to back that are the same: an assistant
+    message's tool calls (name and arguments as canonical JSON, calls in order) and the tool messages after it (their contents,
+    in order); calls = the step's (name, arguments) pairs. Else None (and always when the last message is not a tool result)."""
+    if LOOP_TURNS <= 0 or not messages or messages[-1].get("role") != "tool":
+        return None
+    steps, i = [], len(messages)
+    while i > 0:
+        j = i
+        while j > 0 and messages[j - 1].get("role") == "tool":
+            j -= 1
+        a = messages[j - 1] if 0 < j < i else {}
+        if a.get("role") != "assistant" or not a.get("tool_calls"):
+            break
+        calls = tuple(_canon_call((tc.get("function") or {}).get("name"), _args(tc.get("function") or {})) for tc in a["tool_calls"])
+        res = tuple(m.get("content") if isinstance(m.get("content"), str) else _tojson(m.get("content"), sort_keys=True)
+                    for m in messages[j:i])
+        if steps and (calls, res) != steps[0]:
+            break
+        steps.append((calls, res))
+        i = j - 1
+    if len(steps) >= LOOP_TURNS:
+        return len(steps), steps[0][0]
+    return turn_loop2(messages)
+
+
+def turn_loop2(messages):
+    """(n, calls, why) for a loop turn_loop() does not see: the last LOOP_CYCLE x L steps a cycle of L = 2 or 3 steps with the same
+    calls and results (why ""), or the last >= LOOP_NORM steps the same call whose results differ only in digits (why " but for
+    numbers such as times or ids"); calls = every call of the loop. Else None."""
+    st, i = [], len(messages)
+    while i > 0 and len(st) < 12:
+        j = i
+        while j > 0 and messages[j - 1].get("role") == "tool":
+            j -= 1
+        a = messages[j - 1] if 0 < j < i else {}
+        if a.get("role") != "assistant" or not a.get("tool_calls"):
+            break
+        calls = tuple(_canon_call((tc.get("function") or {}).get("name"), _args(tc.get("function") or {})) for tc in a["tool_calls"])
+        res = tuple(m.get("content") if isinstance(m.get("content"), str) else _tojson(m.get("content"), sort_keys=True)
+                    for m in messages[j:i])
+        st.append((calls, res))
+        i = j - 1
+    for L in (2, 3) if LOOP_CYCLE > 1 else ():
+        need = L * LOOP_CYCLE
+        if len(st) >= need and len(set(st[:L])) == L and all(st[k] == st[k - L] for k in range(L, need)):
+            return need, tuple(dict.fromkeys(c for calls, _ in st[:L] for c in calls)), ""
+    if LOOP_NORM > 1 and len(st) >= LOOP_NORM:
+        key = (st[0][0], tuple(_DIGITS.sub("#", r) for r in st[0][1]))
+        if all((x[0], tuple(_DIGITS.sub("#", r) for r in x[1])) == key for x in st[:LOOP_NORM]):
+            return LOOP_NORM, st[0][0], " but for numbers such as times or ids"
+    return None
+
+
+def reply(ids, mx, req, on_part=None, mode="c", gone=None):
     """The engine's reply to the prompt ids, at most mx tokens: (tokens, totals, stopped). Each token's parts go to
     on_part(kind, val) as they come ("r" reasoning, "c" content, "tool" a call). A loop in the reasoning (Loop) stops
     the engine; the reasoning is kept up to the end of the block's first copy, closed by NUDGE, and the model writes its
     answer (<|end_message|><|message_model|><|content_text|>): the engine reads the kept part again from the prompt's
-    snapshot (from the start when over ~3,000 tokens were written) and goes on. A second loop ends the reply (stopped).
-    mode: the part the prompt ends in ("r" when it ends inside a reasoning)."""
+    snapshot (from the start when over ~3,000 tokens were written) and goes on. A second loop ends the reply (stopped), and
+    so does a loop in the answer (kept up to its first copy) or in a tool call (the call is dropped).
+    mode: the part the prompt ends in ("r" when it ends inside a reasoning). gone() is asked about once a second while
+    the engine writes; True (the client closed its connection) stops the engine with ConnectionResetError, also while
+    the reply is in a part that streams nothing (a tool call)."""
     parts, guard, out = Parts(), Loop(), []
     parts.mode = mode
     tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
+    t_gone = time.time()
     while True:
         t_req, t_first, final, keep = time.time(), None, None, None
         lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1))
@@ -400,16 +551,21 @@ def reply(ids, mx, req, on_part=None, mode="c"):
                         if on_part:
                             for kind, val in evs:
                                 on_part(kind, val)
-                        keep = guard.step(parts.mode, evs, len(out))
+                        raw = b"" if parts.mode in ("r", "c") or t in SPECIAL or t >= len(TOKS) else token_bytes(t)
+                        keep = guard.step(parts.mode, evs, len(out), raw)
                         if keep is not None:
                             break
-                    STATE["n_decoded"] = len(out)
+                    STATE["n_decoded"], STATE["part"] = len(out), parts.mode
                     if keep is not None:
                         break
+                    if gone and time.time() - t_gone >= 1.0:
+                        t_gone = time.time()
+                        if gone():
+                            raise ConnectionResetError("the client left")
                 elif "tokens" in msg:
                     final = msg
         finally:
-            lines.close()   # a cut: the engine stops at its next write
+            lines.close()   # a cut or a client that left: the engine stops at its next write
         if final is not None:
             if tot["cached"] is None:
                 tot["cached"] = final.get("cached", 0)
@@ -425,9 +581,11 @@ def reply(ids, mx, req, on_part=None, mode="c"):
             return out, tot, False
         tot["cuts"] += 1
         start, p = guard.hit
-        print(f"ink2_server: a loop in the reasoning (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
+        print(f"ink2_server: a loop in {PART[guard.mode]} (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
               f"{len(out) - keep} / {len(out)}", file=sys.stderr, flush=True)
         out = out[:keep]
+        if guard.mode != "r":
+            return out, tot, True
         if not NUDGE_IDS:
             NUDGE_IDS.extend(i for i in tokenize(NUDGE) if i not in SPECIAL)
         forced = NUDGE_IDS + [T_END, T_MODEL, T_TEXT]
@@ -479,6 +637,15 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+    def _gone(self):
+        # the request is read, so a connection that reads as ready with nothing in it was closed by the client (as llama-server
+        # checks it); a reply that streams nothing for a while (a tool call, a request without "stream") would not see it otherwise
+        try:
+            ready = select.select([self.connection], [], [], 0)[0]
+            return bool(ready) and not self.connection.recv(1, socket.MSG_PEEK)
+        except (OSError, ValueError):
+            return True
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/health":
@@ -526,6 +693,19 @@ class H(BaseHTTPRequestHandler):
             ids, img_req = place_images(ids, images)
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
+        loop, n_ids = turn_loop(body.get("messages") or []) if tools else None, len(ids)
+        if loop:
+            what = " and ".join(dict.fromkeys(name for name, _ in loop[1]))
+            note = LOOP_NOTE.format(what=what, n=loop[0]) if "r" in LOOP_MODE else ""
+            try:
+                if "s" in LOOP_MODE:
+                    msg = LOOP_SYSTEM.format(what=what, n=loop[0]) if len(loop) == 2 else LOOP_SYSTEM2.format(what=what, n=loop[0], why=loop[2])
+                    ids = ids + tokenize("<|message_system|><|content_text|>" + msg + "<|end_message|>")
+                if note:
+                    ids = ids + [T_MODEL, T_THINK] + [i for i in tokenize(note) if i not in SPECIAL]
+            except Exception as ex:
+                print(f"ink2_server: a loop across turns: the note could not be tokenized ({ex})", file=sys.stderr, flush=True)
+                loop = None
         if len(ids) >= A.ctx - 1:
             return self._send(400, {"error": {"message": f"prompt of {len(ids)} tokens exceeds the context of {A.ctx}", "type": "exceed_context_size_error"}})
         mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
@@ -534,12 +714,30 @@ class H(BaseHTTPRequestHandler):
         req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req}
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
-        if not LOCK.acquire(timeout=3600):
-            return self._send(503, {"error": "busy"})
+        if not LOCK.acquire(blocking=False):
+            print(f"ink2_server: a request of {len(ids)} prompt tokens waits for the one before it", file=sys.stderr, flush=True)
+            if not LOCK.acquire(timeout=3600):
+                return self._send(503, {"error": "busy"})
         try:
-            STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=t0)
+            STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=time.time(), part="", t_note=time.time())
             STATE["requests"] += 1
-            calls, on_part = [], None
+            calls, on_part, said, dropped = [], None, [], [0]
+            if loop:
+                where = {"s": "as a system message", "r": "in the reasoning"}
+                print(f"ink2_server: a loop across turns: {loop[0]} x {what} (the same call, the same result): the note "
+                      f"{' and '.join(where[m] for m in LOOP_MODE if m in where)}", file=sys.stderr, flush=True)
+
+            def looping(val):   # the loop's call written again after the note
+                if not (loop and LOOP_DROP):
+                    return False
+                try:
+                    if _canon_call(val["name"], json.loads(val["arguments"])) not in loop[1]:
+                        return False
+                except ValueError:
+                    return False
+                dropped[0] += 1
+                print(f"ink2_server: a loop across turns: the same {val['name']} call after the note, dropped", file=sys.stderr, flush=True)
+                return True
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -556,6 +754,10 @@ class H(BaseHTTPRequestHandler):
                      "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
 
                 def on_part(kind, val):
+                    if kind == "tool" and looping(val):
+                        return
+                    if kind == "c" and val.strip():
+                        said.append(1)
                     if kind == "tool":
                         call = {"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                                 "function": {"name": val["name"], "arguments": val["arguments"]}}
@@ -565,21 +767,34 @@ class H(BaseHTTPRequestHandler):
                         delta = {"reasoning_content" if kind == "r" else "content": val}
                     sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
                          "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+                if loop and note:
+                    on_part("r", note)
             try:
-                out, tot, stopped = reply(ids, mx, req, on_part)
-            except (BrokenPipeError, ConnectionResetError):
-                return   # the client left: closing the engine's socket stops it at its next write
+                out, tot, stopped = reply(ids, mx, req, on_part, mode="r" if loop and note else "c", gone=self._gone)
+            except (BrokenPipeError, ConnectionResetError):   # closing the engine's socket stopped it at its next write
+                print(f"ink2_server: request: the client left after {STATE['n_decoded']} written tokens ({len(ids)} prompt tokens); "
+                      f"the engine stopped", file=sys.stderr, flush=True)
+                return
             n = len(out)
             STATE["tokens_out"] += n
             w = tot["write_s"] or 1e-9
             if not stream:
-                think, content = [], []
-                for kind, val in Parts().feed(out):
+                think, content, pp = [note] if loop and note else [], [], Parts()
+                pp.mode = "r" if loop and note else "c"
+                for kind, val in pp.feed(out):
+                    if kind == "tool" and looping(val):
+                        continue
                     if kind == "tool":
                         calls.append({"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                                       "function": {"name": val["name"], "arguments": val["arguments"]}})
                     else:
                         (think if kind == "r" else content).append(val)
+            if dropped[0] and not calls:   # the looping call was the reply's only call
+                stop = ("\n\n" if (said if stream else "".join(content).strip()) else "") + LOOP_STOP.format(what=what, n=loop[0])
+                if stream:
+                    on_part("c", stop)
+                else:
+                    content.append(stop)
             finish = "tool_calls" if calls else "stop" if stopped or (out and out[-1] == EOS) else "length"
             timings = {"prompt_n": len(ids) - tot["cached"], "cache_n": tot["cached"], "prompt_ms": 1000 * tot["read_s"],
                        "prompt_per_second": (len(ids) - tot["cached"]) / max(tot["read_s"], 1e-9),
@@ -587,6 +802,8 @@ class H(BaseHTTPRequestHandler):
                        "draft_n": tot["drafted"], "draft_n_accepted": tot["accepted"]}
             if tot["cuts"]:
                 timings["loop_cuts"] = tot["cuts"]
+            if loop:
+                timings["loop_turns"], timings["loop_dropped"] = loop[0], dropped[0]
             usage = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n,
                      "prompt_tokens_details": {"cached_tokens": tot["cached"]}}
             if stream:
@@ -615,6 +832,19 @@ class H(BaseHTTPRequestHandler):
             LOCK.release()
 
 
+def ticker():
+    """A line every LOG_EVERY seconds (INK2_LOG_EVERY, 0: none) while a request runs: a request prints its line only at its
+    end, and a tool call streams nothing until it is whole, so a long read or reply would leave the log silent."""
+    while True:
+        time.sleep(min(5.0, LOG_EVERY))
+        st = STATE
+        if st["busy"] and time.time() - st["t_note"] >= LOG_EVERY:
+            st["t_note"] = time.time()
+            now = f"writing {PART.get(st['part'], 'the reply')}" if st["n_decoded"] else "reading the prompt"
+            print(f"ink2_server: busy for {time.time() - st['t_start']:.0f} s: {st['n_prompt']} prompt tokens, {st['n_decoded']} written, "
+                  f"now {now}", file=sys.stderr, flush=True)
+
+
 def _stop(*_):   # the node stops a profile with SIGTERM to this process: the engine (started by ink2-ovoj.sh) goes with it
     pid = int(os.environ.get("INK2_ENGINE_PID") or 0)
     if pid:
@@ -631,5 +861,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _stop)
     srv = ThreadingHTTPServer((A.host, A.port), H)
     srv.daemon_threads = True
+    if LOG_EVERY > 0:
+        threading.Thread(target=ticker, daemon=True).start()
     print(f"ink2_server: {A.alias} na {A.host}:{A.port}, ctx {A.ctx}, pogon {A.sock}", file=sys.stderr, flush=True)
     srv.serve_forever()

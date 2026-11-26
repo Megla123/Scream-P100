@@ -73,6 +73,28 @@ A needle in the first line of a **495,294-token** prompt was found with `512k-f1
 writing after it 14.3 tok/s; the P100's `512k` took 3,041 s for 496k). The model's full context, 1,048,576, **loads** on the
 24 GB cards, but it was not checked with a full prompt (`run.sh` stops at 524,288).
 
+## Loops (26 Nov)
+
+The engine has no sampler, so a long greedy reply can loop. Since 26 Nov this branch's server has the loop guards of branch
+[`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call),
+ported into its own `serve/ink2_server.py`. The engine is unchanged. That branch's checkpoints and parked conversations need
+its newer engine, so they are not here.
+
+- A reasoning that repeats a block is cut, and the model writes its answer (here since 22 Nov). Now that also holds when the
+  copies differ only in their numbers (`INK2_LOOP_MASK`).
+- An answer or a tool call that repeats a block over 16,000 characters (`INK2_LOOP_TEXT`), or a paragraph 3 times over 1,500
+  (`INK2_LOOP_PAR`), ends after the block's first copy.
+- A coding agent's conversation can end in the same tool call with the same result 3 times (`INK2_LOOP_TURNS`), in a cycle
+  of 2-3 steps twice (`INK2_LOOP_CYCLE`), or in 4 calls whose results differ only in digits (`INK2_LOOP_NORM`). The model
+  then gets a system message that it is looping, and the same call written anyway is dropped (`INK2_LOOP_DROP`).
+- The server checks once a second whether the client left, and stops the engine when it has. While a request runs, the log
+  gets a line every minute (`INK2_LOG_EVERY`).
+
+Each switch is on by default; 0 turns it off. We no longer have the M40 server, so this was checked on the P100 engine of the
+same model: the same requests to this branch's server before and after the change (plain, streamed, tool calls close to a
+loop) gave the same tokens, 6 of 6. A conversation that ended in 3 equal calls got the loop's system message, and
+`tools/loop_check.py` passes. The limits and the tests behind them are in that branch's guide.
+
 ## Notes
 
 - The server waits up to 4 hours for the engine (a 500k read on the M40 takes over an hour).
