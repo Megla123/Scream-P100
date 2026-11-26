@@ -27,8 +27,8 @@ Inkling 2 Mini (`ink2`, exact): **~97 tok/s writing · ~100 tok/s Koda edits · 
 > exact, ~97 tok/s writing with its DSpark drafter (15 % faster since 26 Nov), ~1,030 tok/s reading (5 % faster since 26 Nov, midday), a 256k or a 512k context and pictures; llama.cpp
 > did 13 / 143 on the same cards. **A chat keeps its place:** the next turn reads only its new messages (0.76 s to the first
 > byte instead of ~20 s on a 16k chat), other conversations wait in RAM, and **since 23 Nov such short reads are 18-22 %
-> faster** (128 new tokens in 336 ms instead of 409). **And since 23 Nov on one P100 too** ([`ink2_1c`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov)): 40 tok/s
-> writing exactly within 8 GB of RAM, 48 with a lossy option within 6 GB. **And since 24 Nov several chats at once** (test
+> faster** (128 new tokens in 336 ms instead of 409). **And since 23 Nov on one P100 too** ([`ink2_1c`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-27--faster-writing-the-same-bits-26-nov-evening)): 49 tok/s
+> writing exactly since 26 Nov (40 before), 48 with a lossy option within 6 GB. **And since 24 Nov several chats at once** (test
 > builds [`ink2_tpb` / `ink2_pp`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov)): 121-136 tok/s in all for 2-4 agents, 162-166 for 6,
 > every answer the same as alone. On branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2): [what it is and how to run it](#-inkling-2-mini-an-engine-of-its-own).
 
@@ -229,7 +229,8 @@ such a short read costs less since 23 Nov (64 / 128 / 256 new tokens in 251 / 33
 
 [![Inkling 2 Mini on one Tesla P100](docs/inkling2-1c-scream-p100.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov)
 
-**One P100** (23 Nov, `ink2_1c`, `INK2_CARDS=1 bash engine-inkling2/run.sh DATA`): the same engine on one card. The most used
+**One P100** (23 Nov, `ink2_1c`, `INK2_CARDS=1 bash engine-inkling2/run.sh DATA`; **since 26 Nov 49.4 tok/s fresh writing and
+78.9 on the edit with the same bits**, [details](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-27--faster-writing-the-same-bits-26-nov-evening)): the same engine on one card. The most used
 experts (by a plan from routing traces) fill the VRAM left after everything else, the others wait in RAM, and an on-card
 LRU cache that the card fills itself after each layer's routing holds the RAM experts in use; the reading path copies them
 in groups while it computes. Exact: **40.2 tok/s** fresh writing, 41.1 on an edit, 378 reading a 34.7k prompt, 45 of 45
@@ -330,13 +331,21 @@ settles. What has and has not been tested is in [Known limitations](docs/GUIDE.m
 | [tune/README.md](tune/README.md) | `check.py` and `tune.py`: diagnose and tune your own machine |
 | [Branch `poc-4x-p100`](https://github.com/Megla123/Scream-P100/tree/poc-4x-p100/docs/POC-4X.md) | ⚠️ **Unverified proof of concept**, never run on four cards: a build for four P100 behind one PCIe switch (`build.sh --4x`) |
 | [Branch `m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md) | ⚠️ **Test build** for two Tesla M40 24 GB (sm_52), measured on one machine only: IQ3_XXS, 256k, 32 GB of RAM (`build.sh --m40`) |
-| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, ~97 tok/s writing, ~1,030 tok/s reading, 256k or 512k context, pictures, a chat's next turn in under a second (`engine-inkling2/`); also on **one P100** (`ink2_1c`): 40 tok/s writing within 8 GB of RAM, 48 lossy within 6 GB; **several chats at once** (test builds `ink2_tpb` / `ink2_pp`): 136 tok/s in all with 4 agents, 162-166 with 6 |
+| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, ~97 tok/s writing, ~1,030 tok/s reading, 256k or 512k context, pictures, a chat's next turn in under a second (`engine-inkling2/`); also on **one P100** (`ink2_1c`): 49 tok/s writing exactly (since 26 Nov), 48 lossy within 6 GB; **several chats at once** (test builds `ink2_tpb` / `ink2_pp`): 136 tok/s in all with 4 agents, 162-166 with 6 |
 | [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM, 337 / 442 tok/s reading (`engine-hy4/`) |
 | [NOTICE.md](NOTICE.md) · [docs/PROVENANCE.md](docs/PROVENANCE.md) · [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) | What is ours and what is Strata's, file by file and line by line |
 
 Our scripts and docs refer to sections as *(README, "Section")*. Those sections are now in [docs/GUIDE.md](docs/GUIDE.md).
 
 ## 📰 News
+
+- **26 Nov 2026 (evening):** 🦑 **Inkling 2 Mini on one P100 writes 27 % faster, every token the same** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-27--faster-writing-the-same-bits-26-nov-evening):
+  `build/ink2_1c` is now built from the two-card sources, so today's exact patches are in it, and its cache of RAM experts also
+  gets 0.8 GiB of slots in the reading path's buffers that writing never touches (p63, on in `run.sh`). Fresh writing 38.9 →
+  **49.4 tok/s**, the edit 54.7 → **78.9**, writing after a 34.7k read 31.0 → 40.2, reading unchanged, 0.5 GiB less RAM;
+  measured on both our cards side by side.
+
+  [![Inkling 2 Mini on one P100: writing 38.9 to 49.4 tok/s, edits 54.7 to 78.9, every token the same](docs/inkling2-1c-p63.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-27--faster-writing-the-same-bits-26-nov-evening)
 
 - **26 Nov 2026 (afternoon):** 🦑 **Inkling 2 Mini's server breaks a loop across turns** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call):
   when a coding agent's conversation ends in the same tool call with the same result 3 times (`INK2_LOOP_TURNS`), the
