@@ -24,7 +24,9 @@ With --tok the tokenizer is build/ink2_tok, started once and kept (llama-tokeniz
 and a conversation's next request tokenizes only its new pieces (Tokens). The token offsets where the prompt's messages
 start go to the engine with every request: it keeps checkpoints there, so a request that parts from the conversation in
 the middle (a chat client moving a note from the last message to the new one, a shortened history) reads only from the
-latest checkpoint before that place."""
+latest checkpoint before that place. A conversation that ends in the same tool call with the same result 3 times
+(INK2_LOOP_TURNS) gets a system message that says so before the model's turn, and the same call written anyway is dropped
+(turn_loop(), chat())."""
 import argparse
 import base64
 import codecs
@@ -96,7 +98,8 @@ STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start"
 # /metrics' counters since the start, summed from every finished request's timings (llama-server's names): prompt tokens read
 # (not the ones from the conversation cache: checkpoints, parked conversations), their seconds, the cached ones, the written
 # tokens' seconds, drafted and accepted draft tokens. STATE's tokens_out is llamacpp:tokens_predicted_total
-TOTALS = {"prompt_tokens": 0, "prompt_seconds": 0.0, "cached_tokens": 0, "predicted_seconds": 0.0, "drafted": 0, "accepted": 0}
+TOTALS = {"prompt_tokens": 0, "prompt_seconds": 0.0, "cached_tokens": 0, "predicted_seconds": 0.0, "drafted": 0, "accepted": 0,
+          "turn_loops": 0, "loop_drops": 0}
 TOTALS_MUTEX = threading.Lock()
 METRICS = [   # name, type, help, value
     ("requests_processing", "gauge", "Number of requests processing.", lambda: 1 if STATE["busy"] else 0),
@@ -108,6 +111,10 @@ METRICS = [   # name, type, help, value
     ("tokens_predicted_seconds_total", "counter", "Predict process time.", lambda: round(TOTALS["predicted_seconds"], 6)),
     ("n_drafted_total", "counter", "Number of draft tokens.", lambda: TOTALS["drafted"]),
     ("n_drafted_accepted_total", "counter", "Number of accepted draft tokens.", lambda: TOTALS["accepted"]),
+    ("loop_turns_total", "counter", "Requests that ended in the same tool call with the same result INK2_LOOP_TURNS times.",
+     lambda: TOTALS["turn_loops"]),
+    ("loop_calls_dropped_total", "counter", "Looping tool calls the model wrote again after the note, dropped.",
+     lambda: TOTALS["loop_drops"]),
 ]
 LOG_EVERY = float(os.environ.get("INK2_LOG_EVERY", "60"))
 
@@ -519,6 +526,51 @@ NUDGE = "\n\nI am repeating the same lines. I have enough to answer, so I stop t
 NUDGE_IDS = []
 Loop.TEXT_SPAN = int(os.environ.get("INK2_LOOP_TEXT", Loop.TEXT_SPAN))
 PART = {"r": "the reasoning", "c": "the answer", "tool": "a tool call", "head": "a tool call"}
+# a loop across turns (turn_loop()): the system message before the model's turn (LOOP_MODE s) or the note its reasoning
+# starts with (r), and the text of a reply whose only call was the looping one again (dropped)
+LOOP_TURNS = int(os.environ.get("INK2_LOOP_TURNS", "3"))
+LOOP_DROP = int(os.environ.get("INK2_LOOP_DROP", "1"))
+LOOP_MODE = os.environ.get("INK2_LOOP_MODE", "s")   # where the note goes: s a system message, r the reasoning, sr both
+LOOP_SYSTEM = os.environ.get("INK2_LOOP_SYSTEM") or (
+    "You have called {what} with exactly the same arguments {n} times in a row and got the same result each time: you are in a "
+    "loop. Do not make that call again. Use the result you already have, change the command to get what is missing, or tell the "
+    "user what is blocking you.")
+LOOP_NOTE = os.environ.get("INK2_LOOP_NOTE") or (
+    "I have already run {what} with exactly these arguments {n} times in a row, and the result was the same every time. "
+    "Running it again will not tell me anything new. I will use what the result already shows, change the call to get what "
+    "is missing, or tell the user what is blocking me.\n\n")
+LOOP_STOP = ("[ink2_server] I stopped here: I was about to run {what} with the same arguments again ({n} times already, the same "
+             "result each time). Tell me how to go on.")
+
+
+def _canon_call(name, args):
+    return str(name), _tojson(args, sort_keys=True, separators=(",", ":"))
+
+
+def turn_loop(messages):
+    """(n, calls) when the conversation ends in n >= LOOP_TURNS steps back to back that are the same: an assistant
+    message's tool calls (name and arguments as canonical JSON, calls in order) and the tool messages after it (their contents,
+    in order); calls = the step's (name, arguments) pairs. Else None (and always when the last message is not a tool result)."""
+    if LOOP_TURNS <= 0 or not messages or messages[-1].get("role") != "tool":
+        return None
+    steps, i = [], len(messages)
+    while i > 0:
+        j = i
+        while j > 0 and messages[j - 1].get("role") == "tool":
+            j -= 1
+        a = messages[j - 1] if 0 < j < i else {}
+        if a.get("role") != "assistant" or not a.get("tool_calls"):
+            break
+        calls = tuple(_canon_call((tc.get("function") or {}).get("name"), _args(tc.get("function") or {})) for tc in a["tool_calls"])
+        res = tuple(m.get("content") if isinstance(m.get("content"), str) else _tojson(m.get("content"), sort_keys=True)
+                    for m in messages[j:i])
+        if steps and (calls, res) != steps[0]:
+            break
+        steps.append((calls, res))
+        i = j - 1
+    if len(steps) < LOOP_TURNS:
+        return None
+    return len(steps), steps[0][0]
 
 
 def reply(ids, mx, req, on_part=None, mode="c", gone=None):
@@ -696,13 +748,25 @@ class H(BaseHTTPRequestHandler):
             ids, img_req = place_images(ids, images, starts)
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
+        loop, n_ids = turn_loop(body.get("messages") or []) if tools else None, len(ids)
+        if loop:
+            what = " and ".join(dict.fromkeys(name for name, _ in loop[1]))
+            note = LOOP_NOTE.format(what=what, n=loop[0]) if "r" in LOOP_MODE else ""
+            try:
+                if "s" in LOOP_MODE:
+                    ids = ids + tokenize("<|message_system|><|content_text|>" + LOOP_SYSTEM.format(what=what, n=loop[0]) + "<|end_message|>")
+                if note:
+                    ids = ids + [T_MODEL, T_THINK] + [i for i in tokenize(note) if i not in SPECIAL]
+            except Exception as ex:
+                print(f"ink2_server: a loop across turns: the note could not be tokenized ({ex})", file=sys.stderr, flush=True)
+                loop = None
         if len(ids) >= A.ctx - 1:
             return self._send(400, {"error": {"message": f"prompt of {len(ids)} tokens exceeds the context of {A.ctx}", "type": "exceed_context_size_error"}})
         mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
         mx = max(1, min(mx, A.ctx - len(ids) - 1))
         stream = bool(body.get("stream"))
         req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req,
-               "ckpt": [x for x in starts if x < len(ids) - 8][-4096:]}   # p42: not the answer's own head (n - 1 is checkpointed)
+               "ckpt": [x for x in starts if x < n_ids - 8][-4096:]}   # p42: not the answer's own head (n - 1 is checkpointed)
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
         if not LOCK.acquire(blocking=False):
@@ -712,7 +776,25 @@ class H(BaseHTTPRequestHandler):
         try:
             STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=time.time(), part="", t_note=time.time())
             STATE["requests"] += 1
-            calls, on_part = [], None
+            calls, on_part, said, dropped = [], None, [], [0]
+            if loop:
+                where = {"s": "as a system message", "r": "in the reasoning"}
+                print(f"ink2_server: a loop across turns: {loop[0]} x {what} (the same call, the same result): the note "
+                      f"{' and '.join(where[m] for m in LOOP_MODE if m in where)}", file=sys.stderr, flush=True)
+                with TOTALS_MUTEX:
+                    TOTALS["turn_loops"] += 1
+
+            def looping(val):   # the loop's call written again after the note
+                if not (loop and LOOP_DROP):
+                    return False
+                try:
+                    if _canon_call(val["name"], json.loads(val["arguments"])) not in loop[1]:
+                        return False
+                except ValueError:
+                    return False
+                dropped[0] += 1
+                print(f"ink2_server: a loop across turns: the same {val['name']} call after the note, dropped", file=sys.stderr, flush=True)
+                return True
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -729,6 +811,10 @@ class H(BaseHTTPRequestHandler):
                      "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
 
                 def on_part(kind, val):
+                    if kind == "tool" and looping(val):
+                        return
+                    if kind == "c" and val.strip():
+                        said.append(1)
                     if kind == "tool":
                         call = {"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                                 "function": {"name": val["name"], "arguments": val["arguments"]}}
@@ -738,8 +824,10 @@ class H(BaseHTTPRequestHandler):
                         delta = {"reasoning_content" if kind == "r" else "content": val}
                     sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
                          "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+                if loop and note:
+                    on_part("r", note)
             try:
-                out, tot, stopped = reply(ids, mx, req, on_part, gone=self._gone)
+                out, tot, stopped = reply(ids, mx, req, on_part, mode="r" if loop and note else "c", gone=self._gone)
             except (BrokenPipeError, ConnectionResetError):   # closing the engine's socket stopped it at its next write
                 print(f"ink2_server: request: the client left after {STATE['n_decoded']} written tokens ({len(ids)} prompt tokens); "
                       f"the engine stopped", file=sys.stderr, flush=True)
@@ -750,13 +838,22 @@ class H(BaseHTTPRequestHandler):
             print(f"ink2_server: request: prompt tokens / cached / back to checkpoint / checkpoints, tokenize / read / written / write {len(ids)} / {tot['cached']} / {tot.get('back')} / {tot.get('ckpts')}, "
                   f"{1000 * t_tok:.0f} ms / {tot['read_s']:.2f} s / {n} / {w:.2f} s", file=sys.stderr, flush=True)
             if not stream:
-                think, content = [], []
-                for kind, val in Parts().feed(out):
+                think, content, pp = [note] if loop and note else [], [], Parts()
+                pp.mode = "r" if loop and note else "c"
+                for kind, val in pp.feed(out):
+                    if kind == "tool" and looping(val):
+                        continue
                     if kind == "tool":
                         calls.append({"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                                       "function": {"name": val["name"], "arguments": val["arguments"]}})
                     else:
                         (think if kind == "r" else content).append(val)
+            if dropped[0] and not calls:   # the looping call was the reply's only call
+                stop = ("\n\n" if (said if stream else "".join(content).strip()) else "") + LOOP_STOP.format(what=what, n=loop[0])
+                if stream:
+                    on_part("c", stop)
+                else:
+                    content.append(stop)
             finish = "tool_calls" if calls else "stop" if stopped or (out and out[-1] == EOS) else "length"
             timings = {"prompt_n": len(ids) - tot["cached"], "cache_n": tot["cached"], "prompt_ms": 1000 * tot["read_s"],
                        "prompt_per_second": (len(ids) - tot["cached"]) / max(tot["read_s"], 1e-9),
@@ -764,6 +861,8 @@ class H(BaseHTTPRequestHandler):
                        "draft_n": tot["drafted"], "draft_n_accepted": tot["accepted"]}
             if tot["cuts"]:
                 timings["loop_cuts"] = tot["cuts"]
+            if loop:
+                timings["loop_turns"], timings["loop_dropped"] = loop[0], dropped[0]
             with TOTALS_MUTEX:   # /metrics
                 TOTALS["prompt_tokens"] += timings["prompt_n"]
                 TOTALS["prompt_seconds"] += timings["prompt_ms"] / 1000
@@ -771,6 +870,7 @@ class H(BaseHTTPRequestHandler):
                 TOTALS["predicted_seconds"] += timings["predicted_ms"] / 1000
                 TOTALS["drafted"] += timings["draft_n"]
                 TOTALS["accepted"] += timings["draft_n_accepted"]
+                TOTALS["loop_drops"] += dropped[0]
             usage = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n,
                      "prompt_tokens_details": {"cached_tokens": tot["cached"]}}
             if stream:

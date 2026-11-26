@@ -915,6 +915,40 @@ and not, came back byte for byte as before. A tool call looping in its JSON ende
 `max_tokens` (30,000 tokens, 9.4 s), and a looping answer after 1.9 s. When a client left, the engine stopped 0.1 s later;
 before, it ran on to `max_tokens`. These switches go to the server, so set them before `run.sh`.
 
+**The same tool call again and again (26 Nov).** In a coding agent (OpenCode), the model called one `Select-String` 17
+times in a row. It got the same 10,035-character result every time and wrote the same reasoning, text and call every time,
+until the user wrote that it was going in circles; by then the context had grown from ~100k to 248k tokens. The agent sends
+every earlier step back with its reasoning, so the prompt held N identical copies of one whole step, and greedy decoding
+wrote one more. The guard above watches only one reply, so it could not see this. Since then:
+
+- When a conversation ends in `INK2_LOOP_TURNS` (3; 0 = off) steps back to back with the same tool calls (names and
+  arguments, compared as canonical JSON) and the same results, the server puts a system message after the last result
+  ("You have called bash with exactly the same arguments 3 times in a row and got the same result each time: you are in a
+  loop. Do not make that call again. …"), and the model writes its turn from there. The client never sees that message.
+- If the model writes the same call anyway, the call is dropped (`INK2_LOOP_DROP`, 1; 0 = kept). A reply left without a call
+  ends with "[ink2_server] I stopped here: …", so the agent stops and the user sees why.
+- The log prints "a loop across turns: N x bash", `timings` gets `loop_turns` and `loop_dropped`, and `/metrics` gets
+  `llamacpp:loop_turns_total` and `llamacpp:loop_calls_dropped_total`. Without such a loop the prompt's tokens and the
+  replies stay the same as before.
+
+We rebuilt the real conversation from the agent's database, with the agent's own system prompt and 55 tools taken from one
+request it sent to a catcher. Without the change, that rebuilt request gave the session's own reply bit for bit. With the
+change, at 3, 4 and 10 repeats, the model changed its approach every time ("I'm in a loop. Let me stop calling bash and use
+the edit tool", then an `edit`, a script that replaces the block, or another command).
+
+Two other ideas did not help:
+- A note at the start of the model's own reasoning (`INK2_LOOP_MODE=r`; `s` = the system message, `sr` both) never helped,
+  also with two stronger wordings: the model planned anew, then copied the old text and call.
+- Cutting the repeated call and letting the model go on from a second note gave 16,000 tokens of short reasoning and
+  answer parts that copied the old text. The guard above starts again with each part, so it did not see them.
+
+On all 144 sessions of that agent's database (8,618 steps), the check fires 17 times, each one a real loop (14 in that
+session, the same failing command 3-4 times, a refused command 3 times); the model then wrote the same call again in 15 of
+them. Plain, streamed, tool-call and almost-loop requests (2 repeats, 3 calls with different results, 3 repeats and then a
+user message) give the same tokens as before. When the user really asks for the repetition ("run `date` five times"), the
+model ran `date +%s.%N` after three equal results instead of a fourth plain `date`. `INK2_LOOP_SYSTEM` and `INK2_LOOP_NOTE`
+set other texts (`{what}`: the tools' names, `{n}`: how many times).
+
 ## How it works
 
 - **Split:** query heads 12 + 12 and KV heads 4 + 4 per card; every expert's FF split in half (gate and up rows, down
@@ -962,6 +996,10 @@ and from 26 Nov (p47-p57, each at its old value = the old code, all the same bit
 `INK2_XLL` (1, single-token exchanges as 8-byte words), `INK2_CKSPARE` (1, the spare checkpoint buffer made between requests),
 `INK2_COMB2` (3 since p59, 4 blocks a head or the values ahead in registers; 1 p57's parallel join; 0 `k_attn_comb`), `INK2_R7TPB` / `INK2_R6WPB` (256 / 4, the expert
 kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts).
+Server switches (environment of `serve/ink2_server.py`): `INK2_EFFORT` (0.2 = low), `INK2_OA_MTP` (3), `INK2_OA_LOOKUP`
+(15), `INK2_LOOP_TEXT` (16000), `INK2_LOG_EVERY` (60), and from 26 Nov `INK2_LOOP_TURNS` (3: so many steps back to back with
+the same tool call and the same result get the loop's system message; 0 = off), `INK2_LOOP_DROP` (1) and `INK2_LOOP_MODE`
+(s), see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
