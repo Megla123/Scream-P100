@@ -1000,6 +1000,38 @@ user message) give the same tokens as before. When the user really asks for the 
 model ran `date +%s.%N` after three equal results instead of a fourth plain `date`. `INK2_LOOP_SYSTEM` and `INK2_LOOP_NOTE`
 set other texts (`{what}`: the tools' names, `{n}`: how many times).
 
+**At 125k of context (26 Nov evening).** A user wrote that the loops had become rarer since the last update but came back at
+~125k of context. We found two kinds that the guards above let through:
+
+- In the same agent's database, at 131,901 tokens of context, the reasoning went over the same 13 points of its code again
+  and again, numbered on as items 16 to 257: 53,178 characters, no answer and no call. The reasoning's rule never cut it,
+  since every copy had new numbers.
+- With ~126k tokens of this repository's docs as the prompt and "a reference of every environment variable" asked at low
+  effort with 16,000 tokens to write, the reasoning looped and was cut (122 characters 16.6 times). The answer then ended in
+  154 copies of one line (``- `STRATA_VISION_CUDA` — (see above)``), 5,700 characters, too few for the 16,000-character
+  limit. At high effort the reasoning repeated two lines 57 times and was cut, and that answer ended in 57 copies of a block
+  of six lines ("… — see above."), 11,000 characters.
+
+Since then `serve/ink2_server.py`:
+
+- reads a reasoning a second time with every run of digits as one sign and every run of white space as one space
+  (`INK2_LOOP_MASK`, 1; 0 = off). That 131k reasoning is cut at 13,440 characters, after 3 rounds of the 13 points, and the
+  model writes its answer. Answers and tool calls are not read this way, since a file can be all numbers.
+- cuts an answer or a tool call that repeats a paragraph back to back over 1,500 characters: a block of 200-8,000 characters
+  3 times, or one of 48-199 characters 8 times (`INK2_LOOP_PAR`, 1; 0 = off). The reply keeps the block's first copy, and a
+  block of table rows stays with the 16,000 rule. The answer above is cut at 22,144 characters, with the whole reference up to
+  the first "(see above)".
+- sees two more loops across turns: a cycle of 2 or 3 steps repeated twice with the same results (`INK2_LOOP_CYCLE`, 2; 0 =
+  off), and 4 of the same call in a row whose results differ only in digits, such as times or ids (`INK2_LOOP_NORM`, 4; 0 =
+  off). Their system message names the calls.
+
+On the agent's whole database (144 sessions: 8,171 reasonings, 3,381 answers, 5,960 tool arguments, 8,618 steps), the new
+rules cut only that one reasoning. `tools/loop_check.py` now also checks the numbered review and a looping paragraph.
+On the engine, requests without a loop (plain, streamed, tool calls close to a loop) gave the same tokens as before, 6 of 6.
+The 125k question above, run again through the new server, ended with `finish_reason` "stop" after 13,545 tokens instead of
+running to its 16,000 (22,095 characters of answer, the reference whole). The masked reading costs about 0.13 ms of CPU a
+written token in a 60,000-character reasoning.
+
 ## How it works
 
 - **Split:** query heads 12 + 12 and KV heads 4 + 4 per card; every expert's FF split in half (gate and up rows, down
@@ -1049,8 +1081,9 @@ and from 26 Nov (p47-p57, each at its old value = the old code, all the same bit
 kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts).
 Server switches (environment of `serve/ink2_server.py`): `INK2_EFFORT` (0.2 = low), `INK2_OA_MTP` (3), `INK2_OA_LOOKUP`
 (15), `INK2_LOOP_TEXT` (16000), `INK2_LOG_EVERY` (60), and from 26 Nov `INK2_LOOP_TURNS` (3: so many steps back to back with
-the same tool call and the same result get the loop's system message; 0 = off), `INK2_LOOP_DROP` (1) and `INK2_LOOP_MODE`
-(s), see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call).
+the same tool call and the same result get the loop's system message; 0 = off), `INK2_LOOP_DROP` (1), `INK2_LOOP_MODE`
+(s), and from the evening of 26 Nov `INK2_LOOP_MASK` (1), `INK2_LOOP_PAR` (1), `INK2_LOOP_CYCLE` (2) and `INK2_LOOP_NORM` (4),
+see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 

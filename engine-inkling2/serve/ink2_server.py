@@ -26,7 +26,9 @@ start go to the engine with every request: it keeps checkpoints there, so a requ
 the middle (a chat client moving a note from the last message to the new one, a shortened history) reads only from the
 latest checkpoint before that place. A conversation that ends in the same tool call with the same result 3 times
 (INK2_LOOP_TURNS) gets a system message that says so before the model's turn, and the same call written anyway is dropped
-(turn_loop(), chat())."""
+(turn_loop(), chat()). A reasoning whose copies differ only in numbers is cut too (INK2_LOOP_MASK), an answer or a call that
+repeats a paragraph after 3 copies (INK2_LOOP_PAR), and the loop across turns also sees cycles of 2-3 steps and results that
+differ only in numbers (turn_loop2)."""
 import argparse
 import base64
 import codecs
@@ -487,6 +489,43 @@ def periodic_tail(t, min_p, max_p, min_span, min_copies):
     return None
 
 
+def paragraph_tail(t):
+    """(start, p) when an answer's or a call's tail repeats a paragraph: a block of 200-8,000 characters 3 times or one of
+    48-199 characters 8 times, back to back over 1,500 characters, p the block's own length (a long key finds a multiple of
+    a shorter block); not a block of table rows (a table can repeat a row: the 16,000 rule watches those). Else None."""
+    for min_p, max_p, copies in ((200, 8000, 3), (48, 199, 8)):
+        hit = periodic_tail(t, min_p, max_p, 1500, copies)
+        if hit is None:
+            continue
+        start, p = hit
+        tail = t[start:]
+        p = next((p // k for k in range(p // 8, 1, -1) if p % k == 0 and tail[p // k:] == tail[:-(p // k)]), p)
+        rows = (tail[:p].replace("\\n", "\n") * 2).split("\n")[1:-1]   # a call's JSON has its newlines as \n
+        if not rows or not all(r.lstrip().startswith("|") for r in rows if r.strip()):
+            return start, p
+    return None
+
+
+_MASKED = re.compile(r"\d+|\s+")
+
+
+def masked_tail(t, min_p, max_p, min_span, min_copies):
+    """periodic_tail() on t's last 40,000 characters with every run of digits read as "#" and of white space as " ": a
+    reasoning that goes over the same points again under new numbers (at 131k of context Inkling 2 Mini went over the same 13
+    points of its code as items 16 to 257, 53k characters and no answer). (start, p) in t's own characters, else None."""
+    off = max(0, len(t) - 40000)
+    hit = periodic_tail(re.sub(r"\s+", " ", re.sub(r"\d+", "#", t[off:])), min_p, max_p, min_span, min_copies)
+    if hit is None:
+        return None
+    pos, i = [], off   # pos[k]: where the masked text's character k is in t
+    for x in _MASKED.finditer(t, off):
+        pos.extend(range(i, x.start()))
+        pos.append(x.start())
+        i = x.end()
+    pos.extend(range(i, len(t) + 1))
+    return pos[hit[0]], pos[hit[0] + hit[1]] - pos[hit[0]]
+
+
 class Loop:
     """The engine has no sampler, and a long greedy reasoning can fall into repeating itself word for word (seen on 22 Nov
     after ~20 tool calls: two lines 194 times over and a list 21 times, 84k characters, no answer). Watches
@@ -496,6 +535,8 @@ class Loop:
     the part up to the end of the block's first copy. A tool call's text (its name, its JSON) is watched as its bytes."""
     MIN_P, MAX_P, MIN_SPAN, MIN_COPIES, EVERY = 32, 8000, 2000, 3, 128
     TEXT_SPAN, TEXT_COPIES = 16000, 4
+    PAR = 1   # INK2_LOOP_PAR: also a block of >= 200 characters 3 times or of 48-199 8 times, over 1,500 (answers, calls)
+    MASK = 1  # INK2_LOOP_MASK: a reasoning's rule also with its digits masked (masked_tail)
 
     def __init__(self):
         self.mode, self.text, self.ends, self.checked, self.hit = None, "", [], 0, None
@@ -514,10 +555,18 @@ class Loop:
         if len(self.text) - self.checked < self.EVERY:
             return None
         self.checked = len(self.text)
-        self.hit = periodic_tail(self.text, self.MIN_P, self.MAX_P, span, copies)
+        self.hit = None
+        if mode != "r" and self.PAR:   # a repeated paragraph is a loop long before 16,000 characters
+            self.hit = paragraph_tail(self.text)
+        self.hit = self.hit or periodic_tail(self.text, self.MIN_P, self.MAX_P, span, copies)
+        if self.hit is None and mode == "r" and self.MASK:   # a loop whose copies differ only in numbers
+            self.hit = masked_tail(self.text, self.MIN_P, self.MAX_P, span, copies)
         if self.hit is None:
             return None
         upto = self.hit[0] + self.hit[1]
+        if mode == "c" and self.text[upto - 1:upto] != "\n":   # an answer keeps whole lines (the first copy's last)
+            nl = self.text.find("\n", upto, upto + self.hit[1])
+            upto = nl + 1 if nl >= 0 else upto
         return next(k for c, k in reversed(self.ends) if c <= upto)
 
 
@@ -525,10 +574,18 @@ class Loop:
 NUDGE = "\n\nI am repeating the same lines. I have enough to answer, so I stop thinking here and write the answer now."
 NUDGE_IDS = []
 Loop.TEXT_SPAN = int(os.environ.get("INK2_LOOP_TEXT", Loop.TEXT_SPAN))
+Loop.PAR = int(os.environ.get("INK2_LOOP_PAR", Loop.PAR))
+Loop.MASK = int(os.environ.get("INK2_LOOP_MASK", Loop.MASK))
 PART = {"r": "the reasoning", "c": "the answer", "tool": "a tool call", "head": "a tool call"}
 # a loop across turns (turn_loop()): the system message before the model's turn (LOOP_MODE s) or the note its reasoning
 # starts with (r), and the text of a reply whose only call was the looping one again (dropped)
 LOOP_TURNS = int(os.environ.get("INK2_LOOP_TURNS", "3"))
+LOOP_CYCLE = int(os.environ.get("INK2_LOOP_CYCLE", "2"))   # a cycle of 2-3 steps repeated so many times
+LOOP_NORM = int(os.environ.get("INK2_LOOP_NORM", "4"))     # the same call so many times, results the same but for digits
+LOOP_SYSTEM2 = ("You have repeated the same tool calls ({what}) {n} times without getting anything new: the results were the "
+                "same each time{why}. You are in a loop. Do not make these calls again. Use the results you already have, change "
+                "the commands to get what is missing, or tell the user what is blocking you.")
+_DIGITS = re.compile(r"\d+")
 LOOP_DROP = int(os.environ.get("INK2_LOOP_DROP", "1"))
 LOOP_MODE = os.environ.get("INK2_LOOP_MODE", "s")   # where the note goes: s a system message, r the reasoning, sr both
 LOOP_SYSTEM = os.environ.get("INK2_LOOP_SYSTEM") or (
@@ -568,9 +625,37 @@ def turn_loop(messages):
             break
         steps.append((calls, res))
         i = j - 1
-    if len(steps) < LOOP_TURNS:
-        return None
-    return len(steps), steps[0][0]
+    if len(steps) >= LOOP_TURNS:
+        return len(steps), steps[0][0]
+    return turn_loop2(messages)
+
+
+def turn_loop2(messages):
+    """(n, calls, why) for a loop turn_loop() does not see: the last LOOP_CYCLE x L steps a cycle of L = 2 or 3 steps with the same
+    calls and results (why ""), or the last >= LOOP_NORM steps the same call whose results differ only in digits (why " but for
+    numbers such as times or ids"); calls = every call of the loop. Else None."""
+    st, i = [], len(messages)
+    while i > 0 and len(st) < 12:
+        j = i
+        while j > 0 and messages[j - 1].get("role") == "tool":
+            j -= 1
+        a = messages[j - 1] if 0 < j < i else {}
+        if a.get("role") != "assistant" or not a.get("tool_calls"):
+            break
+        calls = tuple(_canon_call((tc.get("function") or {}).get("name"), _args(tc.get("function") or {})) for tc in a["tool_calls"])
+        res = tuple(m.get("content") if isinstance(m.get("content"), str) else _tojson(m.get("content"), sort_keys=True)
+                    for m in messages[j:i])
+        st.append((calls, res))
+        i = j - 1
+    for L in (2, 3) if LOOP_CYCLE > 1 else ():
+        need = L * LOOP_CYCLE
+        if len(st) >= need and len(set(st[:L])) == L and all(st[k] == st[k - L] for k in range(L, need)):
+            return need, tuple(dict.fromkeys(c for calls, _ in st[:L] for c in calls)), ""
+    if LOOP_NORM > 1 and len(st) >= LOOP_NORM:
+        key = (st[0][0], tuple(_DIGITS.sub("#", r) for r in st[0][1]))
+        if all((x[0], tuple(_DIGITS.sub("#", r) for r in x[1])) == key for x in st[:LOOP_NORM]):
+            return LOOP_NORM, st[0][0], " but for numbers such as times or ids"
+    return None
 
 
 def reply(ids, mx, req, on_part=None, mode="c", gone=None):
@@ -754,7 +839,8 @@ class H(BaseHTTPRequestHandler):
             note = LOOP_NOTE.format(what=what, n=loop[0]) if "r" in LOOP_MODE else ""
             try:
                 if "s" in LOOP_MODE:
-                    ids = ids + tokenize("<|message_system|><|content_text|>" + LOOP_SYSTEM.format(what=what, n=loop[0]) + "<|end_message|>")
+                    msg = LOOP_SYSTEM.format(what=what, n=loop[0]) if len(loop) == 2 else LOOP_SYSTEM2.format(what=what, n=loop[0], why=loop[2])
+                    ids = ids + tokenize("<|message_system|><|content_text|>" + msg + "<|end_message|>")
                 if note:
                     ids = ids + [T_MODEL, T_THINK] + [i for i in tokenize(note) if i not in SPECIAL]
             except Exception as ex:
