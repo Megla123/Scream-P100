@@ -339,6 +339,13 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **26 Nov 2026 (late evening):** 🦑 **Inkling 2 Mini's loop guard holds at 125k of context** on branches [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call)
+  and [`inkling2-m40`](https://github.com/Megla123/Scream-P100/blob/inkling2-m40/docs/INKLING2-M40.md#loops-26-nov): a
+  reasoning that goes over the same points again under new numbers is now cut (`INK2_LOOP_MASK`), and so is an answer or a
+  tool call that repeats a paragraph (`INK2_LOOP_PAR`), long before the old 16,000-character limit; cycles of 2-3 tool calls
+  are seen across turns too. At ~126k tokens of context, an answer that ended in 154 copies of one line now stops after the
+  first; requests without a loop give the same tokens as before. The M40 branch's server gets the same guards.
+
 - **26 Nov 2026 (evening):** 🦑 **Inkling 2 Mini on one P100 writes 27 % faster, every token the same** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-27--faster-writing-the-same-bits-26-nov-evening):
   `build/ink2_1c` is now built from the two-card sources, so today's exact patches are in it, and its cache of RAM experts also
   gets 0.8 GiB of slots in the reading path's buffers that writing never touches (p63, on in `run.sh`). Fresh writing 38.9 →
