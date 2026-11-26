@@ -111,8 +111,26 @@ struct PFB {
     unsigned seq = 1;
 };
 
+// zip (INK2_PF_ZIP): a reading chunk's own buffers and its exchange in flight, for several chunks at once on a card
+struct ZCtx {
+    float *cur, *B[MAXB], *prel, *bankS, *bankO, *ms3 = nullptr, *ab, *MO, *tau, *pfeat = nullptr;   // ms3: chunks 1.. only
+    int* pos = nullptr;
+    int nb = 0;
+    float* hbuf[2] = {};
+    cudaEvent_t evp[PFB::XS_MAX], evd[2][PFB::XS_MAX], evh, evb;
+    unsigned seq = 1;
+    float* py = nullptr;   // the exchange in flight: its rows (ab or MO), their number, its parity, its number
+    int pC = 0, ppar = 0;
+    unsigned psq = 0;
+    bool want = false;     // its slices are on their way to RAM, the other card's are not ordered back yet
+};
+
 struct Card {
     PFB P;
+    static constexpr int ZMAX = 3;
+    ZCtx Z[ZMAX];   // zip
+    int zc = 0;     // zip: the chunk whose buffers P points at
+    int zn = 1;     // zip: chunks at once in this read
     DSW D;   // p6
     float* amv_r = nullptr;   // p47: each written row's argmax on this card (value, index)
     int* ami_r = nullptr;
@@ -197,6 +215,15 @@ struct Engine {
     int pfc = RING >= 4096 ? 2048 : RING - SWA;   // p3: INK2_PF_CHUNK, tokens a reading chunk (p31: RING - SWA with a smaller ring)
     int pf_min = 31;                          // p3: INK2_PF_MIN, shortest piece that goes the reading path (INK2_PF_OFF: never); p23: 41, was MAXT + 1; p27: 31
     std::atomic<unsigned> pf_rec[NC];         // p3: the exchange each card has recorded
+    // zip: INK2_PF_ZIP=n (2 or 3; 0 = off): n consecutive reading chunks at once, their steps taking turns on each card's
+    // stream, so a chunk's exchange crosses PCIe while the other chunks compute. Every launch and cuBLAS call is the same,
+    // chunk by chunk, so the output is the same to the bit. Off by itself when its buffers would push experts to RAM
+    int zip = getenv("INK2_PF_ZIP") ? atoi(getenv("INK2_PF_ZIP")) : 0;
+    std::atomic<unsigned> zrec[Card::ZMAX][NC];   // as pf_rec, for each of the chunks
+    float* h_x0z[Card::ZMAX] = {};                // chunks 1..: rows, positions, tau and raw marks (chunk 0: h_x0, h_pos, h_tau, h_raw)
+    int* h_posz[Card::ZMAX] = {};
+    float* h_tauz[Card::ZMAX] = {};
+    std::vector<char> h_rawz[Card::ZMAX];
     static constexpr int EB = 16, QS = 256;   // p3: experts dequantized at once; queries per attention block
     bool perm_on = getenv("INK2_PERM") ? atoi(getenv("INK2_PERM")) != 0 : false;   // p11: a window's expert jobs by expert (21. 11.: same speed, off)
     int feed_t = getenv("INK2_FEED_T") ? std::max(1, std::min(MAXT, atoi(getenv("INK2_FEED_T")))) : 8;   // p23: 8 rows (16 rows: 239 ms, 8 rows: 56 ms)   // windows of the writing path when reading (test: 1 = token by token)
@@ -967,6 +994,13 @@ struct Engine {
         CK(cudaHostAlloc((void**) &h_pos, (size_t) std::max(MAXT, pfc) * 4, cudaHostAllocPortable));
         CK(cudaHostAlloc((void**) &h_tau, (size_t) std::max(MAXT, pfc) * 4, cudaHostAllocPortable));
         for (int c = 0; c < NC; ++c) pf_rec[c] = 0;
+        for (int z = 0; z < Card::ZMAX; ++z)
+            for (int c = 0; c < NC; ++c) zrec[z][c] = 0;
+        if (zip && !(NC == 2 && xsplit > 1 && pf_min < (1 << 30) && zip > 1)) {
+            std::fprintf(stderr, "ink2_v1: INK2_PF_ZIP off: it takes 2 or 3, two cards, the reading path and INK2_XSPLIT above 1\n");
+            zip = 0;
+        }
+        zip = std::min(zip, (int) Card::ZMAX);
         if (pf_min < (1 << 30)) {
             each_card([&](int c) { alloc_pf(cards[c]); });
         }
@@ -999,6 +1033,35 @@ struct Engine {
             CK(cudaHostAlloc((void**) &h_ami_pinned, NC * 4, cudaHostAllocPortable));
             CK(cudaHostAlloc((void**) &h_prev_pinned, NC * 4, cudaHostAllocPortable));
             ds_on = true;
+        }
+        if (zip) {   // zip: before the experts, which take the VRAM that is left, and only when every expert still fits beside it
+            const long long zb = (long long) (zip - 1) * ((long long) pfc * N * 4 * (ds_on ? 14 : 10) + (long long) pfc * 8);
+            long long spare[NC];
+            each_card([&](int c) { spare[c] = zip_spare(cards[c]); });
+            long long sp = spare[0];
+            for (int c = 1; c < NC; ++c) sp = std::min(sp, spare[c]);
+            if (sp < zb) {
+                std::fprintf(stderr, "ink2_v1: INK2_PF_ZIP off: its %lld MiB a card do not fit beside the experts (%lld MiB to spare)\n", zb >> 20, sp >> 20);
+                zip = 0;
+            } else {
+                for (int z = 1; z < zip; ++z) {
+                    CK(cudaHostAlloc((void**) &h_x0z[z], (size_t) std::max(MAXT, pfc) * N * 4, cudaHostAllocPortable));
+                    CK(cudaHostAlloc((void**) &h_posz[z], (size_t) std::max(MAXT, pfc) * 4, cudaHostAllocPortable));
+                    CK(cudaHostAlloc((void**) &h_tauz[z], (size_t) std::max(MAXT, pfc) * 4, cudaHostAllocPortable));
+                    h_rawz[z].assign((size_t) 1 << 16, 0);
+                }
+                each_card([&](int c) { zip_alloc(cards[c]); });
+                each_card([&](int c) { spare[c] = zip_spare(cards[c]); });   // what the driver really took (it rounds allocations up)
+                long long left = spare[0];
+                for (int c = 1; c < NC; ++c) left = std::min(left, spare[c]);
+                if (left < 0) {
+                    each_card([&](int c) { zip_free(cards[c]); });
+                    std::fprintf(stderr, "ink2_v1: INK2_PF_ZIP off: its buffers took more than the %lld MiB to spare beside the experts\n", sp >> 20);
+                    zip = 0;
+                } else {
+                    std::fprintf(stderr, "ink2_v1: INK2_PF_ZIP %d (reading chunks at once): %lld MiB a card of the %lld to spare beside the experts\n", zip, zb >> 20, sp >> 20);
+                }
+            }
         }
         each_card([&](int c) { place_experts(cards[c]); });   // p30
         if (ck_on) {   // p21
@@ -2036,6 +2099,136 @@ struct Engine {
         const size_t n = (size_t) C * N;
         k_add_ord<<<(unsigned) ((n + 255) / 256), 256, 0, K.st>>>(y, P.tmp, n, c);
     }
+    // zip (INK2_PF_ZIP): chunk 0 keeps the reading path's own buffers, the later chunks get copies of the ones that live across
+    // an exchange (the hidden state and its depth-mix states, the loop's banks and its fourth message, the exchanged rows,
+    // positions, the drafter's features: 14 x a chunk's rows, 252 MiB at 2,048 tokens); everything else is scratch within a
+    // step, and the other card's part of every chunk's exchange comes back into the one P.tmp (zx_recv)
+    long long zip_spare(Card& K) {   // place_experts' rule: the bytes left on the card when every expert stays on it (< 0: they do not)
+        CK(cudaSetDevice(K.dev));
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const long long margin = (getenv("INK2_1C_MARGIN_MB") ? atoll(getenv("INK2_1C_MARGIN_MB")) : NC == 1 ? 400LL : 150LL) << 20;
+        long long budget = (long long) fr - margin - (long long) NPHYS * 2 * NE * 8;
+        if (getenv("INK2_1C_EXP_MB")) budget = std::min(budget, atoll(getenv("INK2_1C_EXP_MB")) << 20);
+        long long all = 0;
+        for (int lp = 0; lp < NPHYS; ++lp) all += (long long) expert_bytes(lp) * NE;
+        return budget - all;
+    }
+    void zip_alloc(Card& K) {
+        PFB& P = K.P;
+        const size_t C = pfc, CN = C * N;
+        CK(cudaSetDevice(K.dev));
+        vt[K.c] = "branje-zip";
+        ZCtx& A = K.Z[0];
+        A.cur = P.cur; A.prel = P.prel; A.bankS = P.bankS; A.bankO = P.bankO; A.ab = P.ab; A.MO = P.MO;
+        A.tau = P.tau; A.pos = P.pos; A.pfeat = K.D.pfeat;
+        for (int i = 0; i < MAXB; ++i) A.B[i] = P.B[i];
+        for (int i = 0; i < 2; ++i) A.hbuf[i] = P.hbuf[i];
+        for (int z = 1; z < zip; ++z) {
+            ZCtx& B = K.Z[z];
+            B.cur = dev(K, CN); B.prel = dev(K, CN); B.bankS = dev(K, CN); B.bankO = dev(K, CN); B.ms3 = dev(K, CN);
+            B.ab = B.MO = dev(K, CN);   // one buffer: ab is used up (the convolution) before the experts' sum is made
+            B.tau = dev(K, C); B.pos = (int*) alloc(K, C * 4);
+            B.pfeat = K.D.pfeat ? dev(K, 4 * CN) : nullptr;
+            for (int i = 0; i < MAXB; ++i) B.B[i] = dev(K, CN);
+            const int numa = getenv("INK2_NUMA") ? atoi(getenv("INK2_NUMA")) : 1;   // p41's placement for these exchange buffers too
+            NodeBind nb(numa == 0 ? -1 : card_node(numa == 2 && NC == 2 ? cards[NC - 1 - K.c].dev : K.dev));
+            for (int i = 0; i < 2; ++i) CK(cudaHostAlloc((void**) &B.hbuf[i], CN * 4, cudaHostAllocPortable));
+        }
+        for (int z = 0; z < zip; ++z) {
+            ZCtx& Z = K.Z[z];
+            for (int j = 0; j < PFB::XS_MAX; ++j) {
+                CK(cudaEventCreateWithFlags(&Z.evp[j], cudaEventDisableTiming));
+                for (int i = 0; i < 2; ++i) CK(cudaEventCreateWithFlags(&Z.evd[i][j], cudaEventDisableTiming));
+            }
+            CK(cudaEventCreateWithFlags(&Z.evh, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&Z.evb, cudaEventDisableTiming));
+        }
+        vt[K.c] = "ostalo";
+    }
+    void zip_free(Card& K) {   // zip_alloc undone (the experts would not all stay on the card beside it)
+        CK(cudaSetDevice(K.dev));
+        const size_t C = pfc, CN = C * N;
+        for (int z = 1; z < zip; ++z) {
+            ZCtx& B = K.Z[z];
+            for (float* q : {B.cur, B.prel, B.bankS, B.bankO, B.ms3, B.ab, B.tau, B.pfeat})
+                if (q) CK(cudaFree(q));
+            CK(cudaFree(B.pos));
+            for (int i = 0; i < MAXB; ++i) CK(cudaFree(B.B[i]));
+            for (int i = 0; i < 2; ++i) CK(cudaFreeHost(B.hbuf[i]));
+            const size_t b = ((B.pfeat ? 14 : 10) * CN + 2 * C) * 4;
+            K.vram -= b;
+            vtag[K.c]["branje-zip"] -= b;
+        }
+    }
+    void zip_load(Card& K, int id) {   // P points at chunk id's buffers
+        PFB& P = K.P;
+        const ZCtx& Z = K.Z[id];
+        P.cur = Z.cur; P.prel = Z.prel; P.bankS = Z.bankS; P.bankO = Z.bankO; P.ab = Z.ab; P.MO = Z.MO;
+        P.tau = Z.tau; P.pos = Z.pos; K.D.pfeat = Z.pfeat;
+        for (int i = 0; i < MAXB; ++i) P.B[i] = Z.B[i];
+        K.nb = Z.nb;
+        K.zc = id;
+    }
+    void zip_save(Card& K) { K.Z[K.zc].nb = K.nb; }
+    // xch_pf2 in three parts for the chunks of a zip. zx_start: the slices of the chunk P points at made and sent to RAM.
+    // zx_recv(id): the other card's slices of chunk id's exchange ordered back into P.tmp, which every chunk uses: it is
+    // called right after a sum (or at a chunk's first step), for the chunk whose sum comes next on the stream, so tmp is
+    // free (evb, recorded here on K.st, is behind the sum before) and the copy runs under the step that follows. zx_add, at
+    // the chunk's next step: wait for them and add
+    template <class F> void zx_start(Card& K, float* y, int C, F make) {
+        PFB& P = K.P;
+        ZCtx& Z = K.Z[K.zc];
+        const int c = K.c, ns = xsplit;
+        const unsigned sq = Z.seq++;
+        const int par = sq & 1;
+        for (int s = 0, r0 = 0; s < ns; ++s) {
+            const int r1 = C * (s + 1) / ns;
+            if (r1 > r0) make(r0, r1);
+            CK(cudaEventRecord(Z.evp[s], K.st));
+            CK(cudaStreamWaitEvent(P.sd, Z.evp[s], 0));
+            if (r1 > r0)
+                CK(cudaMemcpyAsync(Z.hbuf[par] + (size_t) r0 * N, y + (size_t) r0 * N, (size_t) (r1 - r0) * N * 4, cudaMemcpyDeviceToHost, P.sd));
+            CK(cudaEventRecord(Z.evd[par][s], P.sd));
+            r0 = r1;
+        }
+        zrec[K.zc][c].store(sq, std::memory_order_release);
+        Z.py = y;
+        Z.pC = C;
+        Z.ppar = par;
+        Z.psq = sq;
+        Z.want = true;
+    }
+    void zx_recv(Card& K, int id) {
+        PFB& P = K.P;
+        ZCtx& Z = K.Z[id];
+        if (!Z.want) return;
+        Z.want = false;
+        const int c = K.c, ns = xsplit, par = Z.ppar, C = Z.pC;
+        while (zrec[id][1 - c].load(std::memory_order_acquire) < Z.psq) std::this_thread::yield();
+        ZCtx& O = cards[1 - c].Z[id];
+        CK(cudaEventRecord(Z.evb, K.st));
+        CK(cudaStreamWaitEvent(P.sh, Z.evb, 0));
+        for (int s = 0, r0 = 0; s < ns; ++s) {
+            const int r1 = C * (s + 1) / ns;
+            CK(cudaStreamWaitEvent(P.sh, O.evd[par][s], 0));
+            if (r1 > r0)
+                CK(cudaMemcpyAsync(P.tmp + (size_t) r0 * N, O.hbuf[par] + (size_t) r0 * N, (size_t) (r1 - r0) * N * 4, cudaMemcpyHostToDevice, P.sh));
+            r0 = r1;
+        }
+        CK(cudaEventRecord(Z.evh, P.sh));
+    }
+    void zx_add(Card& K) {
+        PFB& P = K.P;
+        ZCtx& Z = K.Z[K.zc];
+        zx_recv(K, K.zc);   // still to order only when no other chunk's step came in between
+        CK(cudaStreamWaitEvent(K.st, Z.evh, 0));
+        CK(cudaStreamWaitEvent(K.st, Z.evd[Z.ppar][xsplit - 1], 0));   // our own slices are out before the sum overwrites y
+        const size_t n = (size_t) Z.pC * N;
+        k_add_ord<<<(unsigned) ((n + 255) / 256), 256, 0, K.st>>>(Z.py, P.tmp, n, K.c);
+        Z.py = nullptr;
+        zx_recv(K, (K.zc + 1) % K.zn);   // the chunk whose sum comes next: its part comes back under this step
+    }
     void moe_comb(Card& K, const LW& L, int r0, int r1) {   // p19d: rows r0 .. r1 - 1 of k_moe_comb
         PFB& P = K.P;
         const size_t o = (size_t) r0 * TOPK;
@@ -2343,10 +2536,14 @@ struct Engine {
             if (!down) k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.fp4 ? L.gu_s : nullptr, situ_b, situ_lb);
         }
     }
-    void layer_pf(Card& K, int p, int slot, bool loop, int p0, int C) {
+    // zip (INK2_PF_ZIP): part -1 = the whole layer; 0 = up to the attention's exchange on its way, 1 = from its sum to the
+    // experts' exchange on its way, 2 = from that sum to the layer's end
+    void layer_pf(Card& K, int p, int slot, bool loop, int p0, int C, int part = -1) {
         const LW& L = K.L[p];
         PFB& P = K.P;
         const size_t CN = (size_t) C * N;
+        auto rmsC = [&](const float* x, const float* w, float* y) { k_rms<<<C, 256, 0, K.st>>>(x, N, w, y, N, N, eps); };
+        if (part <= 0) {
         const float* xin[3] = {P.cur, P.cur, P.cur};
         if (L.attn_rq) {
             mix(K, states_pf(K, P.cur), L.attn_rq, L.nrq, P.X3, C);
@@ -2357,14 +2554,17 @@ struct Engine {
             S.p[0] = P.bankS;
             S.p[1] = P.bankO;
             S.n = 2;
-            mix(K, S, L.msg_q, 4, P.MS, C);
+            // zip: a later chunk's messages go to the experts' scratch (free here; chunk 0's are in P.MS as ever) and the
+            // fourth, which is read after the attention's exchange, from there to the chunk's own ms3
+            float* MS = part >= 0 && K.zc > 0 ? P.Xg : P.MS;
+            mix(K, S, L.msg_q, 4, MS, C);
             for (int j = 0; j < 3; ++j) {
-                control_pf(K, L, j, xin[j], P.MS + j * CN, P.XC[j], C);
+                control_pf(K, L, j, xin[j], MS + j * CN, P.XC[j], C);
                 xin[j] = P.XC[j];
             }
+            if (MS != P.MS) CK(cudaMemcpyAsync(K.Z[K.zc].ms3, MS + 3 * CN, CN * 4, cudaMemcpyDeviceToDevice, K.st));
         }
         const float *nq, *nk, *nv;
-        auto rmsC = [&](const float* x, const float* w, float* y) { k_rms<<<C, 256, 0, K.st>>>(x, N, w, y, N, N, eps); };
         if (!L.full && !loop) {
             rmsC(xin[0], L.attn_norm, P.NQ);
             nq = nk = nv = P.NQ;
@@ -2427,12 +2627,19 @@ struct Engine {
             k_kv_store<<<(C * KVC + 255) / 256, 256, 0, K.st>>>(P.kcv, P.vcv, P.pos, !L.full, K.kc[slot], K.vc[slot], C, K.q8[slot]);
         attn_pf(K, L, slot, p0, C);
         deq8(K, L.wo, P.Wo);
+        if (part == 0) {   // zip: xch_pf2's slices, the sum at the chunk's next step
+            zx_start(K, P.ab, C, [&](int r0, int r1) { sgemm(K, P.Wo, N, QC, P.ao + (size_t) r0 * QC, QC, P.ab + (size_t) r0 * N, N, r1 - r0); });
+            return;
+        }
         if (xsplit > 1) {   // p19d
             xch_pf2(K, P.ab, C, [&](int r0, int r1) { sgemm(K, P.Wo, N, QC, P.ao + (size_t) r0 * QC, QC, P.ab + (size_t) r0 * N, N, r1 - r0); });
         } else {
             sgemm(K, P.Wo, N, QC, P.ao, QC, P.ab, N, C);
             xch_pf(K, P.ab, CN);
         }
+        }   // part <= 0
+        if (part == 1) zx_add(K);
+        if (part < 0 || part == 1) {
         conv_pf(K, P.ab, N, K.sa[slot], L.a_pconv, nullptr, 1, 1.0f / sqrtf(NCONV + 1.0f), P.A, C);
         const int ip = slot < NPHYS ? slot : LS + (slot - NPHYS) % NCORE;
         if (ip % BLK == 0) {
@@ -2444,22 +2651,107 @@ struct Engine {
         mix(K, states_pf(K, P.cur), L.ffn_rq, 1, P.F, C);
         const float* f = P.F;
         if (loop) {
-            control_pf(K, L, 3, P.F, P.MS + 3 * CN, P.F2, C);
+            control_pf(K, L, 3, P.F, part == 1 && K.zc > 0 ? K.Z[K.zc].ms3 : P.MS + 3 * CN, P.F2, C);
             f = P.F2;
         }
         rmsC(f, L.ffn_norm, P.FN);
         sgemm(K, L.gate_inp, NE, N, P.FN, N, P.lg, NE, C);
         k_route<<<C, NE, 0, K.st>>>(P.lg, L.probs_b, wscale, P.topi, P.topw);
+        if (part == 1) {   // zip
+            experts_pf(K, L, C, false);
+            zx_start(K, P.MO, C, [&](int r0, int r1) { moe_comb(K, L, r0, r1); });
+            return;
+        }
         experts_pf(K, L, C, xsplit <= 1);
         if (xsplit > 1)   // p19d
             xch_pf2(K, P.MO, C, [&](int r0, int r1) { moe_comb(K, L, r0, r1); });
         else
             xch_pf(K, P.MO, CN);
+        }   // part < 0 || part == 1
+        if (part == 2) zx_add(K);
         conv_pf(K, P.MO, N, K.sf[slot], L.f_pconv, nullptr, 1, 1.0f / sqrtf(NCONV + 1.0f), P.F2, C);
         k_add<<<(unsigned) ((CN + 255) / 256), 256, 0, K.st>>>(P.cur, P.cur, P.F2, CN);
         if (ds_on && ds_feat_slot(slot) >= 0) ds_feat(K, K.D.pfeat, P.cur, ds_feat_slot(slot), C);   // p6
     }
     // a chunk of C tokens at positions p0.. through both cards; the last row's logits into h_logits when last
+    // zip (INK2_PF_ZIP): pf_card's work for consecutive chunks at once, in steps that end where an exchange is on its way: the
+    // first chunk's step, the next chunk's same step, ... then everyone's next step. A later chunk's layer k comes after the
+    // earlier chunks' layer k (their cache rows and convolution states), and each chunk's own steps keep pf_card's order, so
+    // every value is the one pf_card gives chunk after chunk
+    struct PfRun { int C, p0; bool last; int nprel; const float* hx0; const int* hpos; const float* htau; const char* hraw; };
+    static constexpr int NLAY = LS + NPASS * NCORE + (NPHYS - LE);   // a chunk's layers in order (= NSLOT)
+    static void pf_layer_of(int k, int& p, int& slot, bool& loop) {
+        if (k < LS) {
+            p = slot = k;
+            loop = false;
+        } else if (k < LS + NPASS * NCORE) {
+            const int pass = (k - LS) / NCORE, ip = LS + (k - LS) % NCORE;
+            p = ip;
+            slot = pass == 0 ? ip : NPHYS + (pass - 1) * NCORE + (ip - LS);
+            loop = pass > 0;
+        } else {
+            p = slot = LE + (k - LS - NPASS * NCORE);
+            loop = false;
+        }
+    }
+    void pf_step(int c, PfRun& R, int i) {   // step i of 0 .. 2 NLAY
+        Card& K = cards[c];
+        PFB& P = K.P;
+        const int C = R.C;
+        const size_t CN = (size_t) C * N;
+        int p, slot;
+        bool loop;
+        if (i % 2 == 1) {
+            pf_layer_of(i / 2, p, slot, loop);
+            layer_pf(K, p, slot, loop, R.p0, C, 1);
+            return;
+        }
+        if (i == 0) {   // pf_card's start
+            zx_recv(K, (K.zc + 1) % K.zn);
+            CK(cudaMemcpyAsync(P.x0, R.hx0, (size_t) C * N * 4, cudaMemcpyHostToDevice, K.st));
+            CK(cudaMemcpyAsync(P.pos, R.hpos, C * 4, cudaMemcpyHostToDevice, K.st));
+            CK(cudaMemcpyAsync(P.tau, R.htau, C * 4, cudaMemcpyHostToDevice, K.st));
+            k_rms<<<C, 256, 0, K.st>>>(P.x0, N, K.tok_norm, P.cur, N, N, eps);
+            raw_rows(K, P.x0, P.cur, C, R.hraw);
+            K.nb = 0;
+        } else {
+            pf_layer_of(i / 2 - 1, p, slot, loop);
+            layer_pf(K, p, slot, loop, R.p0, C, 2);
+        }
+        const int k = i / 2;
+        if (k == NLAY) {
+            pf_tail(c, C, R.p0, R.last);
+            return;
+        }
+        if (k == LS) {   // pf_card's copies between the layers
+            CK(cudaMemcpyAsync(P.prel, P.cur, CN * 4, cudaMemcpyDeviceToDevice, K.st));
+            R.nprel = K.nb;
+        } else if (k > LS && k < LS + NPASS * NCORE && (k - LS) % NCORE == 0) {
+            CK(cudaMemcpyAsync(P.bankS, P.B[R.nprel + 1], CN * 4, cudaMemcpyDeviceToDevice, K.st));
+            CK(cudaMemcpyAsync(P.bankO, P.cur, CN * 4, cudaMemcpyDeviceToDevice, K.st));
+            CK(cudaMemcpyAsync(P.cur, P.prel, CN * 4, cudaMemcpyDeviceToDevice, K.st));
+            K.nb = R.nprel;
+        }
+        pf_layer_of(k, p, slot, loop);
+        layer_pf(K, p, slot, loop, R.p0, C, 0);
+    }
+    void pf_multi(int c, int n, const int* Cs, int p0, bool last) {   // n chunks of Cs[j] tokens from position p0 on
+        Card& K = cards[c];
+        CK(cudaSetDevice(K.dev));
+        PfRun R[Card::ZMAX];
+        K.zn = n;
+        for (int j = 0, p = p0; j < n; p += Cs[j], ++j)
+            R[j] = PfRun{Cs[j], p, last && j == n - 1, 0, j ? h_x0z[j] : h_x0, j ? h_posz[j] : h_pos, j ? h_tauz[j] : h_tau,
+                         j ? h_rawz[j].data() : nullptr};
+        for (int i = 0; i <= 2 * NLAY; ++i)
+            for (int j = 0; j < n; ++j) {
+                zip_load(K, j);
+                pf_step(c, R[j], i);
+                zip_save(K);
+            }
+        zip_load(K, 0);
+        CK(cudaStreamSynchronize(K.st));
+    }
     void pf_card(int c, int C, int p0, bool last) {
         Card& K = cards[c];
         PFB& P = K.P;
@@ -2484,6 +2776,12 @@ struct Engine {
             for (int ip = LS; ip < LE; ++ip) layer_pf(K, ip, pass == 0 ? ip : NPHYS + (pass - 1) * NCORE + (ip - LS), pass > 0, p0, C);
         }
         for (int p = LE; p < NPHYS; ++p) layer_pf(K, p, p, false, p0, C);
+        pf_tail(c, C, p0, last);
+        CK(cudaStreamSynchronize(K.st));
+    }
+    void pf_tail(int c, int C, int p0, bool last) {   // zip: pf_card's end as a function of its own (a chunk's last step too)
+        Card& K = cards[c];
+        PFB& P = K.P;
         if (ds_on) {   // p6: every row's final hidden, then the drafter's caches
             mix(K, states_pf(K, P.cur), K.out_rq, 1, P.F, C);
             k_rms<<<C, 256, 0, K.st>>>(P.F, N, K.out_norm, P.F2, N, N, eps);
@@ -2512,7 +2810,6 @@ struct Engine {
             k_softcap_g<<<(NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, 1, softcap, s_invT, s_seed, p0 + C, c * NV_C);   // p36
             CK(cudaMemcpyAsync(h_logits + (size_t) c * NV_C, K.logits, (size_t) NV_C * 4, cudaMemcpyDeviceToHost, K.st));
         }
-        CK(cudaStreamSynchronize(K.st));
     }
 
     // T tokens at positions n_past.. through both cards; logits of the last row (or of all rows) into h_logits
@@ -2596,7 +2893,8 @@ struct Engine {
     std::vector<float> img_rows;
     std::vector<std::array<int, 3>> img_map;
     std::vector<char> h_raw = std::vector<char>((size_t) 1 << 16, 0);   // rows of a window or a reading chunk
-    void raw_rows(Card& K, const float* x0, float* cur, int T) {
+    void raw_rows(Card& K, const float* x0, float* cur, int T, const char* raw = nullptr) {   // zip: raw = a later chunk's marks
+        const char* h_raw = raw ? raw : this->h_raw.data();
         for (int t = 0; t < T;) {
             if (!h_raw[t]) { ++t; continue; }
             int e = t;
@@ -2643,6 +2941,35 @@ struct Engine {
                 }
                 const bool last = i + T >= n;
                 const int p0 = n_past;
+                int Cs[Card::ZMAX] = {T}, nz = 1, tot = T;   // zip: the next chunks, as this loop would cut them
+                while (nz < zip && Cs[nz - 1] == pfc && n - i - tot >= pf_min) {
+                    const int Tz = std::min(pfc, n - i - tot);
+                    if (n_past + tot + Tz > ctx) break;   // the loop throws "context full" when it comes to this chunk, as ever
+                    bool ok = true;
+                    std::swap(h_x0, h_x0z[nz]);   // embed() writes h_x0
+                    try {
+                        for (int t = 0; t < Tz; ++t) {
+                            h_rawz[nz][t] = embed(t, ids[i + tot + t]);
+                            const int P = n_past + tot + t;
+                            h_posz[nz][t] = P;
+                            h_tauz[nz][t] = logf(fmaxf(((float) P + 1.0f) * (1.0f / log_floor), 1.0f)) * log_alpha + 1.0f;
+                        }
+                    } catch (const std::exception&) {
+                        ok = false;   // a token embed() refuses: the loop meets it again when it comes to this chunk
+                    }
+                    std::swap(h_x0, h_x0z[nz]);
+                    if (!ok) break;
+                    Cs[nz++] = Tz;
+                    tot += Tz;
+                }
+                if (nz > 1) {
+                    const bool lastz = i + tot >= n;
+                    both([&](int c) { pf_multi(c, nz, Cs, p0, lastz); });
+                    T = tot;
+                    n_past += T;
+                    processed.insert(processed.end(), ids + i, ids + i + T);
+                    continue;
+                }
                 both([&](int c) { pf_card(c, T, p0, last); });
                 n_past += T;
                 processed.insert(processed.end(), ids + i, ids + i + T);
