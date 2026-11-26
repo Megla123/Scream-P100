@@ -21,7 +21,11 @@ while a single chat stays bit for bit `ink2_v1`; `INK2_MULTI=pp`, a pipeline wit
 on every load** (24 Nov, p38-p41, [below](#two-cards-on-the-one-card-sources-the-exchange-by-numa-node-p38-p41-24-nov)): the
 reading exchange's page-locked buffers now sit on the NUMA node of the card that writes them (946 → 980 tok/s on 4k prompts,
 828 → 851 on 30k; before, it depended on where the loading thread ran), and writing with drafts after a 30k prompt is 1.7 %
-faster; the same bits.
+faster; the same bits. **Writing 15 % faster** (26 Nov, p47-p57,
+[below](#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov)): each card now picks the next token
+itself instead of sending 0.4 MB of logits a row to the host, and several smaller waits are gone: on 56 prompts at 512k 79.9 →
+91.6 tok/s with drafts and 62.6 → 72.4 without, up to 22 % faster at a depth of 240k tokens, edits 139 → 171 tok/s; the same
+bits, reading as before.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -44,23 +48,32 @@ Same two P100 16 GB, temperature 0, everything exact (f32 sums, only their order
 | Context | 32k measured | **262,144** (KV f16) or **524,288** (KV int8 past 32k), 15.2 GiB a card with the drafter |
 | Pictures | mmproj (on a card) | mmproj on the CPU, ~20 s for a 1600×900 picture (920 rows), then read at ~640 tok/s |
 
+(The writing rows are from 21-23 Nov. Since 26 Nov, p47-p57, writing is ~15 % faster with the same output: 72.4 tok/s
+without drafts and 91.6 with them on 56 prompts at 512k, see [below](#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov).)
+
 On the **test set of our Flash-Next builds** (the same prompts, through the OpenAI API, `INK2` with its defaults), against
-Scream P100's Flash-Next UD-Q4_K_XL on the same machine (22 Nov, at the context each option runs with):
+Scream P100's Flash-Next UD-Q4_K_XL on the same machine (ink2 on 26 Nov with p47-p57 at 185 W a card, Flash-Next on 22 Nov,
+at the context each option runs with):
 
 | Test | **ink2, 256k (exact)** | **ink2, 512k** | Flash-Next Q4_K_XL, exact | Flash-Next Q4_K_XL, fast (lossy) |
 |---|---|---|---|---|
-| Fresh writing (12 prompts, thinking low) | 67.3 | 67.2 | 59.3 | 68.9 |
-| Edits, Python / Markdown ¹ | 75.3 / 114.3 | 75.3 / 114.4 | 100.9 / 92.2 | 124.3 / 125.6 |
-| Koda's 26 edit tasks (tool calls, hidden tests) | **97.4** tok/s, 24/26 right | — | — | — |
-| Reading 37.6k / writing after it | **790** / 53.2 | **790** / 56.7 | 802 / 61.8 | 987 / 51.3 |
+| Fresh writing (12 prompts, thinking low) | **81.4** | **81.4** | 59.3 | 68.9 |
+| Edits, Python / Markdown ¹ | **170.6 / 167.6** | **170.5 / 167.5** | 100.9 / 92.2 | 124.3 / 125.6 |
+| Koda's 26 edit tasks (tool calls, hidden tests; 22 Nov) | **97.4** tok/s, 24/26 right | — | — | — |
+| Reading 37.6k / writing after it | **796** / 66.1 | **797** / 64.7 | 802 / 61.8 | 987 / 51.3 |
 
-¹ Inkling thinks before it answers even at effort 0, and both of these prompts are 1,600 tokens of reasoning (in the Python
-one the file has no variable of the name it is asked to rename), so they time its reasoning, not copying, and follow the
-text: with p19's reading path the sums of the prompt come out in another order, the greedy reasoning takes another turn,
+(22 Nov, before p47-p57 and before the server's low reasoning effort: 67.3 / 75.3 / 114.3 / 790 / 53.2 at 256k. The build of
+24 Nov gives 71.4 / 139.1 / 136.8 / 793 / 58.3 in the same run as the 256k column, see
+[below](#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov).)
+
+¹ Inkling thinks before it answers even at effort 0, and both of these prompts are 1,600 / 1,396 tokens of reasoning (in the
+Python one the file has no variable of the name it is asked to rename), so they time its reasoning, not copying, and follow
+the text: with p19's reading path the sums of the prompt come out in another order, the greedy reasoning takes another turn,
 and the two numbers went from 115.5 / 127.8 to 75.3 / 114.3, while the same build with every p19 switch off gives the old
-numbers exactly (`INK2_PF_QSF=64 INK2_SHARE=0 INK2_GEMM5=0 INK2_XSPLIT=1`: 115.2 / 127.4). On Koda's 26 edit tasks the
-speed is the same before and after (97.3 / 97.4 tok/s). Writing after the long read differs between 256k and 512k for the
-same reason (the int8 rows past 32k change the answer a little). Long reads are bound by f32 arithmetic: the P100 has no
+numbers exactly (`INK2_PF_QSF=64 INK2_SHARE=0 INK2_GEMM5=0 INK2_XSPLIT=1`: 115.2 / 127.4); with the low reasoning effort of 23
+Nov the reasoning is another text again. On Koda's 26 edit tasks the speed was the same before and after p19 (97.3 / 97.4
+tok/s). Writing after the long read differs between 256k and 512k for the same reason (the int8 rows past 32k change the
+answer a little). Long reads are bound by f32 arithmetic: the P100 has no
 tensor cores, and Flash-Next's fast numbers use f16 there.
 
 **Long context:** a word hidden in the first line of a **239,114-token** prompt was found at 256k (read in 876 s, 273 tok/s on
@@ -136,6 +149,54 @@ coding agent's write / bash tools worked on our machine. **Pictures**: `image_ur
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## Writing faster: the argmax on the cards and less waiting (p47-p57, 26 Nov)
+
+`src/` (`build/ink2_v1`) writes **15 % faster** with drafts and without them, and up to 22 % faster deep into a long context,
+with **the same output as before**: on the 56 prompts below every answer is the same text, reads of 4k / 30k / 128k tokens
+give the same tokens and logits, and with every step's logits hashed (drafts on, 512k) the hashes are p41's. A build of this
+branch from a clean copy of `src/` gives the same outputs as the build we run (the binaries differ only in the name of a
+temporary file nvcc writes into them). The drafter is the same official DSpark drafter; nothing in it changed.
+
+Each change has a switch of its own, on by default; a switch at its old value runs the old code. They all give the same bits,
+so they choose speed only: `INK2_AMAX=0 INK2_G1WPB=8 INK2_MIX3=0 INK2_XLL=0 INK2_G1W=0 INK2_CKSPARE=0 INK2_COMB2=0` is the
+build of 24 Nov (p41) again.
+
+| | What it does | Switch (default; old) | Measured alone (125 W; 256k profile, 32k context unless said) |
+|---|---|---|---|
+| p47 | Each card finds the largest logit of its rows itself (the first of equals, as the host did) and sends back only the value and its index. Before, every row of a draft window copied its 0.4 MB of logits a card to the host, which searched 200k values. The logits still come back for `lhall` tests, the first token after a prompt and `--logits`. | `INK2_AMAX` (1; 0) | **+12.5 %** with drafts, +9.8 % with prompt lookup only |
+| p49 | The dense Q8 matrices of a single token in blocks of 2 warps instead of 8 (more, smaller blocks for 56 SMs; each row's sum the same code in the same order). | `INK2_G1WPB` (2; 8) | +0.1 % / +1.0 % |
+| p51 | The depth mixes of a few rows in two launches over 24 + 9 blocks instead of one block a row. | `INK2_MIX3` (1; 0) | +0.6 % / +1.5 % |
+| p52 | A single token's exchanges between the cards as 8-byte words, the value and a sequence number together (the idea of NCCL's LL protocol): the reader waits for the words themselves, so the writer needs no fence and no flag. Draft windows keep the flag. | `INK2_XLL` (1; 0) | +0.4 % / +2.3 % |
+| p53 | The dense Q8 matrices of a single token with 4 rows a warp and every part of a row's columns in the same warp, summed in the order of the old last block, without partial sums in global memory. | `INK2_G1W` (4; 0) | 0 / +0.65 % |
+| p55 | A new checkpoint needs a page-locked buffer of ~166 MiB a card. `cudaHostAlloc` made it before the first token until all of them existed (147 at 512k), so a new conversation waited 0.17 s for it; the spare buffer is now made between requests. | `INK2_CKSPARE` (1; 0) | a 59-token chat turn read in 0.25 s instead of 0.42; 6k-18k prompts 3-6.5 % sooner to the first token |
+| p57 | A full-attention layer splits its keys into parts of 64, and one block a head joined them one after the other: the largest of their maxima, then each part's weight and the two sums. The block now finds the maximum together and each part's weight once (the same `expf` of the same value) in shared memory; the sums run in the same order. | `INK2_COMB2` (1; 0) | at 64k +6.5 % without drafts, +4.0 % with them; short prompts the same |
+
+Also in the code, off by default: p43, a request field `"featdump": "/path"` that reads a prompt and writes the drafter's
+four input features of every row to a file (for training drafters; nothing changes without it), and p50, `INK2_G6`, 64-token
+expert tiles of 8 × 8 values a thread on the reading path (exact, but 3.5 % slower). After p47 the host no longer holds the
+cards up: a trace of writing single tokens shows both cards busy 94 % of the time, so what is left is the kernels' own time.
+
+Before and after on our machine, **185 W a card**, 26 Nov, the same runs one after the other in one window (p41 = the build of
+24 Nov, in use until the morning of 26 Nov). Through the engine's socket at production's 512k unless said:
+
+| | p41 | **p47-p57** |
+|---|---|---|
+| Writing with drafts (DSpark MTP 3 + prompt lookup 15), 56 prompts | 79.9 tok/s | **91.6** (+14.7 %) |
+| &nbsp; English questions / arithmetic / writing code / editing code / Slovenian (8 prompts each) | 81.1 / 78.6 / 82.5 / 93.8 / 79.9 | 93.0 / 89.9 / 94.8 / **109.0** / 91.6 |
+| Writing without drafts, the same 56 prompts | 62.6 | **72.4** (+15.6 %) |
+| Writing at a depth of 0 / 16k / 64k / 128k / 240k tokens, with drafts | 74.3 / 61.6 / 67.3 / 40.2 / 28.8 | **84.9 / 69.9 / 76.7 / 46.0 / 33.2** (+13.5 to +15.3 %) |
+| &nbsp; the same without drafts | 62.5 / 57.7 / 46.3 / 36.9 / 27.3 | **72.3 / 67.6 / 54.9 / 44.4 / 33.3** (+15.7 to +22.0 %) |
+| Reading 4k / 30k / 128k tokens from token 0 | 981.6 / 856.2 / 544.9 | 981.4 / 860.6 / 544.6 (the same) |
+| The test set of our Flash-Next builds through the server at 256k (`ab.py`): fresh writing / edits, Python / Markdown | 71.4 / 139.1 / 136.8 | **81.4 / 170.6 / 167.6** (+14 / +23 / +23 %) |
+| &nbsp; the same: reading a 37.6k prompt / writing after it | 792.6 / 58.3 | 796.3 / **66.1** |
+| The writing test's 14 requests at 256k (`pis_ab.py`): single tokens / with drafts | 62.3 / 84.3 | **72.2 / 97.2** (+15.9 / +15.4 %) |
+
+Where a test keeps the answers (the 56 prompts, the 14 requests, the reads) both builds gave the same tokens in every one.
+The 56 prompts are 8 of each kind: English questions, arithmetic, writing functions, editing code, two sets of prompts from
+our drafter's tests and Slovenian; greedy, at most 600 tokens. A depth is a prompt of code and documents of that length and one question, 256 tokens written; reading at depth was
+the same for both (924 / 718 / 546 / 366 tok/s at 16k / 64k / 128k / 240k). At 125 W the 56 prompts gave 79.0 → 90.0 with
+drafts: writing hardly depends on the power limit, reading does (4k / 30k / 128k at 857 / 740 / 467).
 
 ## Two cards on the one-card sources, the exchange by NUMA node (p38-p41, 24 Nov)
 
@@ -709,7 +770,13 @@ off), `INK2_PARK_MIN` (1024, shorter conversations are read again), `INK2_FUSE2`
 controllers, 4 the norms and matrices; 1 the depth mixes and 8 the routing measured no gain), `INK2_Q8G` (1, the Q8 experts
 of the reading path by `k_q8_gemm5`; 0 = f32 copies and cuBLAS), `INK2_TILE_S` (1, expert tiles of 8 and 4 tokens),
 `INK2_CATM` (0, see below), `INK2_ATT_ROWS` (1, p38), `INK2_NUMA` (1, p41: the reading exchange's buffers on the writing
-card's node; 2 the other card's, 0 the scheduler's), `INK2_1C_MARGIN_MB` (150 with two cards, VRAM left after the experts).
+card's node; 2 the other card's, 0 the scheduler's), `INK2_1C_MARGIN_MB` (150 with two cards, VRAM left after the experts),
+and from 26 Nov (p47-p57, each at its old value = the old code, all the same bits): `INK2_AMAX` (1, the argmax on the cards;
+0 the logits to the host), `INK2_G1WPB` (2, warps a block of the dense Q8 matrices of a single token; 8 before),
+`INK2_G1W` (4, rows a warp for them; 0 the block kernel), `INK2_MIX3` (1, the depth mixes of few rows in two launches),
+`INK2_XLL` (1, single-token exchanges as 8-byte words), `INK2_CKSPARE` (1, the spare checkpoint buffer made between requests),
+`INK2_COMB2` (1, the attention's parts joined in parallel; 0 `k_attn_comb`), `INK2_R7TPB` / `INK2_R6WPB` (256 / 4, the expert
+kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
@@ -734,3 +801,13 @@ off (`INK2_CATM=1` turns it on). The small expert tiles in a kernel of their own
 instead of 2 (the same bits, 322 → 324 ms). One exchange instead of 4 slices on short pieces (329 against 322 ms). Our own
 GEMM for the dense Q8 matrices (an idea from `iammrduncan/tensorless`): not built, the profile leaves it little, 3 % for
 their f32 copies on a 128-token piece and cuBLAS at ~6.6 TFLOPS on the products.
+
+For p47-p57 (25-26 Nov, 125 W, all exact): the reading path's expert tiles with 8 × 8 values a thread (`INK2_G6`, 3.5 %
+slower; a micro test of the GEMM alone: no faster at 125 W, where it is nearer the power limit than the instruction limit);
+the single-token expert kernels in smaller blocks (`INK2_R7TPB` 128 / 64, `INK2_R6WPB` 2 / 1: slower); the attention's
+parts first copied to shared memory before they are joined (p58: +0.9 % at 64k, -0.6 % on short prompts); a reading chunk of
+1,024 tokens (-6 %; 4,096 does not fit the ring) and an exchange in 1 / 2 / 8 slices instead of 4 (the same or slower). Not
+exact, so measured only: the drafter's gate at 0.5 / 0.6 / 0.8 / 0.9 instead of 0.7 and 5 or 7 drafts instead of 3 (at best
++0.3 %, worse on some kinds of prompt), and letting the drafter rest after a call that drafted nothing (p48: -1.5 to -2.4 %;
+after p47 such a call costs less than the drafts it would lose). Our own drafter (trained on the model's own answers, three
+rounds) is not in this build: the official one stays.

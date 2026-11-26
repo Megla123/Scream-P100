@@ -43,6 +43,10 @@ static FILE* g_rtrace = nullptr;   // p31: INK2_RTRACE
 static std::string g_draft_vocab;   // p13: --draft-vocab FILE (int32 count + token ids), "" = the whole vocabulary
 static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+__global__ void k_f2h43(const float* x, __half* y, size_t n) {   // p43
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half(x[i]);
+}
 struct LW {   // one card's part of a physical layer
     bool full = false;
     int nrq = 0;
@@ -110,6 +114,8 @@ struct PFB {
 struct Card {
     PFB P;
     DSW D;   // p6
+    float* amv_r = nullptr;   // p47: each written row's argmax on this card (value, index)
+    int* ami_r = nullptr;
     int dev = 0, c = 0;
     cudaStream_t st;
     LW L[NPHYS];
@@ -143,6 +149,7 @@ struct Card {
 struct Xch {
     float* buf[NC][2];
     volatile unsigned* flag[NC];
+    unsigned long long* ll[NC][2] = {};   // p52: the 8-byte word buffers (INK2_XLL)
 };
 
 struct Engine {
@@ -163,10 +170,20 @@ struct Engine {
     // same bits each: 1: +0.1 %; 2: single tokens +2.7 %, windows +1.2..1.5 %; 4: +7.1 % / +0.2..1.5 %; 8: +0.1 % / -1.8..-2.7 % (the last
     // block routes a window's rows one after another); 15: +9.3 % / -2.0..+0.2 %. Default 6
     int fuse2 = getenv("INK2_FUSE2") ? atoi(getenv("INK2_FUSE2")) : 6;
+    // p49: the writing path's weight kernels in smaller blocks (the same sums): gate_up threads, down warps, dense Q8S T = 1 warps
+    int r7tpb = getenv("INK2_R7TPB") ? atoi(getenv("INK2_R7TPB")) : 256;
+    int r6wpb = getenv("INK2_R6WPB") ? atoi(getenv("INK2_R6WPB")) : 4;
+    int g1wpb = getenv("INK2_G1WPB") ? atoi(getenv("INK2_G1WPB")) : 2;
     bool ilv = getenv("INK2_FP4_ILV") != nullptr;   // p4d off: NVFP4 experts interleaved as in the file (the older kernels need it)
     bool rows2 = getenv("INK2_ROWS2") != nullptr;   // p4b off: p4a's NVFP4 writing kernel
     bool gemm5 = getenv("INK2_GEMM5") ? atoi(getenv("INK2_GEMM5")) != 0 : true;
     int tile_s = getenv("INK2_TILE_S") ? atoi(getenv("INK2_TILE_S")) : 1;   // p24: expert tiles of 8 and 4 tokens for an expert's last few (0: 16-token tiles)
+    int g6 = getenv("INK2_G6") ? atoi(getenv("INK2_G6")) : 0;   // p50: reading's 64-token expert tiles by k_fp4_g6 (32 / 16 = its step; 0 off)
+    bool mix3 = getenv("INK2_MIX3") ? atoi(getenv("INK2_MIX3")) != 0 : true;   // p51: the depth mixes of few rows in two launches
+    bool xll = getenv("INK2_XLL") ? atoi(getenv("INK2_XLL")) != 0 : true;   // p52: T = 1 exchanges as 8-byte words (value | sequence)
+    int g1w = getenv("INK2_G1W") ? atoi(getenv("INK2_G1W")) : 4;   // p53: dense Q8S T = 1 by k_gemv8_t1w, rows a warp (1 / 2 / 4; 0 off)
+    bool ckspare = getenv("INK2_CKSPARE") ? atoi(getenv("INK2_CKSPARE")) != 0 : true;   // p55: a spare checkpoint buffer made between requests
+    bool comb2 = getenv("INK2_COMB2") ? atoi(getenv("INK2_COMB2")) != 0 : true;   // p57: k_attn_comb2 (the same numbers, the parts' max and weights in parallel)
     int xsplit = getenv("INK2_XSPLIT") ? std::max(1, std::min(PFB::XS_MAX, atoi(getenv("INK2_XSPLIT")))) : 4;   // p19d: slices of an exchange (1: xch_pf; 22. 11.: 2 / 3 / 4 = 14k 876 / 896 / 914)   // p19b: one block a tile of 64 / 32 / 16 tokens (0: k_fp4_gemm)
     bool pf_deq = getenv("INK2_PF_DEQ") != nullptr;  // p3c: NVFP4 experts of the reading path dequantized to f32 + cuBLAS (p3b)
     bool catm = getenv("INK2_CATM") ? atoi(getenv("INK2_CATM")) != 0 : false;   // p27: the input projections in one call a group of rows (23. 11.: 128 tokens 322 -> 320 ms, routing ties move: off)
@@ -198,6 +215,14 @@ struct Engine {
     static constexpr int DS_RING = 4096, DS_RING1 = 16384, DS_WIN1 = 12288;   // p14: the drafter's caches above 64k (layer 1 sees 12k)
     bool ds_ring = false;   // 21. 11.: 14k 641 -> 695 (2048: 700, +0.7 GB)   // p3d: queries per block in the full layers
     float* h_logits = nullptr;   // page-locked [MAXT][NV]
+    // p47: INK2_AMAX=1, the rows' argmax on the cards while writing; want_logits = the full rows are copied too
+    bool dev_amax = getenv("INK2_AMAX") ? atoi(getenv("INK2_AMAX")) != 0 : true;
+    bool want_logits = true;
+    float* h_amv2 = nullptr;   // page-locked [NC][MAXT]
+    int* h_ami2 = nullptr;
+    std::FILE* fdump = nullptr;   // p43: the featdump request's file (card 0 writes every reading chunk's features)
+    __half *fd_dev = nullptr, *fd_host = nullptr;
+    bool force_pf = false;        // p43: every piece through the reading path
     float s_invT = 0.0f;               // p36: 1 / temperature of this request (0: greedy)
     unsigned long long s_seed = 0;     // p36: its seed
     int n_past = 0;
@@ -919,8 +944,19 @@ struct Engine {
             CK(cudaHostAlloc((void**) &f, 64, cudaHostAllocMapped | cudaHostAllocPortable));
             *f = 0;
             X.flag[c] = f;
+            for (int p = 0; p < 2; ++p) {   // p52
+                CK(cudaHostAlloc((void**) &X.ll[c][p], (size_t) MAXT * N * 8, cudaHostAllocMapped | cudaHostAllocPortable));
+                std::memset(X.ll[c][p], 0, (size_t) MAXT * N * 8);
+            }
         }
         CK(cudaHostAlloc((void**) &h_logits, (size_t) MAXT * NV * 4, cudaHostAllocPortable));
+        CK(cudaHostAlloc((void**) &h_amv2, (size_t) NC * MAXT * 4, cudaHostAllocPortable));   // p47
+        CK(cudaHostAlloc((void**) &h_ami2, (size_t) NC * MAXT * 4, cudaHostAllocPortable));
+        each_card([&](int c) {
+            CK(cudaSetDevice(cards[c].dev));
+            cards[c].amv_r = (float*) alloc(cards[c], MAXT * 4);
+            cards[c].ami_r = (int*) alloc(cards[c], MAXT * 4);
+        });
         if (getenv("INK2_PF_CHUNK")) pfc = std::max(MAXT, atoi(getenv("INK2_PF_CHUNK")));
         if (pfc + SWA - 1 > RING) throw std::runtime_error("INK2_PF_CHUNK: a chunk and its window (RING - SWA + 1) do not fit the ring");   // p31
         if (getenv("INK2_PF_MIN")) pf_min = std::max(1, atoi(getenv("INK2_PF_MIN")));
@@ -1017,7 +1053,15 @@ struct Engine {
     void gemv8_t1(Card& K, const Mat& m, const float* x, const Segs& sg) {
         const int blocks = (m.rows + G1_BR - 1) / G1_BR, nch = (m.cols + 511) / 512;
         const int S = blocks >= 112 ? 1 : std::min(nch, (112 + blocks - 1) / blocks);
-        k_gemv8_t1<<<dim3(blocks, S), 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
+        if (g1w == 1 || g1w == 2 || g1w == 4) {   // p53: a warp's rows with all S parts
+            const int rpb = 8 * g1w;
+            if (g1w == 1) k_gemv8_t1w<1><<<(m.rows + rpb - 1) / rpb, 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
+            else if (g1w == 2) k_gemv8_t1w<2><<<(m.rows + rpb - 1) / rpb, 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
+            else k_gemv8_t1w<4><<<(m.rows + rpb - 1) / rpb, 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
+        } else
+        if (g1wpb == 4) k_gemv8_t1<4><<<dim3((m.rows + 15) / 16, S), 128, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
+        else if (g1wpb == 2) k_gemv8_t1<2><<<dim3((m.rows + 7) / 8, S), 64, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
+        else k_gemv8_t1<8><<<dim3(blocks, S), 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, sg, S);
     }
     // p6c: T rows with k_gemv8_t1's sums (the same parts S as at T = 1)
     template <int TT>
@@ -1110,7 +1154,10 @@ struct Engine {
     }
     void mix(Card& K, const States& S, const float* q, int nq, float* out, int T) {
         if (stare) k_mix<<<T, 256, 0, K.st>>>(S, q, nq, out);
-        else k_mix2<<<T, 768, 0, K.st>>>(S, q, nq, out);
+        else if (mix3 && T <= MAXT) {   // p51
+            k_mix3a<<<dim3(24, T), 32, 0, K.st>>>(S, q, nq);
+            k_mix3b<<<dim3(N / 256, T), 256, 0, K.st>>>(S, nq, out, T);
+        } else k_mix2<<<T, 768, 0, K.st>>>(S, q, nq, out);
     }
     States states(Card& K, const float* last) {
         States S{};
@@ -1374,7 +1421,8 @@ struct Engine {
                 else
                     k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
             }
-            k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);
+            if (comb2) k_attn_comb2<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);   // p57
+            else k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);
         } else {
             const int np = L.full ? nparts : std::min(nparts, (SWA + KC - 1) / KC + 1);
             k_attn_part<<<dim3(np, NH_C, T), 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np);
@@ -1391,6 +1439,9 @@ struct Engine {
                 k_xchg_convT<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi,
                                                    c, K.sa[slot], L.a_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur,
                                                    ip % BLK == 0 ? K.B[K.nb++] : nullptr, hk ? hk + (size_t) 2 * MAXT * KVC : nullptr, T, K.F2);
+            else if (xll && NC > 1)   // p52
+                k_xchg_conv_ll<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.ll[c][par], X.ll[oc][par], K.dtok, xi, c, K.sa[slot], L.a_pconv,
+                                                     1.0f / sqrtf(NCONV + 1.0f), K.cur, ip % BLK == 0 ? K.B[K.nb++] : nullptr);
             else
             k_xchg_conv<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi, c,
                                               K.sa[slot], L.a_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur,
@@ -1452,11 +1503,19 @@ struct Engine {
             k_fp4_mt<9, 1, 128><<<dim3(N / 128, nj), 128, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.mjobs,
                                                                   K.nmjobs, K.EY, N);
         } else if (L.fp4 && !ilv) {   // p4d: planar experts, gate_up by rows of 4 lanes, down by 288-block tiles
-            k_fp4_rows7<36, 4, 256><<<dim3(2 * FF_C / 64, nj), 256, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0,
+            if (r7tpb == 64) k_fp4_rows7<36, 4, 64><<<dim3(2 * FF_C / 16, nj), 64, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0,
+                                                                            L.gu_s, K.jobs, K.GU, 2 * FF_C, perm, L.gu_t);
+            else if (r7tpb == 128) k_fp4_rows7<36, 4, 128><<<dim3(2 * FF_C / 32, nj), 128, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0,
+                                                                            L.gu_s, K.jobs, K.GU, 2 * FF_C, perm, L.gu_t);
+            else k_fp4_rows7<36, 4, 256><<<dim3(2 * FF_C / 64, nj), 256, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0,
                                                                             L.gu_s, K.jobs, K.GU, 2 * FF_C, perm, L.gu_t);
             k_situ<<<(nj * FF_C + 255) / 256, 256, 0, K.st>>>(K.GU, K.HH, nj, situ_b, situ_lb);
             constexpr int DNB = FF_C / 64, DNR = 288 / DNB;   // p30: down's tile (9 x 32 rows a warp with two cards, 18 x 16 with one)
-            k_fp4_rows6<DNB, DNR><<<dim3(N / (4 * DNR), nj), 128, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.jobs,
+            if (r6wpb == 1) k_fp4_rows6<DNB, DNR, 1><<<dim3(N / DNR, nj), 32, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.jobs,
+                                                                          K.EY, N, perm, L.dn_t);
+            else if (r6wpb == 2) k_fp4_rows6<DNB, DNR, 2><<<dim3(N / (2 * DNR), nj), 64, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.jobs,
+                                                                          K.EY, N, perm, L.dn_t);
+            else k_fp4_rows6<DNB, DNR><<<dim3(N / (4 * DNR), nj), 128, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.jobs,
                                                                           K.EY, N, perm, L.dn_t);
         } else if (L.fp4 && !stare && !rows2) {   // p4b: contiguous tiles of 288 blocks a warp (INK2_FP4_ILV)
             k_fp4_rows3<36, 8><<<dim3(2 * FF_C / 32, nj), 128, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0, L.gu_s,
@@ -1491,6 +1550,9 @@ struct Engine {
                 k_xchg_convT<<<1, 1024, 0, K.st>>>(K.MO, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi,
                                                    c, K.sf[slot], L.f_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur, nullptr,
                                                    hk ? hk + (size_t) 2 * MAXT * KVC + (size_t) MAXT * N : nullptr, T, K.F2);
+            else if (xll && NC > 1)   // p52
+                k_xchg_conv_ll<<<1, 1024, 0, K.st>>>(nullptr, K.EY, K.topw, X.ll[c][par], X.ll[oc][par], K.dtok, xi, c, K.sf[slot], L.f_pconv,
+                                                     1.0f / sqrtf(NCONV + 1.0f), K.cur, nullptr);
             else
             k_xchg_conv<<<1, 1024, 0, K.st>>>(nullptr, K.EY, K.topw, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi, c,
                                               K.sf[slot], L.f_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur, nullptr);
@@ -2105,6 +2167,20 @@ struct Engine {
                             &zero, Pa + (size_t) nfull * qs * HD, HD);
         }
     }
+    // p50: k_fp4_gemm5 over the tiles [0, nt) of P.tiles; with INK2_G6 the first n64 (the 64-token tiles) by k_fp4_g6 (the same sums)
+    template <typename WT, typename ETT>
+    void fp4_gemm_pf(Card& K, int nt, WT W, size_t es, int rows, int cols, const float* x, int ldx, float* y, int ldy, ETT ET) {
+        PFB& P = K.P;
+        int n64 = 0;
+        if (g6 == 32 || g6 == 16)
+            while (n64 < nt && P.h_tiles[n64].nk > 32) ++n64;
+        if (n64 > 0) {
+            if (g6 == 16) k_fp4_g6<16, 2><<<dim3(rows / F4M, n64), 128, 0, K.st>>>(W, es, rows, cols, P.tiles, x, ldx, y, ldy, ET);
+            else k_fp4_g6<32, 1><<<dim3(rows / F4M, n64), 128, 0, K.st>>>(W, es, rows, cols, P.tiles, x, ldx, y, ldy, ET);
+        }
+        if (nt > n64)
+            k_fp4_gemm5<<<dim3(rows / F4M, nt - n64), 256, 0, K.st>>>(W, es, rows, cols, P.tiles + n64, x, ldx, y, ldy, tile_s, ET);
+    }
     void experts_pf(Card& K, const LW& L, int C, bool comb = true) {   // p19d: comb false = without the last k_moe_comb (xch_pf2 makes it)
         PFB& P = K.P;
         const int n = C * TOPK;
@@ -2128,10 +2204,9 @@ struct Engine {
         if (L.fp4 && !pf_deq && gemm5 && !ilv && !gemm2) {   // p19b: the tile list from the counts the host has already
             const int nt = fp4_tiles(P.h_offs.data(), P.h_tiles.data());
             CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
-            k_fp4_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.tiles, P.Xg, N, P.GU, (int) gu_rows, tile_s,
-                                                                    L.gu_t);
+            fp4_gemm_pf(K, nt, L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.Xg, N, P.GU, (int) gu_rows, L.gu_t);   // p50
             k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.gu_s, situ_b, situ_lb);
-            k_fp4_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.tiles, P.HH, FF_C, P.EY, N, tile_s, L.dn_t);
+            fp4_gemm_pf(K, nt, L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.HH, FF_C, P.EY, N, L.dn_t);   // p50
             if (comb) moe_comb(K, L, 0, C);
             return;
         }
@@ -2414,6 +2489,17 @@ struct Engine {
             k_rms<<<C, 256, 0, K.st>>>(P.F, N, K.out_norm, P.F2, N, N, eps);
             ds_feat(K, K.D.pfeat, P.F2, 3, C);
             ds_ingest(K, K.D.pfeat, K.D.pfrnn, K.D.pcbuf, K.D.pkb, K.D.pvb, P.pos, C, true);
+            if (fdump && c == 0) {   // p43: [C][4][N] as f16 to the dump file
+                const size_t nv = (size_t) C * 4 * N;
+                if (!fd_dev) {
+                    CK(cudaMalloc((void**) &fd_dev, (size_t) pfc * 4 * N * 2));
+                    CK(cudaHostAlloc((void**) &fd_host, (size_t) pfc * 4 * N * 2, cudaHostAllocPortable));
+                }
+                k_f2h43<<<(unsigned) ((nv + 255) / 256), 256, 0, K.st>>>(K.D.pfeat, fd_dev, nv);
+                CK(cudaMemcpyAsync(fd_host, fd_dev, nv * 2, cudaMemcpyDeviceToHost, K.st));
+                CK(cudaStreamSynchronize(K.st));
+                if (std::fwrite(fd_host, 2, nv, fdump) != nv) throw std::runtime_error("featdump: short write");
+            }
         }
         if (last) {   // the last row only: the depth mix, the norm and the head
             States S{};
@@ -2449,6 +2535,9 @@ struct Engine {
         } else {
             forward_body(c, T, nparts, all_rows);
         }
+        if (dev_amax && want_logits)   // p47
+            CK(cudaMemcpy2DAsync(h_logits + (size_t) c * NV_C, (size_t) NV * 4, K.logits, (size_t) NV_C * 4, (size_t) NV_C * 4,
+                                 all_rows ? T : 1, cudaMemcpyDeviceToHost, K.st));
         CK(cudaStreamSynchronize(K.st));
     }
     void forward_body(int c, int T, int nparts, bool all_rows) {
@@ -2488,8 +2577,16 @@ struct Engine {
         else if (fuse && !stare && !dumping) gemv8_t1T(K, K.out, K.hx + (size_t) r0 * N, N, segs1(NV_C, K.logits), nr);   // p6c
         else gemv8(K, K.out, K.hx + (size_t) r0 * N, N, K.logits, NV_C, nr);
         k_softcap_g<<<(nr * NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, nr, softcap, s_invT, s_seed, n_past + r0 + 1, c * NV_C);   // p36
+        if (dev_amax) {   // p47: the rows' argmax here; the full rows (want_logits) are copied by forward_card, outside a graph
+            const int valid = std::min(NV_C, NVU - c * NV_C);
+            for (int r = 0; r < nr; ++r)
+                k_argmax_n<<<1, 1024, 0, K.st>>>(K.logits + (size_t) r * NV_C, valid, K.amv_r + r, K.ami_r + r);
+            CK(cudaMemcpyAsync(h_amv2 + (size_t) c * MAXT, K.amv_r, nr * 4, cudaMemcpyDeviceToHost, K.st));
+            CK(cudaMemcpyAsync(h_ami2 + (size_t) c * MAXT, K.ami_r, nr * 4, cudaMemcpyDeviceToHost, K.st));
+        } else {
         CK(cudaMemcpy2DAsync(h_logits + (size_t) c * NV_C, (size_t) NV * 4, K.logits, (size_t) NV_C * 4, (size_t) NV_C * 4, nr,
                              cudaMemcpyDeviceToHost, K.st));
+        }
     }
     // p17: pictures. A request's image rows (ink2_vis: mtmd's projector output, n_embd f32 a row) and where they go: token ids
     // from IMG_BASE name rows (img_map: first id, rows, offset into img_rows); the server makes the ids from the picture's
@@ -2535,7 +2632,7 @@ struct Engine {
     int feed(const int* ids, int n, bool all_rows) {
         int T = 0;
         for (int i = 0; i < n; i += T) {
-            if (!all_rows && n - i >= pf_min) {   // p3: the reading path, chunks of up to pfc
+            if (!all_rows && (n - i >= pf_min || force_pf)) {   // p3: the reading path, chunks of up to pfc (p43: always while dumping)
                 T = std::min(pfc, n - i);
                 if (n_past + T > ctx) throw std::runtime_error("context full");
                 for (int t = 0; t < T; ++t) {
@@ -2635,6 +2732,14 @@ struct Engine {
                 rows(K.D.vc[il], W, rg, (size_t) NKVD * 2);
             }
         CK(cudaStreamSynchronize(K.st));
+    }
+    // p55: one spare checkpoint buffer in ck_pool, made while the engine waits (at start and after a reply), not before a first token
+    void ck_spare() {
+        if (!ckspare || !ck_on || ck_max <= 0 || !ck_pool.empty() || ck_made >= ck_max) return;
+        Ckpt cp;
+        for (int c = 0; c < NC; ++c) CK(cudaHostAlloc((void**) &cp.buf[c], ck_bytes(), cudaHostAllocPortable));
+        ++ck_made;
+        ck_pool.push_back(cp);
     }
     // a checkpoint of the state now (n_past tokens). With no free buffer the closest pair gives up its later one (never the newest)
     void ck_take() {
@@ -2841,10 +2946,10 @@ struct Engine {
         });
         feed(win, T, true);
         int right = 0;
-        while (right + 1 < T && argmax(h_logits + (size_t) right * NV) == win[right + 1]) ++right;
-        out_next = argmax(h_logits + (size_t) right * NV);
+        while (right + 1 < T && amax_row(right) == win[right + 1]) ++right;
+        out_next = amax_row(right);
         const int keep = right + 1;
-        if (ds_on)   // p6: the drafter's context is the last kept row's f_rnn (the rejected rows' caches are rewritten later)
+        if (ds_on && !dev_amax)   // p6: the drafter's context is the last kept row's f_rnn (the rejected rows' caches are rewritten later)
             both([&](int c) {
                 Card& K = cards[c];
                 CK(cudaSetDevice(K.dev));
@@ -2854,6 +2959,8 @@ struct Engine {
         both([&](int c) {
             Card& K = cards[c];
             CK(cudaSetDevice(K.dev));
+            if (ds_on && dev_amax)   // p47: the same copy, in the closing call (one sync instead of two)
+                CK(cudaMemcpyAsync(K.D.ctxv, K.D.frnn + (size_t) right * N, N * 4, cudaMemcpyDeviceToDevice, K.st));
             K.keep_hist = false;
             if (keep < T) {
                 const size_t n = (size_t) NSLOT * SLOTST;
@@ -2870,6 +2977,12 @@ struct Engine {
         for (int i = 1; i < NVU; ++i)
             if (l[i] > l[b]) b = i;
         return b;
+    }
+    // p47: row r's token: from the cards' argmax (card 0's ids are the smaller: it wins a tie) or from the copied logits
+    int amax_row(int r) const {
+        if (!dev_amax || want_logits) return argmax(h_logits + (size_t) r * NV);
+        const float v0 = h_amv2[r], v1 = NC > 1 ? h_amv2[MAXT + r] : -INFINITY;
+        return (NC == 1 || v0 >= v1) ? h_ami2[r] : h_ami2[MAXT + r] + NV_C;
     }
 };
 
@@ -2960,6 +3073,7 @@ static unsigned long long fnv_row(unsigned long long h, const float* row) {
 static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::vector<int>& stop, int eos, int lookup = 0, int mtp = 0,
                     const std::function<bool(const int*, int)>* on_out = nullptr, const std::vector<int>* hints = nullptr) {
     Gen g;
+    e.want_logits = true;   // p47
     size_t sent = 0;
     auto flush = [&]() {
         if (!on_out || sent == g.out.size()) return true;
@@ -3058,6 +3172,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
     }
     const double t1 = now_s();
     int next = Engine::argmax(e.h_logits);
+    e.want_logits = !e.dev_amax || g_lhall;   // p47
     auto ends = [&](int t) { return t == eos || std::find(stop.begin(), stop.end(), t) != stop.end(); };
     int dcur = std::min(lookup, 4), cool = 0;   // p5a: the draft length follows the last window; after a miss no drafts for a while
     static const int ng_min = getenv("INK2_NG_MIN") ? atoi(getenv("INK2_NG_MIN")) : 6;   // p7: n-gram match that beats the drafter
@@ -3075,6 +3190,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
             if (mtp > 0 && ml < ng_min) d.clear();
         }
         bool mtpd = false;
+        const int p43_at = e.n_past;   // p43: the anchor's position
         if (d.empty() && mtp > 0) {   // p6: the DSpark drafter
             mtpd = true;
             const double td = now_s();
@@ -3084,7 +3200,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         if ((int) d.size() > e.ctx - e.n_past - 1) d.resize(std::max(0, e.ctx - e.n_past - 1));
         if (d.empty()) {
             e.feed(&next, 1, false);
-            next = Engine::argmax(e.h_logits);
+            next = e.amax_row(0);   // p47 (= Engine::argmax(e.h_logits) without INK2_AMAX)
             if (g_lhall) g.lh2 = fnv_row(g.lh2, e.h_logits);
             continue;
         }
@@ -3097,6 +3213,15 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
             for (int i = 0; i <= right; ++i) g.lh2 = fnv_row(g.lh2, e.h_logits + (size_t) i * NV);
         g.verify_s += now_s() - tv;
         ++g.rounds;
+        if (mtpd) {   // p43: INK2_DS_LOG
+            static std::FILE* dsl = getenv("INK2_DS_LOG") ? std::fopen(getenv("INK2_DS_LOG"), "a") : nullptr;
+            if (dsl) {
+                std::fprintf(dsl, "%d %d :", p43_at, win[0]);
+                for (int t : d) std::fprintf(dsl, " %d", t);
+                std::fprintf(dsl, " : %d\n", right);
+                std::fflush(dsl);
+            }
+        }
         g.drafted += (int) d.size();
         g.accepted += right;
         if (lookup > 0 && !mtpd) {   // the n-gram draft length follows the last n-gram window (p7: not the drafter's)
@@ -3114,6 +3239,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         next = nn;
     }
     g.write_s = now_s() - t1;
+    e.want_logits = true;   // p47
     return g;
 }
 
@@ -3128,6 +3254,7 @@ static int serve(Engine& e, const std::string& path, int eos) {
         return 1;
     }
     std::fprintf(stderr, "ink2_v1: posluša na %s\n", path.c_str());
+    e.ck_spare();   // p55
     for (;;) {
         const int c = accept(s, nullptr, nullptr);
         if (c < 0) continue;
@@ -3168,6 +3295,32 @@ static int serve(Engine& e, const std::string& path, int eos) {
                 }
             }
             if (tok.empty()) throw std::runtime_error("no tokens");
+            if (!json_str(req, "featdump").empty()) {   // p43: every row's drafter features from position 0, nothing kept after
+                if (!e.ds_on) throw std::runtime_error("featdump: no drafter loaded");
+                if ((long long) tok.size() > e.ctx) throw std::runtime_error("featdump: longer than the context");
+                const std::string path = json_str(req, "featdump");
+                e.reset();
+                while (!e.parks.empty()) e.park_drop(e.parks.size() - 1);
+                e.fdump = std::fopen(path.c_str(), "wb");
+                if (!e.fdump) throw std::runtime_error("featdump: cannot write " + path);
+                e.force_pf = true;
+                try {
+                    e.feed(tok.data(), (int) tok.size(), false);
+                } catch (...) {
+                    e.force_pf = false;
+                    std::fclose(e.fdump);
+                    e.fdump = nullptr;
+                    throw;
+                }
+                e.force_pf = false;
+                std::fclose(e.fdump);
+                e.fdump = nullptr;
+                e.reset();
+                rep = "{\"featdump\": " + std::to_string(tok.size()) + "}\n";
+                (void) !write(c, rep.data(), rep.size());
+                close(c);
+                continue;
+            }
             const int max = (int) std::min<long long>(json_int(req, "max", 256), std::max<long long>(1, (long long) e.ctx - (long long) tok.size()));
             // p15: "stream": 1 sends {"t": [ids]} lines as the tokens come; a failed write (the client left) stops the generation
             const std::function<bool(const int*, int)> out_line = [&](const int* t, int n) {
@@ -3207,6 +3360,7 @@ static int serve(Engine& e, const std::string& path, int eos) {
         }
         (void) !write(c, rep.data(), rep.size());
         close(c);
+        e.ck_spare();   // p55: the client has its reply
     }
     close(s);
     unlink(path.c_str());

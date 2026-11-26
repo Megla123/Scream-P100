@@ -484,6 +484,47 @@ __global__ void __launch_bounds__(128) k_attn_comb(const float* part, int nparts
     out[o] = y * sigm(gate[o]);
 }
 
+// p57: k_attn_comb's numbers bit for bit (INK2_COMB2): the max over the parts by the block (exact in any order), each part's weight
+// once (the same expf of the same value) in shared memory a chunk of parts at a time, then the same sums in part order
+__global__ void __launch_bounds__(128) k_attn_comb2(const float* part, int nparts, const float* gate, float* out, int rot) {
+    constexpr int CH = 1024;
+    __shared__ float sh[HD];
+    __shared__ float fw[CH], lw[CH], red[4];
+    const int t = blockIdx.y, h = blockIdx.x, tid = threadIdx.x;
+    const float* p = part + ((size_t) t * NH_C + h) * nparts * (HD + 2);
+    float m = 0.0f;   // the sink, as k_attn_comb's start
+    for (int i = tid; i < nparts; i += 128) m = fmaxf(m, p[(size_t) i * (HD + 2)]);
+    m = warp_max(m);
+    if ((tid & 31) == 0) red[tid >> 5] = m;
+    __syncthreads();
+    const float M = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+    float L = expf(0.0f - M), acc = 0.0f;
+    for (int c0 = 0; c0 < nparts; c0 += CH) {
+        const int n = min(CH, nparts - c0);
+        __syncthreads();   // the previous chunk's weights are used up
+        for (int i = tid; i < n; i += 128) {
+            const float* pi = p + (size_t) (c0 + i) * (HD + 2);
+            const float l = pi[1];
+            lw[i] = l;
+            fw[i] = l == 0.0f ? 0.0f : expf(pi[0] - M);
+        }
+        __syncthreads();
+        const float* pd = p + (size_t) c0 * (HD + 2) + 2 + tid;
+#pragma unroll 8
+        for (int i = 0; i < n; ++i) {
+            const float l = lw[i];
+            if (l == 0.0f) continue;
+            const float f = fw[i];
+            L += l * f;
+            acc += pd[(size_t) i * (HD + 2)] * f;
+        }
+    }
+    const size_t o = ((size_t) t * NH_C + h) * HD + threadIdx.x;
+    float y = acc / L;
+    if (rot) y = fwht128(y, sh);
+    out[o] = y * sigm(gate[o]);
+}
+
 // ------------------------------------------------------------------------------------------------ MoE
 // router: p = sigmoid(logit), the top TOPK by p + bias (ties: the lower index), weights p / sum * scale. One block of NE threads a row
 __global__ void k_route(const float* logits, const float* bias, float wscale, int* topi, float* topw) {
@@ -719,9 +760,10 @@ __device__ __forceinline__ void seg_store(const Segs& S, int r, float v) {
     while (i + 1 < S.n && r >= S.r0[i + 1]) ++i;
     S.dst[i][r - S.r0[i]] = v;
 }
-__global__ void __launch_bounds__(256) k_gemv8_t1(const int8_t* __restrict__ q, const __half* __restrict__ d, int rows, int cols,
+template <int WPB = 8>   // p49: WPB warps a block (4 rows each); S is the launcher's, from 32-row blocks
+__global__ void __launch_bounds__(32 * WPB) k_gemv8_t1(const int8_t* __restrict__ q, const __half* __restrict__ d, int rows, int cols,
                                                    const float* __restrict__ x, Segs segs, int S) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, rb = blockIdx.x * G1_BR, r0 = rb + warp * G1_R;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, rb = blockIdx.x * (WPB * G1_R), r0 = rb + warp * G1_R;
     const int nch = (cols + 511) / 512, s = blockIdx.y, ch0 = s * nch / S, ch1 = (s + 1) * nch / S;
     float acc[G1_R] = {};
     for (int ch = ch0; ch < ch1; ++ch) {
@@ -758,7 +800,7 @@ __global__ void __launch_bounds__(256) k_gemv8_t1(const int8_t* __restrict__ q, 
     __syncthreads();
     if (!last) return;
     __threadfence();
-    if (threadIdx.x < G1_BR && rb + (int) threadIdx.x < rows) {
+    if (threadIdx.x < WPB * G1_R && rb + (int) threadIdx.x < rows) {
         const int r = rb + threadIdx.x;
         float v = 0;
         for (int k = 0; k < S; ++k) v += ((volatile float*) g_part)[(size_t) k * rows + r];
@@ -767,6 +809,51 @@ __global__ void __launch_bounds__(256) k_gemv8_t1(const int8_t* __restrict__ q, 
     if (threadIdx.x == 0) g_g1_cnt[blockIdx.x] = 0;
 }
 
+// p53: k_gemv8_t1's sums with RPW rows a warp and all S column parts of a row in that warp (INK2_G1W): part s's chunks as in
+// k_gemv8_t1 (lane l the 16 columns ch * 512 + 16 l, the same expression, acc += sc * v), warp_sum per part, the parts added in
+// order from 0 (k_gemv8_t1's last block); S = 1 stores the warp's sum as it is. 8 warps a block
+template <int RPW>
+__global__ void __launch_bounds__(256) k_gemv8_t1w(const int8_t* __restrict__ q, const __half* __restrict__ d, int rows, int cols,
+                                                    const float* __restrict__ x, Segs segs, int S) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, r0 = (blockIdx.x * 8 + warp) * RPW;
+    if (r0 >= rows) return;
+    const int nch = (cols + 511) / 512;
+    float tot[RPW];
+#pragma unroll
+    for (int a = 0; a < RPW; ++a) tot[a] = 0.0f;
+    for (int s = 0; s < S; ++s) {
+        const int ch0 = s * nch / S, ch1 = (s + 1) * nch / S;
+        float acc[RPW] = {};
+        for (int ch = ch0; ch < ch1; ++ch) {
+            const int c = ch * 512 + lane * 16;
+            if (c >= cols) continue;
+            const float4 x0 = __ldg((const float4*) (x + c)), x1 = __ldg((const float4*) (x + c + 4)), x2 = __ldg((const float4*) (x + c + 8)),
+                         x3 = __ldg((const float4*) (x + c + 12));
+#pragma unroll
+            for (int a = 0; a < RPW; ++a) {
+                const int r = r0 + a;
+                if (r >= rows) break;
+                const int4 w4 = __ldg((const int4*) (q + (size_t) r * cols + c));
+                const float sc = __half2float(d[(size_t) r * (cols / 32) + c / 32]);
+                const int8_t* w = (const int8_t*) &w4;
+                const float v = w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w +
+                                w[8] * x2.x + w[9] * x2.y + w[10] * x2.z + w[11] * x2.w + w[12] * x3.x + w[13] * x3.y + w[14] * x3.z + w[15] * x3.w;
+                acc[a] += sc * v;
+            }
+        }
+#pragma unroll
+        for (int a = 0; a < RPW; ++a) {
+            const float pv = warp_sum(acc[a]);
+            if (S == 1) tot[a] = pv;
+            else tot[a] += pv;
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int a = 0; a < RPW; ++a)
+            if (r0 + a < rows) seg_store(segs, r0 + a, tot[a]);
+    }
+}
 // F32 matrices with few rows and many columns (loop controllers' down 64 x 4608, router 128 x 2304): a block per row
 __global__ void __launch_bounds__(256) k_gemv32_rows(const float* __restrict__ W, int cols, const float* x, int ldx, float* y, int ldy, int T) {
     __shared__ float red[32];
@@ -873,6 +960,74 @@ __global__ void __launch_bounds__(768) k_mix2(States S, const float* q, int nq, 
         }
 }
 
+
+// p51: k_mix2 in two launches for few rows (INK2_MIX3=1, T <= MAXT); the same sums in the same order (see popravki/p51)
+__device__ float g_mix_part[MAXT * 24 * (MAXB + 2) * 5];
+__global__ void __launch_bounds__(32) k_mix3a(States S, const float* q, int nq) {   // block (w, t): k_mix2's warp w of row t
+    constexpr int NS = MAXB + 2, NR = NS * 5;
+    const int t = blockIdx.y, warp = blockIdx.x, lane = threadIdx.x, tid = warp * 32 + lane;
+    float acc[NR];
+#pragma unroll
+    for (int i = 0; i < NR; ++i) acc[i] = 0;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + 768 * k;
+        float qv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) qv[j] = j < nq ? q[(size_t) j * N + i] : 0.0f;
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            if (s < S.n) {
+                const float v = S.p[s][(size_t) t * N + i];
+                acc[s * 5] += v * v;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[s * 5 + 1 + j] += v * qv[j];
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < NR; ++i) {
+        const float v = warp_sum(acc[i]);
+        if (lane == 0) g_mix_part[((size_t) t * 24 + warp) * NR + i] = v;
+    }
+}
+__global__ void __launch_bounds__(256) k_mix3b(States S, int nq, float* out, int T) {   // block (b, t): outputs b * 256 .. of row t
+    constexpr int NS = MAXB + 2, NR = NS * 5;
+    __shared__ float red[NR];
+    __shared__ float inv[NS], w[4][NS];
+    const int t = blockIdx.y;
+    if (threadIdx.x < NR) {
+        float v = 0;
+        for (int k = 0; k < 24; ++k) v += g_mix_part[((size_t) t * 24 + k) * NR + threadIdx.x];
+        red[threadIdx.x] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        const int j = threadIdx.x;
+        float mx = -INFINITY;
+        for (int s = 0; s < S.n; ++s) {
+            const float iv = 1.0f / sqrtf(red[s * 5] / N + 1e-6f);
+            if (j == 0) inv[s] = iv;
+            w[j][s] = red[s * 5 + 1 + j] * iv / sqrtf((float) N);
+            mx = fmaxf(mx, w[j][s]);
+        }
+        float l = 0;
+        for (int s = 0; s < S.n; ++s) { w[j][s] = expf(w[j][s] - mx); l += w[j][s]; }
+        for (int s = 0; s < S.n; ++s) w[j][s] /= l;
+    }
+    __syncthreads();
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    float xv[NS];
+#pragma unroll
+    for (int s = 0; s < NS; ++s) xv[s] = s < S.n ? S.p[s][(size_t) t * N + i] : 0.0f;
+    for (int j = 0; j < nq; ++j) {
+        float v = 0;
+#pragma unroll
+        for (int s = 0; s < NS; ++s)
+            if (s < S.n) v += w[j][s] * (xv[s] * inv[s]);
+        out[((size_t) j * T + t) * N + i] = v;
+    }
+}
 
 // p4b: NVFP4 expert rows at writing by contiguous tiles: a warp takes R consecutive rows of NBLK blocks (R * NBLK = 288 = 9 * 32
 // blocks, one contiguous run of bytes); lane l decodes whole 36-byte blocks l, l + 32, ... (9 independent 32-bit loads each), the
@@ -1061,12 +1216,12 @@ static void fp4_to_planar(const uint8_t* src, uint8_t* dst, size_t rows, int nbl
     }
 }
 // k_fp4_rows6: k_fp4_rows3's tiles (R rows a warp, lane l the blocks l, l + 32, ... of the tile) on planar rows
-template <int NBLK, int R>
-__global__ void __launch_bounds__(128) k_fp4_rows6(const uint8_t* __restrict__ W, size_t estride, int rows, const float* x, int ldx,
+template <int NBLK, int R, int WPB = 4>   // p49: WPB warps a block
+__global__ void __launch_bounds__(32 * WPB) k_fp4_rows6(const uint8_t* __restrict__ W, size_t estride, int rows, const float* x, int ldx,
                                                    int xbyjob, const float* escale, const EJob* jobs, float* y, int ldy, const int* perm = nullptr,
                                                    const uint8_t* const* ET = nullptr) {   // p30: expert bases
     static_assert(NBLK * R == 288, "a warp's tile is 9 blocks a lane");
-    constexpr int COLS = NBLK * 64, WPB = 4;
+    constexpr int COLS = NBLK * 64;
     __shared__ float xs[NBLK * 65];
     __shared__ float part[WPB][288];
     __shared__ float tab[16], sct[256];
@@ -1762,6 +1917,65 @@ __global__ void k_post_state(const float* k, const float* v, float* sk, float* s
     for (int r = 0; r < 3; ++r) st[(size_t) r * KVC + c] = nv[r];
 }
 
+// p52: k_xchg_conv with the exchange as single 8-byte words (value bits | sequence << 32) in page-locked RAM (INK2_XLL=1): the
+// other card's word is polled until its sequence is this exchange's; no fence, no flag. The rest is k_xchg_conv's code
+__global__ void __launch_bounds__(1024) k_xchg_conv_ll(const float* y, const float* ey, const float* topw, unsigned long long* out_ll,
+                                                       const unsigned long long* in_ll, const unsigned* tok, unsigned idx, int card,
+                                                       float* st, const float* w, float k, float* cur, float* bpush) {
+    const unsigned seq = *tok * 128u + idx + 1u;
+    const unsigned long long tag = (unsigned long long) seq << 32;
+    float own[3], oth[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int i = threadIdx.x + 1024 * j;
+        own[j] = 0.0f;
+        if (i < N) {
+            float v;
+            if (ey) {
+                v = 0.0f;
+                for (int kk = 0; kk < TOPK; ++kk) v += ey[(size_t) kk * N + i] * topw[kk];
+            } else {
+                v = y[i];
+            }
+            own[j] = v;
+            ((volatile unsigned long long*) out_ll)[i] = tag | __float_as_uint(v);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int i = threadIdx.x + 1024 * j;
+        oth[j] = 0.0f;
+        if (i < N) {
+            unsigned long long wv;
+            do {
+                wv = ((const volatile unsigned long long*) in_ll)[i];
+            } while ((unsigned) (wv >> 32) != seq);
+            oth[j] = __uint_as_float((unsigned) wv);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int i = threadIdx.x + 1024 * j;
+        if (i >= N) continue;
+        const float a = card == 0 ? own[j] + oth[j] : oth[j] + own[j];
+        const float s0 = st[i], s1 = st[N + i], s2 = st[2 * N + i];
+        float o = 0.0f;
+        o += s0 * w[i * 4 + 0];
+        o += s1 * w[i * 4 + 1];
+        o += s2 * w[i * 4 + 2];
+        o += a * w[i * 4 + 3];
+        const float r = (a + o) * k;
+        st[i] = s1;
+        st[N + i] = s2;
+        st[2 * N + i] = a;
+        if (bpush) {
+            bpush[i] = cur[i];
+            cur[i] = r;
+        } else {
+            cur[i] = cur[i] + r;
+        }
+    }
+}
 // k_xchg_conv for T rows: the exchange of T x N, then per channel the convolution over the T rows in order (state in registers), the
 // residual (or the push) of each row; the exchanged rows go to hist (draft rollback) when given
 __global__ void __launch_bounds__(1024) k_xchg_convT(const float* y, const float* ey, const float* topw, float* out, volatile unsigned* flag,
