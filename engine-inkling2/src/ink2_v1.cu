@@ -201,7 +201,10 @@ struct Engine {
     bool xll = getenv("INK2_XLL") ? atoi(getenv("INK2_XLL")) != 0 : true;   // p52: T = 1 exchanges as 8-byte words (value | sequence)
     int g1w = getenv("INK2_G1W") ? atoi(getenv("INK2_G1W")) : 4;   // p53: dense Q8S T = 1 by k_gemv8_t1w, rows a warp (1 / 2 / 4; 0 off)
     bool ckspare = getenv("INK2_CKSPARE") ? atoi(getenv("INK2_CKSPARE")) != 0 : true;   // p55: a spare checkpoint buffer made between requests
-    bool comb2 = getenv("INK2_COMB2") ? atoi(getenv("INK2_COMB2")) != 0 : true;   // p57: k_attn_comb2 (the same numbers, the parts' max and weights in parallel)
+    const int att_w = getenv("INK2_ATT_W") ? atoi(getenv("INK2_ATT_W")) : 1;   // p61: a window's rows in one block of k_attn_decw (full layers)
+    const int att_w_min = getenv("INK2_ATT_W_MIN") ? atoi(getenv("INK2_ATT_W_MIN")) : 64;   // p61: from so many parts (64 = 4k; kodachat -0.3 % below)
+    int comb2 = getenv("INK2_COMB2") ? atoi(getenv("INK2_COMB2")) : 3;   // p57: 1 k_attn_comb2 (the parts' max and weights in parallel); p59: 3 k_attn_comb4 / comb5 from INK2_COMB4_MIN parts
+    const int comb4_min = getenv("INK2_COMB4_MIN") ? atoi(getenv("INK2_COMB4_MIN")) : 48;   // p59
     int xsplit = getenv("INK2_XSPLIT") ? std::max(1, std::min(PFB::XS_MAX, atoi(getenv("INK2_XSPLIT")))) : 4;   // p19d: slices of an exchange (1: xch_pf; 22. 11.: 2 / 3 / 4 = 14k 876 / 896 / 914)   // p19b: one block a tile of 64 / 32 / 16 tokens (0: k_fp4_gemm)
     bool pf_deq = getenv("INK2_PF_DEQ") != nullptr;  // p3c: NVFP4 experts of the reading path dequantized to f32 + cuBLAS (p3b)
     bool catm = getenv("INK2_CATM") ? atoi(getenv("INK2_CATM")) != 0 : false;   // p27: the input projections in one call a group of rows (23. 11.: 128 tokens 322 -> 320 ms, routing ties move: off)
@@ -218,7 +221,7 @@ struct Engine {
     // zip: INK2_PF_ZIP=n (2 or 3; 0 = off): n consecutive reading chunks at once, their steps taking turns on each card's
     // stream, so a chunk's exchange crosses PCIe while the other chunks compute. Every launch and cuBLAS call is the same,
     // chunk by chunk, so the output is the same to the bit. Off by itself when its buffers would push experts to RAM
-    int zip = getenv("INK2_PF_ZIP") ? atoi(getenv("INK2_PF_ZIP")) : 0;
+    int zip = getenv("INK2_PF_ZIP") ? atoi(getenv("INK2_PF_ZIP")) : 2;
     std::atomic<unsigned> zrec[Card::ZMAX][NC];   // as pf_rec, for each of the chunks
     float* h_x0z[Card::ZMAX] = {};                // chunks 1..: rows, positions, tau and raw marks (chunk 0: h_x0, h_pos, h_tau, h_raw)
     int* h_posz[Card::ZMAX] = {};
@@ -1472,19 +1475,47 @@ struct Engine {
             static const bool att_rows = !getenv("INK2_ATT_ROWS") || atoi(getenv("INK2_ATT_ROWS")) != 0;
             const int nt = att_rows ? T : 1;
             const dim3 g16(npf * nt, NKV_C, T / nt), g8((np - npf) * nt, NKV_C, T / nt);
-            if (npf > 0) {
-                if (big)
-                    k_attn_dec<128, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0, nt);
-                else
-                    k_attn_dec<64, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0, nt);
+            if (att_w && L.full && T >= 2 && np >= att_w_min) {   // p61: 2 or 4 rows of the window a block, K and V read once
+                // micro test (26. 11.): 2 rows a block for T = 2 and below 512 parts (32k), 4 from 512 parts for T >= 3
+                const int tt = T >= 3 && np >= 512 ? 4 : 2;
+                const dim3 w16(npf, NKV_C, (T + tt - 1) / tt), w8(np - npf, NKV_C, (T + tt - 1) / tt);
+                if (npf > 0) {
+                    if (tt == 4) {
+                        if (big) k_attn_decw<128, false, 4><<<w16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, 0, T);
+                        else k_attn_decw<64, false, 4><<<w16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, 0, T);
+                    } else {
+                        if (big) k_attn_decw<128, false, 2><<<w16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, 0, T);
+                        else k_attn_decw<64, false, 2><<<w16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, 0, T);
+                    }
+                }
+                if (np > npf) {
+                    if (tt == 4) {
+                        if (big) k_attn_decw<128, true, 4><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
+                        else k_attn_decw<64, true, 4><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
+                    } else {
+                        if (big) k_attn_decw<128, true, 2><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
+                        else k_attn_decw<64, true, 2><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
+                    }
+                }
+            } else {
+                if (npf > 0) {
+                    if (big)
+                        k_attn_dec<128, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0, nt);
+                    else
+                        k_attn_dec<64, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0, nt);
+                }
+                if (np > npf) {
+                    if (big)
+                        k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
+                    else
+                        k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
+                }
             }
-            if (np > npf) {
-                if (big)
-                    k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
-                else
-                    k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
-            }
-            if (comb2) k_attn_comb2<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);   // p57
+            if (comb2 == 3 && np >= comb4_min && T <= 2) {   // p59: 4 blocks a head
+                k_attn_comb4<4, 32><<<dim3(NH_C * 4, T), 32, 0, K.st>>>(K.part, np, K.ao);
+                k_attn_comb4b<<<dim3(NH_C, T), 128, 0, K.st>>>(K.gate, K.ao, q8k && q8.rot);
+            } else if (comb2 == 3 && np >= comb4_min) k_attn_comb5<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);   // p59
+            else if (comb2) k_attn_comb2<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);   // p57
             else k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);
         } else {
             const int np = L.full ? nparts : std::min(nparts, (SWA + KC - 1) / KC + 1);

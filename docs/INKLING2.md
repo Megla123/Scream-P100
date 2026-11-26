@@ -25,7 +25,10 @@ faster; the same bits. **Writing 15 % faster** (26 Nov, p47-p57,
 [below](#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov)): each card now picks the next token
 itself instead of sending 0.4 MB of logits a row to the host, and several smaller waits are gone: on 56 prompts at 512k 79.9 →
 91.6 tok/s with drafts and 62.6 → 72.4 without, up to 22 % faster at a depth of 240k tokens, edits 139 → 171 tok/s; the same
-bits, reading as before.
+bits, reading as before. **And reading 5 % faster, writing at depth up to 16 %** (26 Nov, p59, p61 and Keoian's PR #15,
+[below](#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)): two reading chunks at once (1,031 tok/s at
+4k, was 981), the attention's parts joined by more blocks and a draft window's rows in one block (240k: 33.2 → 38.4 tok/s with
+drafts); the same bits.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -151,6 +154,54 @@ coding agent's write / bash tools worked on our machine. **Pictures**: `image_ur
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## Attention at depth and two reading chunks at once (p59, p61, PR #15, 26 Nov)
+
+`src/` (`build/ink2_v1`) now writes up to **16 % faster at a depth of 240k tokens** and reads **5 % faster** (over 1,000
+tok/s at 4k for the first time on our machine), again with **the same output**: every answer of the 56 prompts below, every
+read's tokens and logits, and every step's logits hashed with drafts at 512k are those of p47-p57 (and of p41). Three changes,
+each with a switch whose old value runs the old code:
+
+- **p59, the attention's parts joined by more blocks** (`INK2_COMB2=3`, from `INK2_COMB4_MIN` = 48 parts; `1` = p57's
+  kernel). After p57 one block of 128 threads a (row, head) still waited for each part's values one after the other: 137 µs
+  at 1,024 parts (64k) whether a window had 1, 2 or 4 rows, so the limit was the block, not the 6.4 MB it reads. For one or
+  two rows it is now 4 blocks of 32 threads a head (each block finds the same maximum and weights itself, a thread still one
+  dimension), the values 32 parts ahead in registers, and the head's rotation and gate in a small kernel after it; for 3 or
+  more rows one block with the values 16 parts ahead. The same sums in the same order. Alone (micro test, a card): 137 → 46
+  µs at 1,024 parts, 497 → 154 at 4,096.
+- **p61, a draft window's rows in one block** (`INK2_ATT_W=1`, full-attention layers from `INK2_ATT_W_MIN` = 64 parts, that
+  is 4k; `0` = one block a row). A window checks up to 4 drafted tokens at once, and on the full layers each of its rows read
+  the part's K and V rows itself: `k_attn_dec` took 410 / 672 / 1,194 µs at 64k for 1 / 2 / 4 rows. Now 2 or 4 rows share a
+  block and read them once (each row's dot products, softmax and sums the same code in the same order; the queries come from
+  shared memory): 2 rows 669 → 502 µs, 4 rows 1,195 → 865, and at 240k 5,031 → 3,332. Below 4k it was 0.3 % slower on a short
+  chat, hence the threshold. Single tokens are not touched.
+- **[PR #15](https://github.com/Megla123/Scream-P100/pull/15) by Keoian, two reading chunks at once**
+  ([above](#two-reading-chunks-at-once-ink2_pf_zip-25-26-nov-a-contribution-measured-on-two-other-machines)), **on by default
+  in this build** (`INK2_PF_ZIP=2`; `0` = one chunk at a time). On our machine, two x16 links at 185 W, it fits at 512k (its 252
+  MiB a card of the 292 to spare beside the experts, 15.25 GiB a card in use) and gives the same bits.
+
+Each change alone, at 512k, 185 W, two runs of each arm, every token and hash the same:
+
+| | before | after | |
+|---|---|---|---|
+| p59: writing at 64k, drafts / single tokens | 58.9 / 55.5 tok/s | 60.1 / 57.5 | +2.0 / +3.5 % |
+| p59: writing at 128k, drafts / single tokens | 56.4 / 44.9 | 57.7 / 47.7 | +2.4 / +6.2 % |
+| p61: writing with drafts at 64k / 128k | 60.2 / 57.8 | 62.2 / 63.1 | +3.4 / **+9.1 %** |
+| PR #15: reading 4k / 30k / 128k from token 0 | 981 / 863 / 545 | **1,031** / 895 / 557 | +5.1 / +3.7 / +2.2 % |
+
+All three against the build before (p47-p57), the whole check we run before a build goes into use (512k, 185 W):
+
+| | p47-p57 | **+ p59, p61, PR #15** |
+|---|---|---|
+| Writing with drafts / without, the 56 prompts of the section below (all answers the same) | 91.6 / 72.4 tok/s | 92.1 / 73.4 |
+| Writing at a depth of 0 / 16k / 64k / 128k / 240k tokens, with drafts | 84.9 / 69.9 / 76.7 / 46.0 / 33.2 | 85.2 / 70.8 / **81.2 / 50.8 / 38.4** (+5.9 / +10.4 / +15.7 % from 64k) |
+| &nbsp; the same without drafts | 72.3 / 67.6 / 54.9 / 44.4 / 33.3 | 73.4 / 69.1 / 57.6 / 47.7 / 36.8 |
+| Reading 4k / 30k / 128k from token 0 | 981 / 861 / 545 | **1,031** / 891 / 557 |
+| Reading at a depth of 64k / 128k / 240k | 718 / 547 / 366 | 739 / 558 / 371 |
+| `tools/bench.py` through the server: fresh / edit / 34.7k read / writing after it | 83.2 / 141.3 / 696 / 63.8 (the night before, 125 W: reading is slower there) | 84.6 / 155.4 / **824.5** / 68.0 |
+
+Checkpoints (`ckpt_test`), parked conversations (`park_test`), a picture, a chat app's conversation and `/metrics` passed as
+before. The micro tests and our step scripts are not in this branch; the numbers are from the engine through its socket.
 
 ## Writing faster: the argmax on the cards and less waiting (p47-p57, 26 Nov)
 
@@ -907,8 +958,8 @@ and from 26 Nov (p47-p57, each at its old value = the old code, all the same bit
 0 the logits to the host), `INK2_G1WPB` (2, warps a block of the dense Q8 matrices of a single token; 8 before),
 `INK2_G1W` (4, rows a warp for them; 0 the block kernel), `INK2_MIX3` (1, the depth mixes of few rows in two launches),
 `INK2_XLL` (1, single-token exchanges as 8-byte words), `INK2_CKSPARE` (1, the spare checkpoint buffer made between requests),
-`INK2_COMB2` (1, the attention's parts joined in parallel; 0 `k_attn_comb`), `INK2_R7TPB` / `INK2_R6WPB` (256 / 4, the expert
-kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (0; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts).
+`INK2_COMB2` (3 since p59, 4 blocks a head or the values ahead in registers; 1 p57's parallel join; 0 `k_attn_comb`), `INK2_R7TPB` / `INK2_R6WPB` (256 / 4, the expert
+kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 

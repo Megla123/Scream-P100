@@ -525,6 +525,121 @@ __global__ void __launch_bounds__(128) k_attn_comb2(const float* part, int npart
     out[o] = y * sigm(gate[o]);
 }
 
+// p59: k_attn_comb2's numbers with S blocks of 128 / S threads a (row, head) (INK2_COMB2=3, T <= 2): block b of head b / S does
+// dimensions (b % S) * 128 / S ..., a thread a dimension, each block the same max and weights, the values U parts ahead in
+// registers; acc / L to out, then k_attn_comb4b the FWHT (rot) and the gate in place
+template <int S, int U>
+__global__ void __launch_bounds__(128 / S) k_attn_comb4(const float* part, int nparts, float* out) {
+    constexpr int NT = 128 / S, CH = 1024;
+    __shared__ float fw[CH], lw[CH], red[NT / 32 > 0 ? NT / 32 : 1];
+    const int t = blockIdx.y, h = blockIdx.x / S, d = (blockIdx.x % S) * NT + threadIdx.x, tid = threadIdx.x;
+    const float* p = part + ((size_t) t * NH_C + h) * nparts * (HD + 2);
+    float m = 0.0f;   // the sink, as k_attn_comb's start
+    for (int i = tid; i < nparts; i += NT) m = fmaxf(m, p[(size_t) i * (HD + 2)]);
+    m = warp_max(m);
+    if (NT > 32) {
+        if ((tid & 31) == 0) red[tid >> 5] = m;
+        __syncthreads();
+        m = red[0];
+        for (int w = 1; w < NT / 32; ++w) m = fmaxf(m, red[w]);
+    }
+    const float M = m;
+    float L = expf(0.0f - M), acc = 0.0f;
+    for (int c0 = 0; c0 < nparts; c0 += CH) {
+        const int n = min(CH, nparts - c0);
+        __syncthreads();   // the previous chunk's weights are used up
+        for (int i = tid; i < n; i += NT) {
+            const float* pi = p + (size_t) (c0 + i) * (HD + 2);
+            const float l = pi[1];
+            lw[i] = l;
+            fw[i] = l == 0.0f ? 0.0f : expf(pi[0] - M);
+        }
+        __syncthreads();
+        const float* pd = p + (size_t) c0 * (HD + 2) + 2 + d;
+        int i = 0;
+        for (; i + U <= n; i += U) {
+            float vv[U];
+#pragma unroll
+            for (int j = 0; j < U; ++j) vv[j] = __ldg(pd + (size_t) (i + j) * (HD + 2));
+#pragma unroll
+            for (int j = 0; j < U; ++j) {
+                const float l = lw[i + j];
+                if (l == 0.0f) continue;
+                const float f = fw[i + j];
+                L += l * f;
+                acc += vv[j] * f;
+            }
+        }
+        for (; i < n; ++i) {
+            const float l = lw[i];
+            if (l == 0.0f) continue;
+            const float f = fw[i];
+            L += l * f;
+            acc += pd[(size_t) i * (HD + 2)] * f;
+        }
+    }
+    out[((size_t) t * NH_C + h) * HD + d] = acc / L;
+}
+__global__ void __launch_bounds__(128) k_attn_comb4b(const float* gate, float* out, int rot) {
+    __shared__ float sh[HD];
+    const size_t o = ((size_t) blockIdx.y * NH_C + blockIdx.x) * HD + threadIdx.x;
+    float y = out[o];
+    if (rot) y = fwht128(y, sh);
+    out[o] = y * sigm(gate[o]);
+}
+// p59: k_attn_comb2 with the values 16 parts ahead in registers (INK2_COMB2=3, T >= 3), the FWHT and the gate in the same kernel
+__global__ void __launch_bounds__(128) k_attn_comb5(const float* part, int nparts, const float* gate, float* out, int rot) {
+    constexpr int CH = 1024, U = 16;
+    __shared__ float sh[HD];
+    __shared__ float fw[CH], lw[CH], red[4];
+    const int t = blockIdx.y, h = blockIdx.x, tid = threadIdx.x;
+    const float* p = part + ((size_t) t * NH_C + h) * nparts * (HD + 2);
+    float m = 0.0f;   // the sink, as k_attn_comb's start
+    for (int i = tid; i < nparts; i += 128) m = fmaxf(m, p[(size_t) i * (HD + 2)]);
+    m = warp_max(m);
+    if ((tid & 31) == 0) red[tid >> 5] = m;
+    __syncthreads();
+    const float M = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+    float L = expf(0.0f - M), acc = 0.0f;
+    for (int c0 = 0; c0 < nparts; c0 += CH) {
+        const int n = min(CH, nparts - c0);
+        __syncthreads();   // the previous chunk's weights are used up
+        for (int i = tid; i < n; i += 128) {
+            const float* pi = p + (size_t) (c0 + i) * (HD + 2);
+            const float l = pi[1];
+            lw[i] = l;
+            fw[i] = l == 0.0f ? 0.0f : expf(pi[0] - M);
+        }
+        __syncthreads();
+        const float* pd = p + (size_t) c0 * (HD + 2) + 2 + tid;
+        int i = 0;
+        for (; i + U <= n; i += U) {
+            float vv[U];
+#pragma unroll
+            for (int j = 0; j < U; ++j) vv[j] = __ldg(pd + (size_t) (i + j) * (HD + 2));
+#pragma unroll
+            for (int j = 0; j < U; ++j) {
+                const float l = lw[i + j];
+                if (l == 0.0f) continue;
+                const float f = fw[i + j];
+                L += l * f;
+                acc += vv[j] * f;
+            }
+        }
+        for (; i < n; ++i) {
+            const float l = lw[i];
+            if (l == 0.0f) continue;
+            const float f = fw[i];
+            L += l * f;
+            acc += pd[(size_t) i * (HD + 2)] * f;
+        }
+    }
+    const size_t o = ((size_t) t * NH_C + h) * HD + threadIdx.x;
+    float y = acc / L;
+    if (rot) y = fwht128(y, sh);
+    out[o] = y * sigm(gate[o]);
+}
+
 // ------------------------------------------------------------------------------------------------ MoE
 // router: p = sigmoid(logit), the top TOPK by p + bias (ties: the lower index), weights p / sum * scale. One block of NE threads a row
 __global__ void k_route(const float* logits, const float* bias, float wscale, int* topi, float* topw) {
@@ -1644,6 +1759,142 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R
     }
 }
 
+
+// p61: a full layer's attention for up to TT rows of a draft window in one block (INK2_ATT_W): the K and V rows read once
+template <int KCB, bool Q8, int TT>
+__global__ void __launch_bounds__(128) k_attn_decw(const float* q, const float* R, const float* B, const float* sink, const __half* kc,
+                                                   const __half* vc, const int* pos, float* part, int nparts, KV8 q8, int poff, int T) {
+    constexpr int QP = 17;   // a lane's 16 query values, padded: 8 lanes read 8 banks apart
+    __shared__ float qs[TT][GQ][8 * QP];
+    __shared__ float rs[TT][GQ][NREL];
+    __shared__ float sc[TT][GQ][KCB];
+    __shared__ float red[TT][GQ][2];
+    const int g = blockIdx.y, p = (int) blockIdx.x + poff, tid = threadIdx.x, t0 = (int) blockIdx.z * TT;
+    const int nt = min(TT, T - t0);
+    const int j0 = p * KCB;
+    int nr[TT];   // keys of this part a row
+    int nmax = 0;
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        nr[t] = t < nt ? max(0, min(pos[t0 + t] + 1, j0 + KCB) - j0) : 0;
+        nmax = max(nmax, nr[t]);
+    }
+    for (int t = 0; t < nt; ++t)
+        for (int hh = 0; hh < GQ; ++hh) qs[t][hh][(tid >> 4) * QP + (tid & 15)] = q[(size_t) (t0 + t) * QC + (g * GQ + hh) * HD + tid];
+    for (int i = tid; i < nt * GQ * NREL; i += 128) {
+        const int t = i / (GQ * NREL), r = i % (GQ * NREL);
+        rs[t][r / NREL][r % NREL] = R[(size_t) (t0 + t) * NH_C * NREL + (g * GQ + r / NREL) * NREL + r % NREL];
+    }
+    __syncthreads();
+    const int warp = tid >> 5, lane = tid & 31, sub = lane >> 3, l8 = lane & 7;
+    const float scale = 1.0f / sqrtf((float) HD);
+    for (int base = warp * 4; base < nmax; base += 16) {
+        const int jj = base + sub;
+        const bool ok = jj < nmax;
+        const int j = j0 + (ok ? jj : 0);
+        const size_t row = (size_t) j;
+        float kf[16], ksc = 1.0f;
+        if (Q8 && q8.k && row >= (size_t) q8.f0) {
+            uint4 a = make_uint4(0, 0, 0, 0);
+            if (ok) {
+                const size_t r8 = row - q8.f0;
+                a = __ldg((const uint4*) (q8.k + r8 * KVC + g * HD + l8 * 16));
+                ksc = __half2float(q8.ks[r8 * KQN + (g * HD + l8 * 16) / KQG]);
+            }
+            const int8_t* b8 = (const int8_t*) &a;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) kf[i] = (float) b8[i];
+        } else {
+            const uint4* kr = (const uint4*) (kc + row * KVC + g * HD + l8 * 16);
+            uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
+            if (ok) {
+                a = __ldg(kr);
+                b = __ldg(kr + 1);
+            }
+            const __half2* h2a = (const __half2*) &a;
+            const __half2* h2b = (const __half2*) &b;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 fa = __half22float2(h2a[i]), fb = __half22float2(h2b[i]);
+                kf[2 * i] = fa.x; kf[2 * i + 1] = fa.y; kf[8 + 2 * i] = fb.x; kf[8 + 2 * i + 1] = fb.y;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= nt) break;
+            float d[GQ];
+#pragma unroll
+            for (int hh = 0; hh < GQ; ++hh) {
+                const float* qv = &qs[t][hh][l8 * QP];
+                float s = 0;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) s += kf[i] * qv[i];
+                if (Q8) s *= ksc;
+                s += __shfl_xor_sync(0xffffffffu, s, 1);
+                s += __shfl_xor_sync(0xffffffffu, s, 2);
+                s += __shfl_xor_sync(0xffffffffu, s, 4);
+                d[hh] = s;
+            }
+            if (jj < nr[t] && l8 < GQ) {   // lane l8 = hh adds head hh's bias, as k_attn_dec
+                const int hh = l8, dist = pos[t0 + t] - j;
+                float bias = 0.0f;
+                if (dist < EXT) {
+                    const float* bb = B + (size_t) dist * NREL;
+#pragma unroll
+                    for (int r = 0; r < NREL; ++r) bias += rs[t][hh][r] * bb[r];
+                }
+                const float dd = hh == 0 ? d[0] : (hh == 1 ? d[1] : d[2]);
+                sc[t][hh][jj] = dd * scale + (bias - sink[(t0 + t) * NH_C + g * GQ + hh]);
+            }
+        }
+    }
+    __syncthreads();
+    for (int pp = warp; pp < nt * GQ; pp += 4) {   // each (row, head)'s max and sum by one warp, as k_attn_dec's warp hh
+        const int t = pp / GQ, hh = pp % GQ;
+        int n = 0;
+#pragma unroll
+        for (int u = 0; u < TT; ++u) if (u == t) n = nr[u];
+        float m = -INFINITY;
+        for (int j = lane; j < n; j += 32) m = fmaxf(m, sc[t][hh][j]);
+        m = warp_max(m);
+        float l = 0;
+        for (int j = lane; j < n; j += 32) {
+            const float e = expf(sc[t][hh][j] - m);
+            sc[t][hh][j] = e;
+            l += e;
+        }
+        l = warp_sum(l);
+        if (lane == 0) { red[t][hh][0] = m; red[t][hh][1] = l; }
+    }
+    __syncthreads();
+    float acc[TT][GQ] = {};
+    for (int jj = 0; jj < nmax; ++jj) {
+        const int j = j0 + jj;
+        const size_t row = (size_t) j;
+        const float vv = Q8 ? kv_get(q8, false, vc, row, g * HD + tid) : __half2float(vc[row * KVC + g * HD + tid]);
+#pragma unroll
+        for (int t = 0; t < TT; ++t)
+            if (jj < nr[t])
+#pragma unroll
+                for (int hh = 0; hh < GQ; ++hh) acc[t][hh] += sc[t][hh][jj] * vv;
+    }
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        if (t >= nt) break;
+        float* pt = part + (size_t) (t0 + t) * NH_C * nparts * (HD + 2);
+#pragma unroll
+        for (int hh = 0; hh < GQ; ++hh) {
+            float* o = pt + ((size_t) (g * GQ + hh) * nparts + p) * (HD + 2);
+            if (nr[t] == 0) {   // nothing of this part for the row: k_attn_dec's empty result
+                if (tid == 0) { o[0] = -INFINITY; o[1] = 0.0f; }
+                o[2 + tid] = 0.0f;
+            } else {
+                if (tid == 0) { o[0] = red[t][hh][0]; o[1] = red[t][hh][1]; }
+                o[2 + tid] = acc[t][hh];
+            }
+        }
+    }
+}
 
 // p5a: draft windows. The convolutions' states of all slots in one buffer (per slot: K, V 3 x KVC, attention and FFN outputs 3 x N);
 // after a window of T tokens of which keep were valid, the state = rows keep .. keep + 2 of [the state before (3 rows), the window's
