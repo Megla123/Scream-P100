@@ -34,7 +34,9 @@ Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run thr
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
 Scream P100's Flash-Next, with an **engine of its own**, `ink2` (`engine-inkling2/`): Strata's split engine does not know the
 looped layers, the depth mixing, the loop controllers and messages, the short convolutions, the relative position bias with
-a sink logit, or the DSpark drafter, so we wrote one with the same idea. **Both cards work on every layer at once**, and
+a sink logit, or the DSpark drafter, so we wrote one with the same idea. **`ink2` is not a Strata fork:** its engine, kernels,
+GGUF reader and server are written for Inkling 2 and hold no Strata code; it links llama.cpp only for the tokenizer and
+the picture encoder. **Both cards work on every layer at once**, and
 here the **whole model sits in VRAM** (8.9 GB a card): no RAM tier, no PCIe streaming of experts.
 
 ## Speed
