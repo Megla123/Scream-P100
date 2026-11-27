@@ -95,6 +95,19 @@ same model: the same requests to this branch's server before and after the chang
 loop) gave the same tokens, 6 of 6. A conversation that ended in 3 equal calls got the loop's system message, and
 `tools/loop_check.py` passes. The limits and the tests behind them are in that branch's guide.
 
+Since 27 Nov two more, as on branch `inkling2`:
+
+- A tool call that loops is cut where it began, and the model writes on after a system message that says so
+  (`INK2_LOOP_CALL`). A reply that ends in a loop again with no call and no text ends with a line the user sees ("[ink2_server]
+  I stopped here: …"), so an agent no longer stops without a word.
+- While a prompt is read, `/slots` gives llama-server's `n_prompt_tokens_total`, `n_prompt_tokens_cache` and
+  `n_prompt_tokens_processed`, the last estimated from the reading cost by depth. The cost model was measured on the P100, so
+  the first long read sets its scale for the M40, which reads at about half that speed. Without checkpoints, the cache
+  expected is the conversation the engine holds, continued to its end.
+
+Both were checked with a fake engine (scripted tokens through the engine's socket): without a loop the same tokens as before,
+one loop followed by a good call, a loop every time ending with the visible line.
+
 ## Notes
 
 - The server waits up to 4 hours for the engine (a 500k read on the M40 takes over an hour).
