@@ -664,6 +664,14 @@ CALL_NOTE = os.environ.get("INK2_LOOP_CALL_NOTE") or (
 CALL_STOP = ("[ink2_server] I stopped here: my tool call ({what}) kept repeating the same text, so it was not run. Tell me how "
              "to go on.")
 LOOP_END = "[ink2_server] I stopped here: my reply kept repeating itself. Tell me how to go on."
+# p77: an agent's step that ends by itself with neither text nor a tool call: the system message the model writes on after (once
+# a request), and the line the client gets when the reply is empty again
+EMPTY_STEP = int(os.environ.get("INK2_EMPTY_STEP", "1"))
+EMPTY_NOTE = os.environ.get("INK2_EMPTY_NOTE") or (
+    "Your turn ended without a reply to the user and without a tool call. If you meant to call a tool, call it now. Otherwise "
+    "write your answer to the user.")
+EMPTY_STOP = "[ink2_server] I stopped here without a reply or a tool call. Tell me how to go on."
+_INTENT = re.compile(r"\b(?:let me|let's|i'll|i will|i need to|i should|now i|next,? i)\b", re.I)
 # p75: the reasoning's budget by effort (tokens of a reply's reasoning part): <= 0.1 / 0.2 / 0.7 / 0.9 / above; INK2_THINK_BUDGET=0 off
 THINK_BUDGET = [int(x) for x in os.environ.get("INK2_THINK_BUDGET", "1024,4096,8192,16384,32768").split(",") if x.strip()]
 THINK_BUDGET_TOOLS = int(os.environ.get("INK2_THINK_BUDGET_TOOLS", "8192"))   # p75: the most with tools (0: no extra limit)
@@ -769,7 +777,7 @@ def turn_loop2(messages):
     return None
 
 
-def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0):
+def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False):
     """The engine's reply to the prompt ids, at most mx tokens: (tokens, totals, stopped). Each token's parts go to
     on_part(kind, val) as they come ("r" reasoning, "c" content, "tool" a call). A loop in the reasoning (Loop) stops
     the engine; the reasoning is kept up to the end of the block's first copy, closed by NUDGE, and the model writes its
@@ -781,6 +789,7 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0):
     the reply is in a part that streams nothing (a tool call). p75: budget > 0, a reasoning part over budget tokens is closed at
     its next sentence end by BUDGET_NOTE (once a reply) and the model writes its answer."""
     parts, guard, out = Parts(), Loop(), []
+    said = False   # p77: the reply has text or a tool call
     r_n, bud = 0, False   # p75: tokens of the current reasoning part; a budget cut asked
     parts.mode = mode
     tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
@@ -805,6 +814,7 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0):
                     for t in msg["t"]:
                         out.append(t)
                         evs = parts.feed([t])
+                        said = said or any(k == "tool" or (k == "c" and v.strip()) for k, v in evs)   # p77
                         if on_part:
                             for kind, val in evs:
                                 on_part(kind, val)
@@ -841,6 +851,22 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0):
             tot["read_s"] += (t_first or t_req) - t_req
             tot["write_s"] += time.time() - (t_first or t_req)
         if keep is None:
+            if EMPTY_STEP and tools and not said and out and out[-1] == EOS:   # p77: an agent's step that would stop without a word
+                if tot.get("empty_retry"):
+                    return shown(True, EMPTY_STOP)
+                base = out[:-1] if out[-2:-1] == [T_END] else out[:-1] + [T_END]
+                note = tokenize("<|message_system|><|content_text|>" + EMPTY_NOTE + "<|end_message|>")
+                if len(base) + len(note) + 64 < mx:
+                    tail = b"".join(token_bytes(t) for t in base[-48:] if t not in SPECIAL and t < len(TOKS)).decode("utf-8", "replace")
+                    m = _INTENT.findall(tail)
+                    intent = repr(tail[tail.lower().rfind(m[-1].lower()):][:80]) if m else "-"
+                    print(f"ink2_server: a step without text or a tool call ({intent}): the model writes on after a system message", file=sys.stderr, flush=True)
+                    tot["empty_retry"] = 1
+                    out = base
+                    hidden.append((len(out), len(out) + len(note)))
+                    out += note
+                    parts, guard, r_n = Parts(), Loop(), 0
+                    continue
             return shown(False)
         if bud:   # p75: the reasoning over its budget, closed at a sentence end; not a loop cut
             bud = False
@@ -1081,7 +1107,7 @@ class H(BaseHTTPRequestHandler):
                     on_part("r", note)
             try:
                 out, tot, stopped = reply(ids, mx, req, on_part, mode="r" if loop and note else "c", gone=self._gone,
-                                          budget=think_budget(effort_of(body), bool(tools)))   # p75
+                                          budget=think_budget(effort_of(body), bool(tools)), tools=bool(tools))   # p75, p77
             except (BrokenPipeError, ConnectionResetError):   # closing the engine's socket stopped it at its next write
                 print(f"ink2_server: request: the client left after {STATE['n_decoded']} written tokens ({len(ids)} prompt tokens); "
                       f"the engine stopped", file=sys.stderr, flush=True)
@@ -1125,6 +1151,8 @@ class H(BaseHTTPRequestHandler):
                        "draft_n": tot["drafted"], "draft_n_accepted": tot["accepted"]}
             if tot["cuts"]:
                 timings["loop_cuts"] = tot["cuts"]
+            if tot.get("empty_retry"):
+                timings["empty_step_retry"] = 1   # p77
             if tot.get("call_retry"):
                 timings["loop_call_retry"] = 1
             if loop:

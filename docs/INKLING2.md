@@ -318,6 +318,28 @@ server `make_multi.py` makes from this file). We checked both with a budget of 3
 
 `INK2_THINK_BUDGET` sets the five budgets (comma list); `INK2_THINK_BUDGET=0` turns it off.
 
+## An agent's step never ends without a word (p77, 27 Nov)
+
+A request with tools whose reply ends by itself with **neither text nor a tool call** would leave an agent standing without a
+word. The model's reasoning usually says what it was about to do ("Let me check …"). The server now does not hand such a reply
+over:
+- it drops the stop token, closes the model's message and adds a system message, once a request: "Your turn ended without a
+  reply to the user and without a tool call. If you meant to call a tool, call it now. Otherwise write your answer to the
+  user." The model writes on, and the client never sees the note;
+- if the reply is empty again, the client gets a visible line instead: `[ink2_server] I stopped here without a reply or a tool
+  call. Tell me how to go on.`
+
+A reply that has any text or a call, that ends by its length, or that has no tools is the same as before, bit for bit: the
+engine gets the same requests. Checked:
+- with a fake engine (an empty step once, every time, never; and a short answer): the call after the note, the visible line,
+  and the same requests as before where nothing was empty;
+- with the real engine, short requests through the server before and after gave the same output;
+- the server runs the same on one card and with `INK2_MULTI=tpb` (`make_multi.py` makes the latter's from it).
+
+Our agent's two empty steps at 340k tokens on 27 Nov came from the [loop guard](#loops-in-the-reasoning-the-answer-or-a-tool-call)
+dropping a looping call (fixed that morning). This is the net for a step the model itself ends empty. `INK2_EMPTY_STEP` (1;
+0 = off) switches it, `INK2_EMPTY_NOTE` sets the note's text.
+
 ## Sampling: a choice, greedy by default (p76, 27 Nov)
 
 The server is still **greedy by default** and ignores a request's temperature. `INK2_SAMPLING=1` lets a request's
@@ -1378,7 +1400,9 @@ see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call), and from 27 Nov 
 `INK2_THINK_BUDGET_TOOLS` (8192, the most for a request with tools), see [the budget](#a-budget-for-the-reasoning-p75-27-nov),
 and (p76) `INK2_SAMPLING` (0 = greedy, the request's temperature ignored; 1 = its `temperature`, `min_p` and `seed`),
 `INK2_MIN_P` (0.05, for a sampled request that names none), and for tests `INK2_FORCE_TEMP` / `INK2_FORCE_MIN_P` (every
-request at that temperature / min-p), see [Sampling](#sampling-a-choice-greedy-by-default-p76-27-nov).
+request at that temperature / min-p), see [Sampling](#sampling-a-choice-greedy-by-default-p76-27-nov), and (p77)
+`INK2_EMPTY_STEP` (1: an agent's step without text or a call gets a system message once and the model writes on; 0 = off) and
+`INK2_EMPTY_NOTE` (that message's text), see [above](#an-agents-step-never-ends-without-a-word-p77-27-nov).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
