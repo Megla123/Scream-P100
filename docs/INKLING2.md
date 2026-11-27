@@ -158,7 +158,7 @@ clients work. `reasoning_effort` (none … xhigh) sets Inkling's "Thinking effor
 as the template's `tool_declare`, the model's calls come back as `tool_calls` (streamed too), tool results as its tool messages;
 the prompt equals the GGUF template's to the character (`tools/template_check.py`), and a web search tool in a chat app and a
 coding agent's write / bash tools worked on our machine. **Pictures**: `image_url` parts (a data URL, an http(s) URL or a
-local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
+local path; checked with one picture a message). Limits: **greedy by default** (sampling with `INK2_SAMPLING=1`, [below](#sampling-a-choice-greedy-by-default-p76-27-nov)), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
 
@@ -317,6 +317,47 @@ server `make_multi.py` makes from this file). We checked both with a budget of 3
 - `INK2_MULTI=tpb` with two conversations at once: both were closed at 355 tokens and gave the same right answer.
 
 `INK2_THINK_BUDGET` sets the five budgets (comma list); `INK2_THINK_BUDGET=0` turns it off.
+
+## Sampling: a choice, greedy by default (p76, 27 Nov)
+
+The server is still **greedy by default** and ignores a request's temperature. `INK2_SAMPLING=1` lets a request's
+`temperature`, `min_p` and `seed` through to the engine (both cards and one card; the `INK2_MULTI` builds stay greedy). A request
+with a temperature and no `min_p` gets `INK2_MIN_P` (0.05). A request without a `seed` gets a random one. `top_p` is ignored.
+
+How it works:
+- The engine samples a row by **Gumbel noise from the request's seed and the row's position** (`temp_milli`, `seed`): the
+  argmax of logit / T plus the noise is a sample of softmax(logit / T).
+  - A draft is right exactly when it is the token the model samples at its place. So both drafters stay exact and need no
+    acceptance ratio, and the same seed gives the same text.
+- **min-p** (`minp_milli`): a token takes part only when its logit is within T · ln(min_p) of the row's largest. The largest is
+  taken over both cards' halves of the vocabulary: each card writes its row maxima into its half of a small vector, and the
+  cross-card sum gives both.
+- The first token after a prompt is sampled on the host from the full row, with the same noise.
+- At temperature 0 nothing of this runs.
+
+Checked on both cards at 512k with DFlash 2, 185 W a card:
+- **Greedy is unchanged:** the 56 prompts at 7 drafts give the same tokens as the build before (56/56), at 99.27 tok/s
+  instead of 99.35.
+- On one card, six prompts with and without prompt lookup give the same tokens as before (6/6).
+- The same seed gives the same text (6/6 on both builds).
+- The server with `INK2_SAMPLING=0` gives the greedy answer to a request with a temperature.
+- With and without drafts at T 1.0, 6 of 6 texts were the same; at T 0.6, 2 of 6. The others parted after 139-349 tokens at a
+  near-tie, the same way greedy texts with and without drafts part (see [DFlash 2](#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov)).
+
+Why greedy stays the default, measured through the server (functions with hidden tests and English questions at effort low;
+a 126.5k-token prompt of our docs with six questions, 4,000 tokens each, the reasoning budget off):
+
+| | greedy | T 0.6, min-p 0.05 | T 1.0, min-p 0.05 |
+|---|---|---|---|
+| functions with hidden tests | **45 / 45** | 43 / 45 | 44 / 45 |
+| English questions | 16 / 16 | 16 / 16 | 16 / 16 |
+| writing the functions, tok/s | **108.7** | 104.4 | 99.0 |
+| no answer within 4,000 tokens at 126.5k | **0 / 6** | 4 / 6 | 4 / 6 |
+| loops the server cut there | 3 | 0 | 0 |
+
+Sampling stops the repeating, but it does not shorten a long reasoning: at 126.5k more answers ran out of tokens before
+they began. Against that the [reasoning budget](#a-budget-for-the-reasoning-p75-27-nov) helps, and greedy writes code a
+little better and faster. Drafts are accepted less often when the text is sampled.
 
 ## Attention at depth: the int8 rows up front (p70, p72, 27 Nov)
 
@@ -1334,7 +1375,10 @@ and from 27 Nov `INK2_LOOP_CALL` (1: a looping tool call is cut and the model wr
 and `INK2_LOOP_CALL_NOTE` (that message's text, `{what}`: the tool's name),
 see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call), and from 27 Nov (p75) `INK2_THINK_BUDGET`
 (1024,4096,8192,16384,32768: the reasoning's budget in tokens for none / low / medium / high / xhigh; 0 = off) and
-`INK2_THINK_BUDGET_TOOLS` (8192, the most for a request with tools), see [the budget](#a-budget-for-the-reasoning-p75-27-nov).
+`INK2_THINK_BUDGET_TOOLS` (8192, the most for a request with tools), see [the budget](#a-budget-for-the-reasoning-p75-27-nov),
+and (p76) `INK2_SAMPLING` (0 = greedy, the request's temperature ignored; 1 = its `temperature`, `min_p` and `seed`),
+`INK2_MIN_P` (0.05, for a sampled request that names none), and for tests `INK2_FORCE_TEMP` / `INK2_FORCE_MIN_P` (every
+request at that temperature / min-p), see [Sampling](#sampling-a-choice-greedy-by-default-p76-27-nov).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 

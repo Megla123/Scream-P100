@@ -43,7 +43,7 @@ python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # wit
 | `src-pp/` | several chats at once as a pipeline (`ink2_pp.cu`, one-card kernels, `-DINK2_RING=2048`): half of the layers on each card, 8 segments a token, a thread and a queue a card, the drafter on card 1 |
 | `src/gguf_min.*` | a small GGUF reader (NVFP4 = type 40) |
 | `src/bench_dec.cu`, `src/ink2_bench.cuh` | a one-card microbenchmark of the decode kernels on random weights |
-| `serve/ink2_server.py` | the HTTP server (OpenAI API + llama-server endpoints, tools, pictures, the loop guard and the reasoning budget), greedy |
+| `serve/ink2_server.py` | the HTTP server (OpenAI API + llama-server endpoints, tools, pictures, the loop guard and the reasoning budget), greedy by default (`INK2_SAMPLING=1`: temperature, min-p and seed by request) |
 | `data/draft_vocab_32768.bin`, `tools/draft_vocab.py` | the drafter's reduced vocabulary and how it was made |
 | `data/plan_1c.txt`, `tools/plan_1c.py` | the one-card build's order of experts for VRAM and how to make one from routing traces |
 | `serve/make_multi.py` | the server for `INK2_MULTI` (`build/ink2_server_multi.py`): up to `--slots` requests at once |

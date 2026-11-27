@@ -802,6 +802,40 @@ __global__ void k_softcap_g(float* x, int ld, int nr, float cap, float invT, uns
     }
     x[i] = v;
 }
+// p76: each row's largest logit of this card into its half of mx2 [nr][2] (the other half 0, so the cross-card sum gives both)
+__global__ void __launch_bounds__(1024) k_rowmax2(const float* x, int ld, int valid, float* mx2, int c) {
+    __shared__ float red[32];
+    const float* xr = x + (size_t) blockIdx.x * ld;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < valid; i += 1024) m = fmaxf(m, xr[i]);
+    m = warp_max(m);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < 32; ++w) m = fmaxf(m, red[w]);
+        m = fmaxf(m, red[0]);
+        mx2[blockIdx.x * 2 + c] = m;
+        mx2[blockIdx.x * 2 + (1 - c)] = 0.0f;
+    }
+}
+// p76: min-p and p36's noise: a (softcapped) logit below max - T ln(1/min_p) of its row (the max of both cards' halves) is -inf,
+// the others logit / T + Gumbel noise of (seed, position, token) as k_softcap_g does
+__global__ void k_gumbel_minp(float* x, int ld, int nr, float invT, unsigned long long seed, int pos0, int col0, const float* mx2,
+                              int ncards, float lnminp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ld * nr) return;
+    const int r = i / ld, j = i % ld;
+    float m = mx2[r * 2];
+    if (ncards > 1) m = fmaxf(m, mx2[r * 2 + 1]);
+    float v = x[i];
+    if (v < m + lnminp / invT) {
+        x[i] = -INFINITY;
+        return;
+    }
+    const unsigned long long h = mix64(seed ^ mix64((unsigned long long) (pos0 + r) * 0x100000000ull + (unsigned long long) (col0 + j)));
+    const float u = ((float) (h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    x[i] = v * invT - logf(-logf(u));
+}
 // the cross-card sum (Hy4 v1): page-locked mapped buffers, a flag a card; each card writes its part and adds the other's
 __global__ void k_xput(const float* y, int n, float* out, volatile unsigned* flag, unsigned seq) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = y[i];

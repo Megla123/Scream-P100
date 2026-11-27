@@ -25,6 +25,10 @@
 # build/ink2_pp (a pipeline: half of the layers on each card). Up to INK2_SLOTS (4) requests run side by side, each in its own
 # slot of CTX tokens (default tpb 24576, pp 65536; tpb: 4 x 24k or 3 x 40k, pp: 4 x 64k or 6 x 32k fit). No pictures, no
 # checkpoints or parked conversations (a conversation stays in its slot until another needs it).
+# Sampling (docs/INKLING2.md "Sampling"): greedy by default, a request's temperature is ignored; INK2_SAMPLING=1 lets a request's
+# temperature, min_p (INK2_MIN_P, 0.05, when it names none) and seed through (both cards and one card; the INK2_MULTI builds
+# stay greedy). The drafts stay exact with it. INK2_THINK_BUDGET (1024,4096,8192,16384,32768 tokens by effort; 0 = off) is the
+# reasoning's budget.
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); B=$H/build
 D=${1:?usage: run.sh DATA [CTX|256k|512k] [PORT]}; CTX=${2:-32768}; CTX_SET=${2:+1}; PORT=${3:-8080}
@@ -75,6 +79,7 @@ if [ -n "${INK2_MULTI:-}" ]; then   # several conversations at once (test builds
   [ -n "$CTX_SET" ] || CTX=$([ "$INK2_MULTI" = tpb ] && echo 24576 || echo 65536)
   [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
   MODE="both cards, up to $SLOTS conversations at once (ink2_$INK2_MULTI, a slot of $CTX each, drafter $DRAFTER)"; INK2_PICTURES=0
+  export INK2_SAMPLING=0   # the multi builds write greedy (no sampling in ink2_tpb, ink2_pp)
   SERVER=$B/ink2_server_multi.py; SL=(--slots "$SLOTS")
   "$D/venv/bin/python" "$H/serve/make_multi.py" "$H/serve/ink2_server.py" "$SERVER" "ink2_$INK2_MULTI" >&2 || exit 1
 fi

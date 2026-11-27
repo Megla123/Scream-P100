@@ -386,6 +386,29 @@ def place_images(ids, images, starts=None):
     return out, {"img": table, "embd": str(comb)}
 
 
+SAMPLING = int(os.environ.get("INK2_SAMPLING", "0"))   # p76: 1 = the request's temperature / min_p / seed (0: greedy)
+MIN_P = float(os.environ.get("INK2_MIN_P", "0.05"))     # p76: a sampled request's min-p when it names none
+
+
+def sampling_of(body):
+    """p76: the engine's temp_milli / minp_milli / seed for a request ({} = greedy)"""
+    t = os.environ.get("INK2_FORCE_TEMP") or (body.get("temperature") if SAMPLING else None)
+    try:
+        t = float(t) if t is not None else 0.0
+    except (TypeError, ValueError):
+        t = 0.0
+    if t <= 0.0:
+        return {}
+    mp = os.environ.get("INK2_FORCE_MIN_P") or body.get("min_p")
+    try:
+        mp = float(mp) if mp is not None else MIN_P
+    except (TypeError, ValueError):
+        mp = MIN_P
+    seed = body.get("seed")
+    seed = int(seed) if isinstance(seed, (int, float)) else int.from_bytes(os.urandom(7), "little")
+    return {"temp_milli": int(round(t * 1000)), "minp_milli": int(round(max(0.0, min(mp, 0.999)) * 1000)), "seed": seed & 0x7FFFFFFFFFFFFFFF}
+
+
 def effort_of(body):
     kw = body.get("chat_template_kwargs") or {}
     e = kw.get("reasoning_effort", body.get("reasoning_effort"))
@@ -994,7 +1017,7 @@ class H(BaseHTTPRequestHandler):
         mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
         mx = max(1, min(mx, A.ctx - len(ids) - 1))
         stream = bool(body.get("stream"))
-        req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req,
+        req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req, **sampling_of(body),   # p76
                "ckpt": [x for x in starts if x < n_ids - 8][-4096:]}   # p42: not the answer's own head (n - 1 is checkpointed)
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)

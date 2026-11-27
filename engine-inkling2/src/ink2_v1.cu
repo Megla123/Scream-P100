@@ -147,6 +147,7 @@ struct Card {
     DSW D;   // p6
     D2W D2;   // p74
     float* amv_r = nullptr;   // p47: each written row's argmax on this card (value, index)
+    float* mx2 = nullptr;     // p76: [MAXT][2] the rows' largest logits of both cards (min-p)
     int* ami_r = nullptr;
     int dev = 0, c = 0;
     cudaStream_t st;
@@ -272,6 +273,8 @@ struct Engine {
     bool share1c = NC == 1 && getenv("INK2_1C_SHARE") && atoi(getenv("INK2_1C_SHARE")) != 0;   // p63: cache slots in the reading path's buffers
     float s_invT = 0.0f;               // p36: 1 / temperature of this request (0: greedy)
     unsigned long long s_seed = 0;     // p36: its seed
+    float s_lnminp = 0.0f;             // p76: ln(min_p) of this request (0: no min-p)
+    bool row_raw = false;              // p76: h_logits' last row came from the reading path without noise (min-p)
     int n_past = 0;
     int snap_n = -1;   // p8: tokens before the snapshot of the conv states (stsnap), -1 = none
     std::vector<int> processed;   // the tokens whose state the caches hold
@@ -1062,6 +1065,7 @@ struct Engine {
         each_card([&](int c) {
             CK(cudaSetDevice(cards[c].dev));
             cards[c].amv_r = (float*) alloc(cards[c], MAXT * 4);
+            cards[c].mx2 = (float*) alloc(cards[c], MAXT * 2 * 4);   // p76
             cards[c].ami_r = (int*) alloc(cards[c], MAXT * 4);
         });
         if (getenv("INK2_PF_CHUNK")) pfc = std::max(MAXT, atoi(getenv("INK2_PF_CHUNK")));
@@ -3206,7 +3210,9 @@ struct Engine {
             mix(K, S, K.out_rq, 1, P.F, 1);
             rms(K, P.F, K.out_norm, P.hx1, 1, eps);
             gemv8_t1(K, K.out, P.hx1, segs({{NV_C, K.logits}}));
-            k_softcap_g<<<(NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, 1, softcap, s_invT, s_seed, p0 + C, c * NV_C);   // p36
+            k_softcap_g<<<(NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, 1, softcap, s_lnminp < 0.0f ? 0.0f : s_invT, s_seed, p0 + C,
+                                                           c * NV_C);   // p36 (p76: with min-p the host adds the noise)
+            row_raw = s_invT > 0.0f && s_lnminp < 0.0f;   // p76
             CK(cudaMemcpyAsync(h_logits + (size_t) c * NV_C, K.logits, (size_t) NV_C * 4, cudaMemcpyDeviceToHost, K.st));
         }
     }
@@ -3275,6 +3281,14 @@ struct Engine {
         if (nr == 1 && !stare) gemv8_t1(K, K.out, K.hx + (size_t) r0 * N, segs({{NV_C, K.logits}}));
         else if (fuse && !stare && !dumping) gemv8_t1T(K, K.out, K.hx + (size_t) r0 * N, N, segs1(NV_C, K.logits), nr);   // p6c
         else gemv8(K, K.out, K.hx + (size_t) r0 * N, N, K.logits, NV_C, nr);
+        row_raw = false;   // p76
+        if (s_invT > 0.0f && s_lnminp < 0.0f) {   // p76: min-p over both cards' halves of each row
+            k_softcap_g<<<(nr * NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, nr, softcap, 0.0f, 0, 0, 0);
+            k_rowmax2<<<nr, 1024, 0, K.st>>>(K.logits, NV_C, std::min(NV_C, NVU - c * NV_C), K.mx2, c);
+            xch(K, K.mx2, 2 * nr);
+            k_gumbel_minp<<<(nr * NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, nr, s_invT, s_seed, n_past + r0 + 1, c * NV_C, K.mx2,
+                                                                       NC, s_lnminp);
+        } else
         k_softcap_g<<<(nr * NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, nr, softcap, s_invT, s_seed, n_past + r0 + 1, c * NV_C);   // p36
         if (dev_amax) {   // p47: the rows' argmax here; the full rows (want_logits) are copied by forward_card, outside a graph
             const int valid = std::min(NV_C, NVU - c * NV_C);
@@ -3725,6 +3739,29 @@ struct Engine {
         return b;
     }
     // p47: row r's token: from the cards' argmax (card 0's ids are the smaller: it wins a tie) or from the copied logits
+    // p76: the host's sample of a full row of softcapped logits without noise (the reading path's last row with min-p), the same
+    // noise as k_gumbel_minp: the token predicting position pos
+    static unsigned long long mix64h(unsigned long long z) {
+        z += 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+    int sample_row(const float* l, int pos) const {
+        float m = -INFINITY;
+        for (int j = 0; j < NVU; ++j) m = std::max(m, l[j]);
+        const float thr = m + s_lnminp / s_invT;
+        int best = 0;
+        float bv = -INFINITY;
+        for (int j = 0; j < NVU; ++j) {
+            if (l[j] < thr) continue;
+            const unsigned long long h = mix64h(s_seed ^ mix64h((unsigned long long) pos * 0x100000000ull + (unsigned long long) j));
+            const float u = ((float) (h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+            const float v = l[j] * s_invT - logf(-logf(u));
+            if (v > bv) { bv = v; best = j; }
+        }
+        return best;
+    }
     int amax_row(int r) const {
         if (!dev_amax || want_logits) return argmax(h_logits + (size_t) r * NV);
         const float v0 = h_amv2[r], v1 = NC > 1 ? h_amv2[MAXT + r] : -INFINITY;
@@ -3917,7 +3954,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         g.lh = h;
     }
     const double t1 = now_s();
-    int next = Engine::argmax(e.h_logits);
+    int next = e.row_raw ? e.sample_row(e.h_logits, e.n_past) : Engine::argmax(e.h_logits);   // p76: the reading path's raw row
     e.want_logits = !e.dev_amax || g_lhall;   // p47
     auto ends = [&](int t) { return t == eos || std::find(stop.begin(), stop.end(), t) != stop.end(); };
     int dcur = std::min(lookup, 4), cool = 0;   // p5a: the draft length follows the last window; after a miss no drafts for a while
@@ -4085,6 +4122,8 @@ static int serve(Engine& e, const std::string& path, int eos) {
                 const long long tm = json_int(req, "temp_milli", 0);
                 e.s_invT = tm > 0 ? 1000.0f / (float) tm : 0.0f;
                 e.s_seed = (unsigned long long) json_int(req, "seed", 0);
+                const long long mp = json_int(req, "minp_milli", 0);   // p76
+                e.s_lnminp = tm > 0 && mp > 0 && mp < 1000 ? logf((float) mp / 1000.0f) : 0.0f;
             }
             std::vector<int> hints;   // p21: where the prompt's messages start
             for (long long x : json_ints(req, "ckpt")) hints.push_back((int) x);
