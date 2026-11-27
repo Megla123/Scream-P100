@@ -1355,6 +1355,88 @@ logits byte for byte) and is slower than the cards alone at every share tried: 4
 `FNX_CPU_SHARE=25,40`, 37.3 with `40,40` and 28.9 with `60,60` against 51.8-54.8. `tune.py` keeps the path only where
 it gains, so there it leaves the profile as it was. A machine with both cards on x16 and fast CPUs is not measured.
 
+## The learned stop rule (FNX_DRAFT_STOP_ISO)
+
+The MTP chain's length is decided before drafting: the planner picks 1 to K drafts from how often each chain position
+was accepted lately and what a round costs, and `FNX_DRAFT_MIN_P` stops after a draft whose distribution was unsure.
+`FNX_DRAFT_STOP_ISO=<tables file>` (off unless set) decides draft by draft instead, as Keoian's learned stop rule does in
+their Qwen3.8-27B llama.cpp branch (`LLAMA_SPEC_STOP_ISO`): draft d is kept while
+
+    S(d) = iso_q(q_1) * ... * iso_q(q_(d-1)) * iso_p1(p1_d)  >=  theta
+
+where q_i is the probability of the token drawn at step i, p1_d the top probability of step d's distribution, and iso_q
+and iso_p1 are isotonic fits of how often the model accepts a draft (min(1, p/q) when sampling, the argmax test at
+temperature 0), made offline from a trace. The first draft below theta ends the chain and is not checked. A file holds
+sets of tables, each with its theta and the sampling it serves: a temperature range and, where given, top-p, top-k and
+presence-penalty ranges (`set instruct theta 0.45 temp 0.6 0.8 top_p 0.7 0.9 presence 1 2`). A request gets the first set
+whose ranges hold its sampling; a request that no set covers keeps the planner.
+
+**Exact.** The decision about draft d reads step d's distribution and the drafts before d, never d itself, so the chain's
+length is a stopping time and the p/q verify keeps the model's distribution (`split_stop_iso_test` checks this by Monte
+Carlo, and that a rule reading the drawn token's own q is biased). On our cards at temperature 0, card-only, the answers
+of 24 prompts were the same to the character with the rule on, off, and with full chains.
+
+**Tables** (`engine/data/`; add `"FNX_DRAFT_STOP_ISO": "<release>/engine/data/<file>"` to the profile's `"env"`):
+
+| file | profile | thinking / chat / greedy theta | how |
+|---|---|---|---|
+| `stop_iso_flash_next_iq3s.txt` | IQ3_S 512k (the 2-bit draft layer) | 0.425 / 0.375 / 0.5 | written by `tune.py --only draft` on our machine |
+| `stop_iso_flash_next_ud_q4_k_xl.txt` | UD-Q4_K_XL 512k (the q4_0 draft layer, no CPU path) | 0.6 / 0.55 / 0.6 | fit on 19,072 traced rounds at six samplings |
+| `stop_iso_flash_next_q4.txt` | bitlamas' Q4_K_XL-IQ4NL with `FNX_CPU_EXPERTS=1` and the English draft vocabulary | 0.45 / 0.525 / 0.375 | our own served setup |
+
+All three use the profile's draft vocabulary (the first two the Slovenian one) and K = 4. They are specific to the model, the
+draft layer and the vocabulary, and theta is specific to the machine (a profile that copies its missing experts in pays
+about 16 ms a row here and wants a high theta). Make your own with the tuner (one load traces, the next measures; see
+[tune/README.md](../tune/README.md)):
+
+```bash
+python3 tune/tune.py --data /data/flash-next --only draft    # writes DATA/stop_iso.txt and a profile that names it, if it wins
+```
+
+or by hand, from your own requests:
+
+```bash
+FNX_DRAFT_TRACE=/tmp/trace.txt FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 ./run.sh ...   # full chains, then your usual requests
+python3 tune/stop_iso_fit.py /tmp/trace.txt --cost auto \
+    --set thinking:0.95:1.05 --set chat:0.001:1e9 --set greedy:0:0 --out my.stop_iso
+```
+
+(`--cost auto` prices the rounds from the trace's own times; `--set name:lo:hi,top_p=lo:hi,presence=lo:hi` adds ranges.)
+
+**Do top-p and presence need their own tables?** Not on our trace of UD-Q4_K_XL at six samplings (the card's thinking
+1.0 / 0.95 / 20 and instruct 0.7 / 0.8 / 20 / presence 1.5, greedy, and 0.7 / 0.95 / presence 0, 1.0 / 0.95 / presence 1.5,
+0.6 / 0.95): each sampling's own tables beat those of the set it falls in by at most 0.2 % (simulated on held-out
+requests). So the files keep three sets.
+
+**Same bits** (IQ3_S 512k, temperature 0): the first-token logits of 42 requests (bench.py fresh and edit, 24 other prompts)
+were a build of main's bit for bit with the switch off, and with it on; the answers of the 24 were the same to the
+character in both. On bitlamas' file, card-only: the answers of 24 prompts were the same with the rule on, off and with
+full chains.
+
+**Measured** (2 x P100 at 150 W; three rounds a profile, every run a fresh load; tok/s mean (min-max); bench.py's tests
+and 24 other prompts, 12 English chat and 12 HumanEval tasks, none of them in any fit; "thinking" and "instruct" are the
+model card's two settings, instruct with thinking off):
+
+| test | IQ3_S 512k: planner | FNX_DRAFT_STOP_ISO | | UD-Q4_K_XL 512k: planner | FNX_DRAFT_STOP_ISO | |
+|---|---:|---:|---:|---:|---:|---:|
+| bench.py fresh (temperature 0) | 59.4 (59.2-59.5) | 62.1 (62.0-62.2) | +4.6 % | 39.2 (38.8-39.7) | 39.7 (39.7-39.8) | +1.5 % |
+| edit py | 77.6 (77.5-77.7) | 76.8 (76.8-76.8) | -1.0 % | 37.5 (37.5-37.5) | 37.4 (37.0-37.7) | -0.2 % |
+| edit md | 80.5 (80.0-80.7) | 80.6 (80.1-81.0) | +0.2 % | 37.6 (37.5-37.6) | 37.9 (37.7-38.0) | +0.8 % |
+| reading 38,862 tokens | 940 | 940 | equal | 826 (771-902) | 783 (710-863) | (two load states) |
+| writing after it | 52.5 (52.0-53.0) | 56.7 (56.6-56.9) | +7.9 % | 36.9 (36.4-37.3) | 37.8 (37.6-38.0) | +2.6 % |
+| 24 prompts, temperature 0 | 57.6 (57.5-57.6) | 59.8 (59.8-59.9) | +3.9 % | 34.8 (34.4-35.2) | 34.8 (34.7-35.1) | 0.0 % |
+| the same, thinking | 56.3 (56.3-56.4) | 57.7 (57.5-57.9) | +2.4 % | 33.5 (33.4-33.7) | 33.5 (33.4-33.8) | +0.1 % |
+| the same, instruct | 57.9 (57.7-58.0) | 59.4 (59.3-59.6) | +2.6 % | 34.1 (33.8-34.6) | 33.7 (33.6-33.9) | -1.1 % |
+
+On IQ3_S the rule wins wherever the MTP chain writes and loses 1 % in the .py edit (drafted mostly by prompt lookup). On
+UD-Q4_K_XL, whose rows cost twice as much here, the planner is already as good: only bench.py's fresh and writing after
+the long read move. The tuner's run on IQ3_S (two baselines, the trace, the candidate, a final run; 51 minutes) kept it:
+fresh +4.5 %, writing after the long read +8.4 %, edits -0.7 / +0.3 %, logits the baseline's. On bitlamas' file with
+`FNX_CPU_EXPERTS=1` (our own served setup, English prompts outside the fit): temperature 0 +2.6 %, thinking +2.4 %,
+0.7 / 0.8 +0.5 %, edits +2.3 / -1.4 %. One run with theta 0.3 for every set came within 1-2 % of the fitted thetas there
+(the optimum is flat). Not measured: other machines, Edge0-145B, the 64 GB and 32 GB modes, `--batch` above 1 (the
+batch decoder keeps its own drafting).
+
 ## Benchmark and compare
 
 With the server running:

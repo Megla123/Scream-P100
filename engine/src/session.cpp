@@ -1,5 +1,6 @@
 #include "session.hpp"
 #include "env.hpp"
+#include "stop_iso.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -506,16 +507,48 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     int mtp_chains = 0;
     const double min_p = cost_env("FNX_DRAFT_MIN_P", 0.0);
     double last_p = 1.0;   // how sure the draft layer was of the last draft (FNX_DRAFT_MIN_P)
+    // FNX_DRAFT_TRACE=<file> (measuring, off by default; appends): per MTP round one line for a learned stop rule's fit
+    // (strata tools/spec_stop_iso_fit.py): "req temp n acc q.. p1.. a.. M rows verify_ms draft_ms p1raw.." with, per draft,
+    // the drawn token's q, the top probability of the distribution it was drawn from (p1), the target's acceptance of it given
+    // the drafts before it (a: min(1, p/q) when sampling, 1/0 against the row's argmax at temperature 0, for every verified
+    // row) and the draft layer's own top probability at temperature 1 (p1raw); per lookup round "#L req temp rows acc
+    // verify_ms draft_ms"; per request "#R req temp top_p top_k presence". The candidates are fetched for every draft then.
+    static std::FILE* const tr_file = [] {
+        const char* f = std::getenv("FNX_DRAFT_TRACE");
+        return f != nullptr && f[0] != '\0' ? std::fopen(f, "a") : nullptr;
+    }();
+    static long tr_req_n = 0;
+    // FNX_DRAFT_STOP_ISO=<tables file> (off by default; src/stop_iso.hpp, Keoian's LLAMA_SPEC_STOP_ISO): an MTP chain keeps
+    // draft d while prod_{i<d} iso_q(q_i) * iso_p1(p1_d) >= theta, the maps fit offline on an FNX_DRAFT_TRACE trace
+    // (tune/stop_iso_fit.py) for this model, draft layer and sampling; it replaces chain_len() and FNX_DRAFT_MIN_P for
+    // the requests whose sampling (temperature; top-p, top-k, presence where a set names them) a set of the file covers.
+    // The decision about draft d reads the top probability of step d's distribution and the drafts before d, never d
+    // itself, so the output keeps the model's distribution.
+    // FNX_DRAFT_STOP_ISO_THETA=<theta>: every set's threshold (sweeps).
+    static const stop_iso::Rule iso_rule = stop_iso::from_env("FNX_DRAFT_STOP_ISO", "session");
+    const stop_iso::Set* const iso_set = iso_rule.pick(s.temperature, s.top_p, (float) s.top_k, s.pen_present);
+    double dp_p1 = 0.0, dp_q = 0.0;   // the last draft's step: the top probability of its distribution, the drawn token's q
+    const long tr_req = tr_file ? ++tr_req_n : 0;
+    std::vector<double> tr_q, tr_p1, tr_raw;   // this round's drafts (d1 first)
+    if (tr_file) std::fprintf(tr_file, "#R\t%ld\t%g\t%g\t%d\t%g\n", tr_req, (double) s.temperature, (double) s.top_p, (int) s.top_k,
+                              (double) s.pen_present);
     // one draft from the draft layer for the token after pen_seq (the penalty window before it)
     auto draft_one = [&](int T, bool from_main, int src_row, const std::vector<int>& toks, int pos0, const std::vector<int>& pen_seq,
                          Dist& q) {
         Engine::Penalties::Row pen;
         if (pen_drafts) pen = penalty_row(pen_seq, s);
-        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts || min_p > 0.0);
+        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr,
+                         samp_drafts || min_p > 0.0 || tr_file != nullptr || iso_set != nullptr);
         if (min_p > 0.0 && !e_.last_draft_cands.empty()) {
             double sum = 0.0;
             for (const auto& c : e_.last_draft_cands) sum += std::exp((double) c.first - (double) e_.last_draft_cands[0].first);
             last_p = 1.0 / sum;
+        }
+        double tr_rawp = 0.0;
+        if ((tr_file || iso_set) && !e_.last_draft_cands.empty()) {
+            double sum = 0.0;
+            for (const auto& c : e_.last_draft_cands) sum += std::exp((double) c.first - (double) e_.last_draft_cands[0].first);
+            tr_rawp = 1.0 / sum;
         }
         st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
         chain_draft_ms += e_.last_draft_ms;
@@ -523,6 +556,20 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         if (samp_drafts) {
             q = make_dist(e_.last_draft_cands, s);
             d = draw(q, unif(rng));
+        }
+        if (tr_file || iso_set) {
+            double top = tr_rawp;
+            if (samp_drafts) {
+                top = 0.0;
+                for (const double v : q.p) top = std::max(top, v);
+            }
+            dp_p1 = top;
+            dp_q = samp_drafts ? q.prob(d) : tr_rawp;
+        }
+        if (tr_file) {
+            tr_q.push_back(dp_q);
+            tr_p1.push_back(dp_p1);
+            tr_raw.push_back(tr_rawp);
         }
         return d;
     };
@@ -557,12 +604,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             cost_sum[kd] = cost_sum[kd] * DECAY + ms_since(tv) + chain_draft_ms;
             cost_n[kd] = cost_n[kd] * DECAY + 1.0;
         }
+        const double tr_vms = ms_since(tv), tr_dms = chain_draft_ms;
         chain_draft_ms = 0.0;
         st.verify_ms += ms_since(tv);
         st.verify_gpu_ms += e_.last_gpu_ms;
         st.launch_ms += e_.last_launch_ms;
         st.embed_ms += e_.last_embed_ms;
         int n = 1;
+        std::vector<double> tr_a;
         if (!sample) {
             if (biased) {   // the greedy pick after the list: each row's best biased logit (verify()'s argmax is without it)
                 Engine::Penalties pen;
@@ -571,6 +620,8 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 for (size_t j = 0; j < rows.size(); ++j) o[j] = cand[j][0].second;
             }
             while (n < (int) rows.size() && rows[n] == o[n - 1]) ++n;
+            if (tr_file)
+                for (size_t j = 0; j + 1 < rows.size(); ++j) tr_a.push_back(rows[j + 1] == o[j] ? 1.0 : 0.0);
         } else {
             // speculative sampling: draft rows[j + 1], drawn from q_j (a fixed draft: q_j is all on it), stands with
             // probability min(1, p_j / q_j); else row j's token is drawn from max(0, p_j - q_j) normalized, and the window
@@ -585,6 +636,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 }
             }
             const auto cand = e_.top_tokens(T, pen);
+            if (tr_file)
+                for (int j = 0; j + 1 < T; ++j) {
+                    const Dist pj = make_dist(cand[(size_t) j], s);
+                    const int dr = rows[(size_t) j + 1];
+                    const Dist& qj = qs[(size_t) j];
+                    const double pd = pj.prob(dr), qd = qj.ids.empty() ? 1.0 : qj.prob(dr);
+                    tr_a.push_back(qd > 0.0 ? std::min(1.0, pd / qd) : 0.0);
+                }
             for (n = 0; n < T; ++n) {
                 Dist d = make_dist(cand[n], s);
                 if (n + 1 < T) {
@@ -618,6 +677,26 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 stood[(size_t) j] = stood[(size_t) j] * DECAY + (j < acc ? 1.0 : 0.0);
             }
         }
+        if (tr_file && !drafts.empty()) {
+            const int nd = (int) drafts.size(), acc = n - 1;
+            if (mtp_round && (int) tr_q.size() == nd && (int) tr_a.size() == nd) {
+                std::string ln = std::to_string(tr_req) + "\t" + std::to_string((double) s.temperature) + "\t" + std::to_string(nd) + "\t" +
+                                 std::to_string(acc);
+                char b[32];
+                for (const std::vector<double>* v : {&tr_q, &tr_p1, &tr_a}) {
+                    ln += "\t";
+                    for (int j = 0; j < nd; ++j) { std::snprintf(b, sizeof b, j ? ",%.5g" : "%.5g", (*v)[(size_t) j]); ln += b; }
+                }
+                std::snprintf(b, sizeof b, "\tM\t%d\t%.3f\t%.3f\t", nd + 1, tr_vms, tr_dms);
+                ln += b;
+                for (int j = 0; j < nd; ++j) { std::snprintf(b, sizeof b, j ? ",%.5g" : "%.5g", tr_raw[(size_t) j]); ln += b; }
+                std::fprintf(tr_file, "%s\n", ln.c_str());
+            } else {
+                std::fprintf(tr_file, "#L\t%ld\t%g\t%d\t%d\t%.3f\t%.3f\n", tr_req, (double) s.temperature, nd + 1, acc, tr_vms, tr_dms);
+            }
+        } else if (tr_file) {
+            std::fprintf(tr_file, "#L\t%ld\t%g\t1\t0\t%.3f\t%.3f\n", tr_req, (double) s.temperature, tr_vms, tr_dms);
+        }
         // emit the accepted drafts' successors in order until a stop: the window keeps the rows before the last emitted
         int used = 0;
         bool done = false;
@@ -647,7 +726,9 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         std::vector<int> pen_seq;   // the penalty window before the next token: the context's last pen_last_n
         if (pen_drafts) pen_seq.assign(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
         Dist q1;
+        tr_q.clear(), tr_p1.clear(), tr_raw.clear();
         const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
+        const double d1_p1 = dp_p1, d1_q = dp_q;
         mtp_round = false;
         if (!speculate) {
             drafts.clear(), qs.clear();
@@ -666,8 +747,31 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // the MTP chain: each draft from the draft layer's own row for the one before
         // every 4th chain one draft longer, so the position past the chosen length stays measured (the full K every 4th
         // chain cost prose ~0.9 ms a round)
-        const int k = !adapt ? K_ : std::min(K_, chain_len() + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
         mtp_round = true;
+        if (iso_set != nullptr) {   // FNX_DRAFT_STOP_ISO: up to K drafts while the estimated survival holds
+            stop_iso::Chain chain(iso_set);
+            drafts.clear(), qs.clear();
+            if (!chain.keep((float) d1_p1)) {   // not even d1: a window of the one row
+                if (tr_file) tr_q.clear(), tr_p1.clear(), tr_raw.clear();
+                continue;
+            }
+            chain.drew((float) d1_q);
+            drafts = {d1}, qs = {std::move(q1)};
+            for (int j = 1; j < K_; ++j) {
+                if (pen_drafts) pen_seq.push_back(drafts.back());
+                Dist q;
+                const int d = draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q);
+                if (!chain.keep((float) dp_p1)) {   // step j's distribution decides; its token is not looked at
+                    if (tr_file) tr_q.pop_back(), tr_p1.pop_back(), tr_raw.pop_back();
+                    break;
+                }
+                chain.drew((float) dp_q);
+                drafts.push_back(d);
+                qs.push_back(std::move(q));
+            }
+            continue;
+        }
+        const int k = !adapt ? K_ : std::min(K_, chain_len() + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
         drafts = {d1}, qs = {std::move(q1)};
         for (int j = 1; j < k; ++j) {
             if (min_p > 0.0 && last_p < min_p) break;
@@ -677,6 +781,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             qs.push_back(std::move(q));
         }
     }
+    if (tr_file) std::fflush(tr_file);
     prompt_.clear();
     timing_ = nullptr;
     st.decode_ms = ms_since(t0);

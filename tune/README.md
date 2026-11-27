@@ -111,6 +111,7 @@ It starts from `DATA/profile.json` (the profile `setup.sh` wrote, at `FNX_ROUTE_
 | `ple` | `FNX_PLE_RAM` | the other setting, when the RAM allows |
 | `convcache` | `--conversation-cache-mib` | half, only when an arm came within 4 GiB of the RAM's end (RAM, not speed) |
 | `cpu_exact` | `FNX_CPU_EXPERTS=1` with `FNX_CPU_EXACT=1`, `FNX_CPU_SHARE=A,B` | the exact CPU path on: A (the CPU's per cent of a window's missing experts at 1 row) 50, 30, 70 with `check.py`'s guess for B (at 16 rows); then B ±15; then A ±10; then `FNX_CPU_WARM=1`, `FNX_CPU_MIN_T=3`, and `FNX_CPU_THREADS` on both hyperthreads (alone, and with B +15: more threads pay only when the CPU has more to do), each a step of its own. The later steps run only if the first kept the path; a second run from the tuned profile goes on from where the first stopped |
+| `draft` | `FNX_DRAFT_STOP_ISO` (the learned stop rule) | one load first traces full MTP chains (`FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 FNX_DRAFT_TRACE`) over [stop_iso_prompts.json](stop_iso_prompts.json) (36 prompts in English, Slovenian and code, none of bench.py's) at greedy and the model card's thinking (1.0 / 0.95 / 20) and instruct (0.7 / 0.8 / 20, presence 1.5) settings; [stop_iso_fit.py](stop_iso_fit.py) fits the tables at the trace's own round costs (`--cost auto`); the next load measures them against the length planner. Kept, they are written beside the profile as `stop_iso.txt`. Profiles without an MTP chain skip it. Last in the default set, after `cpu_exact`: the tables follow the round costs, which the CPU path changes |
 | `stage` (not by default) | `FNX_PF_STAGE_MIB`, `FNX_PF_TAIL_MIB` | half the staging buffers; 512 MiB more lent slots. Ours are at the size of the largest layer and smaller ones were slower |
 
 All of these give the same bits ("none" under output effect in [docs/SWITCHES.md](../docs/SWITCHES.md)).
@@ -119,7 +120,7 @@ All of these give the same bits ("none" under output effect in [docs/SWITCHES.md
 **The exact CPU path (`cpu_exact`).** With `FNX_CPU_EXACT=1` the CPU computes a missing expert with the cards' own
 arithmetic, and with `FNX_CPU_SHARE` it takes only a part of a window's missing experts while the copy engine brings the
 others ([GUIDE.md](../docs/GUIDE.md#the-exact-cpu-path)). The answers are the starting profile's bit for bit,
-so the group is in the default set, last, and needs no option. `tune.py` holds it to that itself: every arm's
+so the group is in the default set (before `draft`) and needs no option. `tune.py` holds it to that itself: every arm's
 first-token logits must be the baseline's, the engine's log must show the exact path on both cards, and a profile that
 keeps the path is loaded once more with `FNX_CPU_CHECK=1` (the copy engine and the cards compute every window as without
 the path, and each row the CPU computed is compared with the card's own). Only if that run counted rows on both cards

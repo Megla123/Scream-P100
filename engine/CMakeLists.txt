@@ -125,10 +125,11 @@ foreach(_n ${STRATA_SPLIT_CARDS})
   set_target_properties(${_t} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endforeach()
 
-# the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
+# the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser) and the learned
+# MTP stop rule (stop_iso_test): plain C++, no GPU
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)
-  foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test)
+  foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test stop_iso_test)
     add_executable(split_${_tt} ${_sp}/tools/${_tt}.cpp)
     target_include_directories(split_${_tt} PRIVATE ${_sp}/src ${_sp}/tools)
     target_compile_definitions(split_${_tt} PRIVATE FNX_NCARD=${_n0} FNX_27B=0)
