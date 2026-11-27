@@ -1034,6 +1034,38 @@ The 125k question above, run again through the new server, ended with `finish_re
 running to its 16,000 (22,095 characters of answer, the reference whole). The masked reading costs about 0.13 ms of CPU a
 written token in a 60,000-character reasoning.
 
+**A tool call that loops (27 Nov).** In the coding agent, at ~340k tokens of context, Inkling wrote two bash calls whose JSON
+repeated one short block (28 characters 56 times, 24 characters 66 times). The guard dropped each call, the reply ended with
+"stop" and no text, and the agent stopped without a word. Since then:
+
+- The first looping call of a reply is cut where it began. A system message after the kept part says so ("Your last tool call
+  (bash) started repeating the same text over and over, so it was cut off and not run. Do not write that call again. Write a
+  shorter call instead …"), and the model writes on from there (`INK2_LOOP_CALL`, 1; 0 = dropped as before). As with the loop
+  across turns, a system message moves the model where a note in its reasoning does not. The client never sees the message
+  or the cut call, and the server's log prints how the call began.
+- If the reasoning then loops, the cut call does not count as its first loop: the reasoning is closed as before ("I am
+  repeating the same lines …") and the model writes its answer.
+- A reply that ends in a loop again (a second looping call, a second loop in the reasoning) with no call and no text ends
+  with a line the user sees: "[ink2_server] I stopped here: my tool call (bash) kept repeating the same text, so it was not
+  run. Tell me how to go on."
+
+On the agent's whole database (10,600 tool calls: 2,773 bash, 2,392 edit, 415 write and the rest), the guard cut no call.
+With a fake engine (scripted tokens through the engine's socket), without a loop the same tokens go to the engine and to the
+client as before. A call that loops once is followed by a good call after the note. A call cut and then a reasoning that
+loops ends in an answer, and a call that loops every time ends with the visible line. We also rebuilt the agent's real
+request of that morning from its database (340,810 tokens; OpenCode's server sends one more tool, `question`, than
+`opencode run`). The old server wrote the same looping call again and stopped without a word. The new one cut it, and the
+reply ended in a visible line instead.
+
+**How far a prompt is read (27 Nov).** The engine says nothing while it reads a prompt, so a chat app's progress line took
+the speed of the task before it (one showed "32 tok/s" and 8,308 s to go). While a prompt is read, `/slots` now gives
+llama-server's fields: `n_prompt_tokens_total` (the whole prompt), `n_prompt_tokens_cache` (the prefix the engine is expected
+to take from its cache: the longest prefix of one of the last 8 conversations it held, back to its last checkpoint where
+the prompt parts from it) and `n_prompt_tokens_processed`. The last is an estimate from the time since the request began and
+the engine's reading cost by depth (`read_scale × (0.941 + 1.396e-5 × depth)` ms a token: two P100 at 185 W read 4k at
+1,031, 30k at 895 and 126k at 548 tok/s, within 3 %). The scale follows the engine's own read time after every request of
+2,048 new tokens or more (another power limit, one card, the M40). The replies do not change.
+
 ## How it works
 
 - **Split:** query heads 12 + 12 and KV heads 4 + 4 per card; every expert's FF split in half (gate and up rows, down
@@ -1084,7 +1116,9 @@ kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50,
 Server switches (environment of `serve/ink2_server.py`): `INK2_EFFORT` (0.2 = low), `INK2_OA_MTP` (3), `INK2_OA_LOOKUP`
 (15), `INK2_LOOP_TEXT` (16000), `INK2_LOG_EVERY` (60), and from 26 Nov `INK2_LOOP_TURNS` (3: so many steps back to back with
 the same tool call and the same result get the loop's system message; 0 = off), `INK2_LOOP_DROP` (1), `INK2_LOOP_MODE`
-(s), and from the evening of 26 Nov `INK2_LOOP_MASK` (1), `INK2_LOOP_PAR` (1), `INK2_LOOP_CYCLE` (2) and `INK2_LOOP_NORM` (4),
+(s), from the evening of 26 Nov `INK2_LOOP_MASK` (1), `INK2_LOOP_PAR` (1), `INK2_LOOP_CYCLE` (2) and `INK2_LOOP_NORM` (4),
+and from 27 Nov `INK2_LOOP_CALL` (1: a looping tool call is cut and the model writes on after a system message; 0 = dropped)
+and `INK2_LOOP_CALL_NOTE` (that message's text, `{what}`: the tool's name),
 see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).

@@ -28,12 +28,17 @@ latest checkpoint before that place. A conversation that ends in the same tool c
 (INK2_LOOP_TURNS) gets a system message that says so before the model's turn, and the same call written anyway is dropped
 (turn_loop(), chat()). A reasoning whose copies differ only in numbers is cut too (INK2_LOOP_MASK), an answer or a call that
 repeats a paragraph after 3 copies (INK2_LOOP_PAR), and the loop across turns also sees cycles of 2-3 steps and results that
-differ only in numbers (turn_loop2)."""
+differ only in numbers (turn_loop2). A looping tool call is cut and the model writes on after a system message
+(INK2_LOOP_CALL); a reply that ends in a loop with nothing to show says so to the user. While a prompt is read, /slots says how
+far (llama-server's n_prompt_tokens_cache / _processed and n_prompt_tokens_total, the read so far estimated)."""
 import argparse
+import array
 import base64
 import codecs
+import collections
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -410,6 +415,59 @@ def loose_call(raw):
     return name, args
 
 
+# /slots while a prompt is read (the engine says nothing until its first written token): the cached prefix expected from the
+# last conversations the engine held, and the tokens read so far estimated from the engine's reading cost by depth (ms a token
+# = read_scale x (READ_C0 + READ_C1 x depth); two P100 at 185 W: 4k 1,031, 30k 895, 126k 548 tok/s), the scale fitted after
+# each request to the engine's own read_s (another card, another power limit)
+READ_C0, READ_C1 = 0.941, 1.396e-5
+RECENT = collections.deque(maxlen=8)   # (the tokens the engine held after a request as int32 bytes, that request's checkpoint hints)
+STATE.update(n_cache=0, n_total=0, read_scale=1.0)
+
+
+def common_prefix(a, b):
+    """how many tokens two token strings (int32 bytes) share from the start: 64 KiB blocks, then halving in the first one
+    that differs (bytes compare with memcmp)"""
+    n, i, blk = min(len(a), len(b)), 0, 1 << 16
+    while i < n and a[i:min(i + blk, n)] == b[i:min(i + blk, n)]:
+        i += blk
+    if i >= n:
+        return n // 4
+    lo, hi = i // 4, min(i + blk, n) // 4   # tokens: the first lo the same, the first hi not
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[4 * lo:4 * mid] == b[4 * lo:4 * mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def predict_cache(ids):
+    """the prefix of ids the engine is expected to take from its cache: a conversation it held continued to its end, or else
+    back to its last checkpoint hint before the place where the prompt parts from it"""
+    a, best = array.array("i", ids).tobytes(), 0
+    for seq, hints in RECENT:
+        n = common_prefix(a, seq)
+        if n < len(seq) // 4:
+            n = max((h for h in hints if h <= n), default=0)
+        best = max(best, n)
+    return min(best, max(len(ids) - 1, 0))
+
+
+def read_estimate(cache, total, seconds):
+    """prompt tokens read after `seconds` from the prefix `cache` (the root of the reading cost), at most total - cache - 1"""
+    qa, qb = STATE["read_scale"] * READ_C1 / 2, STATE["read_scale"] * (READ_C0 + READ_C1 * cache)
+    done = (-qb + math.sqrt(qb * qb + 4 * qa * 1000 * max(seconds, 0.0))) / (2 * qa)
+    return int(max(0, min(done, total - cache - 1)))
+
+
+def read_fit(cached, total, read_s):
+    """the scale of the reading cost from a request's real read (2,048+ new tokens)"""
+    if total - cached >= 2048 and read_s > 0:
+        model = READ_C0 * (total - cached) + READ_C1 * (total * total - cached * cached) / 2
+        STATE["read_scale"] = 0.5 * STATE["read_scale"] + 0.5 * min(max(1000 * read_s / model, 0.25), 8.0)
+
+
 class Parts:
     """Turns the reply's tokens into events: ("r", text) reasoning, ("c", text) content, ("tool", {"name", "arguments"}) a
     finished tool call (<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>). The name
@@ -573,6 +631,16 @@ class Loop:
 # what closes a looping reasoning before the answer is forced (the reasoning is in English)
 NUDGE = "\n\nI am repeating the same lines. I have enough to answer, so I stop thinking here and write the answer now."
 NUDGE_IDS = []
+# a looping tool call: the system message the model writes on after (the call cut where it began), and the line a reply that
+# ends in a loop with nothing to show gets (the client sees it, so the agent does not stop without a word)
+LOOP_CALL = int(os.environ.get("INK2_LOOP_CALL", "1"))
+CALL_NOTE = os.environ.get("INK2_LOOP_CALL_NOTE") or (
+    "Your last tool call ({what}) started repeating the same text over and over, so it was cut off and not run. Do not write "
+    "that call again. Write a shorter call instead (for example a file in smaller parts, or a command that builds the repeated "
+    "part), or take a different approach.")
+CALL_STOP = ("[ink2_server] I stopped here: my tool call ({what}) kept repeating the same text, so it was not run. Tell me how "
+             "to go on.")
+LOOP_END = "[ink2_server] I stopped here: my reply kept repeating itself. Tell me how to go on."
 Loop.TEXT_SPAN = int(os.environ.get("INK2_LOOP_TEXT", Loop.TEXT_SPAN))
 Loop.PAR = int(os.environ.get("INK2_LOOP_PAR", Loop.PAR))
 Loop.MASK = int(os.environ.get("INK2_LOOP_MASK", Loop.MASK))
@@ -672,6 +740,14 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None):
     parts.mode = mode
     tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
     t_gone = time.time()
+    hidden = []   # (start, end) in out of the system messages the engine reads and the client never gets
+
+    def shown(stopped, why=None):   # what the client gets; tot["held"]: all the engine holds
+        tot["held"], tot["loop_end"] = list(out), why if stopped else None
+        if not hidden:
+            return out, tot, stopped
+        cut = set(i for a, b in hidden for i in range(a, b))
+        return [t for i, t in enumerate(out) if i not in cut], tot, stopped
     while True:
         t_req, t_first, final, keep = time.time(), None, None, None
         lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1))
@@ -715,19 +791,37 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None):
             tot["read_s"] += (t_first or t_req) - t_req
             tot["write_s"] += time.time() - (t_first or t_req)
         if keep is None:
-            return out, tot, False
+            return shown(False)
         tot["cuts"] += 1
         start, p = guard.hit
         print(f"ink2_server: a loop in {PART[guard.mode]} (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
               f"{len(out) - keep} / {len(out)}", file=sys.stderr, flush=True)
+        if guard.mode in ("tool", "head"):   # cut where the call began; once a reply, the model writes on after a note
+            at = guard.ends[0][1]
+            k = next((i for i in range(min(at, len(out) - 1), -1, -1) if out[i] == T_MODEL), at)
+            j = next((i for i in range(k + 1, len(out)) if out[i] == T_TOOL), len(out))
+            what = "".join(TOKS[t] if t not in SPECIAL and t < len(TOKS) else "" for t in out[k + 1:j]).strip()[:64] or "a tool"
+            print(f"ink2_server: a loop in a tool call {what}: it began {guard.text[:240]!r}", file=sys.stderr, flush=True)
+            out = out[:k]
+            if not LOOP_CALL:   # as before: the call dropped
+                return shown(True)
+            note = tokenize("<|message_system|><|content_text|>" + CALL_NOTE.format(what=what) + "<|end_message|>")
+            if tot.get("call_retry") or len(out) + len(note) + 64 >= mx:
+                return shown(True, CALL_STOP.format(what=what))
+            tot["call_retry"] = what
+            print(f"ink2_server: the call {what} cut, the model writes on after a system message", file=sys.stderr, flush=True)
+            hidden.append((len(out), len(out) + len(note)))
+            out += note
+            parts, guard = Parts(), Loop()
+            continue
         out = out[:keep]
         if guard.mode != "r":
-            return out, tot, True
+            return shown(True)
         if not NUDGE_IDS:
             NUDGE_IDS.extend(i for i in tokenize(NUDGE) if i not in SPECIAL)
         forced = NUDGE_IDS + [T_END, T_MODEL, T_TEXT]
-        if tot["cuts"] > 1 or len(out) + len(forced) >= mx:
-            return out, tot, True
+        if tot["cuts"] - bool(tot.get("call_retry")) > 1 or len(out) + len(forced) >= mx:   # a cut call does not count
+            return shown(True, LOOP_END)
         evs = parts.feed(forced)
         if on_part:
             for kind, val in evs:
@@ -793,8 +887,13 @@ class H(BaseHTTPRequestHandler):
                                     "modalities": {"vision": bool(A.mmproj and A.vis), "audio": False}})
         if path == "/slots":
             st = STATE
+            reading = st["busy"] and not st["n_decoded"]   # as llama-server says it while a prompt is read
+            done = (read_estimate(st["n_cache"], st["n_total"], time.time() - st["t_start"]) if reading
+                    else st["n_total"] - st["n_cache"] if st["busy"] else 0)
             return self._send(200, [{"id": 0, "id_task": st["requests"], "n_ctx": A.ctx, "is_processing": st["busy"],   # p42
-                                     "n_prompt_tokens": st["n_prompt"],
+                                     "n_prompt_tokens": st["n_cache"] + done if reading else st["n_prompt"],
+                                     "n_prompt_tokens_processed": done, "n_prompt_tokens_cache": st["n_cache"],
+                                     "n_prompt_tokens_total": st["n_total"],
                                      "next_token": [{"n_decoded": st["n_decoded"], "has_next_token": st["busy"]}]}])
         if path == "/metrics":   # Prometheus' text format, llama-server's names
             with TOTALS_MUTEX:
@@ -860,7 +959,8 @@ class H(BaseHTTPRequestHandler):
             if not LOCK.acquire(timeout=3600):
                 return self._send(503, {"error": "busy"})
         try:
-            STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=time.time(), part="", t_note=time.time())
+            STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, part="", n_total=len(ids), n_cache=predict_cache(ids))
+            STATE.update(t_start=time.time(), t_note=time.time())
             STATE["requests"] += 1
             calls, on_part, said, dropped = [], None, [], [0]
             if loop:
@@ -920,6 +1020,11 @@ class H(BaseHTTPRequestHandler):
                 return
             n = len(out)
             STATE["tokens_out"] += n
+            if not tot["cuts"]:   # a cut reads its kept part again, so its read_s is no measure
+                read_fit(tot["cached"], len(ids), tot["read_s"])
+            STATE["n_cache"] = tot["cached"]   # the engine's own count from here on
+            hints = req["ckpt"] + [len(ids) - 1] if "ckpt" in req else []   # the engine checkpoints n - 1 too (none without "ckpt")
+            RECENT.append((array.array("i", ids + tot.get("held", out)).tobytes(), hints))
             w = tot["write_s"] or 1e-9
             print(f"ink2_server: request: prompt tokens / cached / back to checkpoint / checkpoints, tokenize / read / written / write {len(ids)} / {tot['cached']} / {tot.get('back')} / {tot.get('ckpts')}, "
                   f"{1000 * t_tok:.0f} ms / {tot['read_s']:.2f} s / {n} / {w:.2f} s", file=sys.stderr, flush=True)
@@ -934,6 +1039,11 @@ class H(BaseHTTPRequestHandler):
                                       "function": {"name": val["name"], "arguments": val["arguments"]}})
                     else:
                         (think if kind == "r" else content).append(val)
+            if tot.get("loop_end") and not calls and not dropped[0] and not (said if stream else "".join(content).strip()):
+                if stream:   # a reply that ended in a loop with nothing to show says so
+                    on_part("c", tot["loop_end"])
+                else:
+                    content.append(tot["loop_end"])
             if dropped[0] and not calls:   # the looping call was the reply's only call
                 stop = ("\n\n" if (said if stream else "".join(content).strip()) else "") + LOOP_STOP.format(what=what, n=loop[0])
                 if stream:
@@ -947,6 +1057,8 @@ class H(BaseHTTPRequestHandler):
                        "draft_n": tot["drafted"], "draft_n_accepted": tot["accepted"]}
             if tot["cuts"]:
                 timings["loop_cuts"] = tot["cuts"]
+            if tot.get("call_retry"):
+                timings["loop_call_retry"] = 1
             if loop:
                 timings["loop_turns"], timings["loop_dropped"] = loop[0], dropped[0]
             with TOTALS_MUTEX:   # /metrics
