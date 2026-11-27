@@ -1526,6 +1526,7 @@ struct Engine {
             const int kcb = big ? 128 : KC2, npf = !q8k ? np : (q8.k || q8.v) ? std::min(np, q8.f0 / kcb) : np;
             // p38: a window's rows side by side in grid x (they read the same keys at the same time: L2); INK2_ATT_ROWS=0 the old grid
             static const bool att_rows = !getenv("INK2_ATT_ROWS") || atoi(getenv("INK2_ATT_ROWS")) != 0;
+            static const bool att_pv = !getenv("INK2_ATT_PV") || atoi(getenv("INK2_ATT_PV")) != 0;   // p70: int8 parts' V from shared memory
             const int nt = att_rows ? T : 1;
             const dim3 g16(npf * nt, NKV_C, T / nt), g8((np - npf) * nt, NKV_C, T / nt);
             if (att_w && L.full && T >= 2 && np >= att_w_min) {   // p61: 2 or 4 rows of the window a block, K and V read once
@@ -1543,11 +1544,11 @@ struct Engine {
                 }
                 if (np > npf) {
                     if (tt == 4) {
-                        if (big) k_attn_decw<128, true, 4><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
-                        else k_attn_decw<64, true, 4><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
+                        if (big) { if (att_pv) k_attn_decw<128, true, 4, true><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T); else k_attn_decw<128, true, 4><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T); }
+                        else { if (att_pv) k_attn_decw<64, true, 4, true><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T); else k_attn_decw<64, true, 4><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T); }
                     } else {
-                        if (big) k_attn_decw<128, true, 2><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
-                        else k_attn_decw<64, true, 2><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);
+                        if (big) k_attn_decw<128, true, 2><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T);   // p70: not staged here (micro test +8 %)
+                        else { if (att_pv) k_attn_decw<64, true, 2, true><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T); else k_attn_decw<64, true, 2><<<w8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, K.part, np, q8, npf, T); }
                     }
                 }
             } else {
@@ -1559,9 +1560,9 @@ struct Engine {
                 }
                 if (np > npf) {
                     if (big)
-                        k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
+                        { if (att_pv) k_attn_dec<128, true, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt); else k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt); }
                     else
-                        k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
+                        { if (att_pv) k_attn_dec<64, true, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt); else k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt); }
                 }
             }
             if (comb2 == 3 && np >= comb4_min && T <= 2) {   // p59: 4 blocks a head

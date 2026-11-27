@@ -3,7 +3,7 @@
 **Not a Strata fork:** an engine written from scratch for Thinking Machines' Inkling 2 Mini (no Strata code; llama.cpp only as a library for the tokenizer and the picture encoder). The Strata-derived engine of Scream P100 is the Flash-Next one, `engine/` on `main`. `ink2` runs Inkling 2 Mini (26.4B looped MoE, NVFP4 experts) on two Tesla P100 16 GB: both
 cards on every layer at once, the whole model in VRAM, DSpark (MTP) and prompt-lookup drafts, an OpenAI-compatible server
 with tool calls and pictures. Fresh writing 72 tok/s (97 with drafts), edits ~170,
-reading ~1,030 tok/s at 4k and ~800-825 at 35-38k, writing at a depth of 240k 38 tok/s with drafts (26 Nov, 185 W a
+reading ~1,030 tok/s at 4k and ~800-825 at 35-38k, writing at a depth of 240k 42 tok/s with drafts, 43.5 without (27 Nov, 185 W a
 card); context
 **256k** (KV f16) or **512k** (KV int8 past 32k, the first 32k bit for bit as 256k, same speed); llama.cpp on the same cards:
 13.0 / 143. A conversation keeps its place: checkpoints and parked conversations in RAM, so a chat's next turn reads only

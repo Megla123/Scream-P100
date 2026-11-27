@@ -157,6 +157,56 @@ local path; checked with one picture a message). Limits: **greedy only** (no sam
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
 
+## Attention at depth: the int8 rows up front (p70, p72, 27 Nov)
+
+[![Inkling 2 Mini, p70 + p72: writing at 240k 36.8 to 43.5 tok/s without drafts and 38.4 to 42.2 with them, every token the same, 185 W a card](inkling2-p72.jpg)](#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov)
+
+`src/` (`build/ink2_v1`) now writes **up to 18 % faster at a depth of 240k tokens** (43.5 tok/s without drafts, 42.2 with
+them; it was 36.8 and 38.4) and 11 % / 5 % faster at 128k, again with **the same output**. The 56 prompts' answers with and
+without drafts are those of the build before, and so are the reads' tokens and logits (4k / 30k / 128k) and every step's
+logits hashed with drafts at 512k. Short prompts and reading are unchanged.
+
+Deep in a chat, most of a written token's time goes to the full layers' attention: eight visits a token (layer 5, layers 11
+and 17 three times each through the loop, layer 23). In the 512k option the KV rows past 32k are int8. The writing path read
+a part's K in 16-byte pieces round by round, and its V one or two bytes a thread a key, in key order: one visit at 240k took
+1,521 µs, about 190 GB/s of the card's ~500. Now, for a part whose rows are int8:
+
+- **p70:** the part's V rows (16-byte pieces) and their scales are issued at the kernel's start, so they arrive while the K
+  part runs. They wait in registers, go into shared memory after the K part, and P·V reads them from there. The values, the
+  products and their order (a thread a dimension, the keys in order) are the same.
+- **p72:** the K pieces of all the part's rounds are issued at the start too. The K loop, unrolled over its rounds, takes
+  them from registers.
+- The f16 parts (the first 32k rows) keep the old code, and so do parts of 128 keys with 2 rows a block (past 256k): staging
+  was slower there.
+- `INK2_ATT_PV` (1) switches both; 0 = the old kernels.
+
+One visit of a full layer, µs. These are micro tests against the kernels of the build before (cold L2, median of 21, both
+cards), 0 bits apart everywhere; old and new numbers come from runs a few minutes apart:
+
+| depth | 1 row (no drafts) | window of 2 rows | window of 4 rows |
+|---:|---|---|---|
+| 65k | 429 → 333 | 542 → 477 | 937 → 829 |
+| 131k | 819 → 564 | 1,037 → 852 | 1,738 → 1,516 |
+| 240k | 1,521 → 979 | 1,975 → 1,530 | 3,273 → 2,767 |
+| 491k | 2,898 → 1,728 | 3,669 → 3,711 | 6,853 → 5,929 |
+
+Writing at depth, tok/s (our docs and sources cut to each depth and a question, 256 tokens, 512k, 185 W a card; the build
+before was measured the day before with the same procedure):
+
+| depth | DSpark drafts on | no drafts |
+|---:|---|---|
+| new chat | 85.2 → 85.3 | 73.4 → 73.6 |
+| 16k | 70.8 → 70.8 | 69.1 → 69.1 |
+| 64k | 81.2 → 81.9 | 57.6 → 60.0 |
+| 128k | 50.8 → 53.3 | 47.7 → 52.8 |
+| 240k | 38.4 → 42.2 | 36.8 → 43.5 |
+
+Tried the same morning and left out:
+- **Longer drafts at depth.** MTP 5 and 7, with n-grams 15 or 31, were 6-10 % slower than MTP 3 at 128k and 240k. On this
+  text a round accepts only 1.3-1.6 drafts there, and a window's rows cost more. n-grams 31 changed nothing, and at 240k
+  writing without drafts was 2 % faster than MTP 3.
+- **The window's queries read as float4** (the rows padded to 20 floats): the same bits, but 1-3 % slower.
+
 ## One P100: 27 % faster writing, the same bits (26 Nov evening)
 
 `build/ink2_1c` is now built from `src/`, the two-card engine's sources with `-DINK2_NC=1 -DINK2_RING=2048` (they kept every
@@ -1112,7 +1162,7 @@ and from 26 Nov (p47-p57, each at its old value = the old code, all the same bit
 `INK2_G1W` (4, rows a warp for them; 0 the block kernel), `INK2_MIX3` (1, the depth mixes of few rows in two launches),
 `INK2_XLL` (1, single-token exchanges as 8-byte words), `INK2_CKSPARE` (1, the spare checkpoint buffer made between requests),
 `INK2_COMB2` (3 since p59, 4 blocks a head or the values ahead in registers; 1 p57's parallel join; 0 `k_attn_comb`), `INK2_R7TPB` / `INK2_R6WPB` (256 / 4, the expert
-kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts).
+kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts), and from 27 Nov (p70, p72): `INK2_ATT_PV` (1, the full layers' int8 parts read their K and V rows up front, P·V from shared memory, see [above](#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov); 0 the old kernels).
 Server switches (environment of `serve/ink2_server.py`): `INK2_EFFORT` (0.2 = low), `INK2_OA_MTP` (3), `INK2_OA_LOOKUP`
 (15), `INK2_LOOP_TEXT` (16000), `INK2_LOG_EVERY` (60), and from 26 Nov `INK2_LOOP_TURNS` (3: so many steps back to back with
 the same tool call and the same result get the loop's system message; 0 = off), `INK2_LOOP_DROP` (1), `INK2_LOOP_MODE`
