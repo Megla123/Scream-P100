@@ -10,6 +10,7 @@
 #include "ink2_fuse.cuh"
 #include "ink2_pf.cuh"
 #include "ink2_dspark.cuh"
+#include "ink2_dflash2.cuh"   // p74
 #include "gguf_min.hpp"
 
 #include <cublas_v2.h>
@@ -74,6 +75,18 @@ struct DSW {
     int nparts = 0;
 };
 
+// p74 (p74tp: rings per conversation in ConvDev): the DFlash 2 drafter on one card (whole, on both cards); its features are DSW's feat / pfeat (the same four as DSpark's)
+struct D2W {
+    Mat fc, selh, wq[D2L], wk[D2L], wv[D2L], wo[D2L], gate[D2L], up[D2L], down[D2L], aproj[D2L], mproj[D2L];
+    const float *hnorm, *onorm, *anorm[D2L], *fnorm[D2L], *qn[D2L], *kn[D2L], *abase[D2L], *mbase[D2L];
+    __half *kc[D2L], *vc[D2L];
+    float *mrow, *cx, *xin, *kb, *vb, *x, *xn, *dyn, *c, *q, *k, *v, *ao, *o, *t1, *g, *u, *h, *part, *hid, *gout, *tv, *tv1;
+    int *ti, *ti1, *bpos;
+    int nparts = 0;
+    float* part2 = nullptr;   // k_d2_gemv2's column chunks
+    size_t partn = 0;
+};
+
 // p3: one card's buffers of the reading path (a chunk of up to C tokens)
 struct PFB {
     int C = 0;
@@ -106,6 +119,7 @@ struct PFB {
 struct Card {
     PFB P;
     DSW D;   // p6
+    D2W D2;   // p74
     int dev = 0, c = 0;
     cudaStream_t st;
     LW L[NPHYS];
@@ -269,6 +283,16 @@ struct Engine {
     }
     GgufMin* dsg = nullptr;   // p6: the drafter's file (--mtp)
     bool ds_on = false;
+    bool d2_on = false;   // p74: the DFlash 2 drafter (--mtp with dflash.selector_rank)
+    int d2_from = 0;      // p74: the reading path's first row the rings keep after this feed()
+    int d2_mask = 0;
+    float d2_cap = 30.0f, d2_eps = 1e-6f, d2_theta = 1e4f;
+    const uint16_t *d2_A = nullptr, *d2_B = nullptr;   // the selector's codebooks (BF16 [vocabulary][D2R]) in the file's mapping
+    float *h_d2v = nullptr, *h_d2g = nullptr;          // page-locked: each card's top-16 of rows 1.. (values, ids), card 0's gate
+    int* h_d2i = nullptr;
+    int d2_rows = getenv("INK2_D2_ROWS") ? std::max(2, std::min(DBLK, atoi(getenv("INK2_D2_ROWS")))) : DBLK;
+    float d2_qmin = getenv("INK2_D2_QMIN") ? (float) atof(getenv("INK2_D2_QMIN")) : 0.5f;
+    static constexpr int D2PIECE = 1024;   // the context's rows a pass (the reading path's chunk in pieces)
     const float* f32(Card& K, const std::string& name, size_t off = 0, size_t n = 0, GgufMin* gg = nullptr) {
         const GTensor& t = (gg ? *gg : g).t(name);
         if (t.type != G_F32) throw std::runtime_error(name + " is not F32");
@@ -963,6 +987,9 @@ struct Engine {
         }
         if (!mtp.empty()) {   // p6
             dsg = new GgufMin(mtp);
+            if (dsg->has("dflash.selector_rank")) {   // p74: DFlash 2
+                d2_init();
+            } else {
             if (dsg->s("general.architecture") != "dflash" || dsg->i("dflash.block_size") != DBLK || dsg->i("dflash.block_count") != DSL)
                 throw std::runtime_error("the drafter is not Inkling 2's DSpark");
             if (!g_draft_vocab.empty()) {   // p13: card c takes the c-th half of the (sorted) draft vocabulary
@@ -990,6 +1017,7 @@ struct Engine {
             CK(cudaHostAlloc((void**) &h_ami_pinned, NC * 4, cudaHostAllocPortable));
             CK(cudaHostAlloc((void**) &h_prev_pinned, NC * 4, cudaHostAllocPortable));
             ds_on = true;
+            }
         }
         each_card([&](int c) { place_experts(cards[c]); });   // p30
         if (ck_on) {   // p21
@@ -1590,7 +1618,7 @@ struct Engine {
             k_conv<<<(N + 127) / 128, 128, 0, K.st>>>(K.MO, N, K.sf[slot], L.f_pconv, nullptr, 1, 1.0f / sqrtf(NCONV + 1.0f), K.F2, T);
             k_add<<<(T_N + 255) / 256, 256, 0, K.st>>>(K.cur, K.cur, K.F2, T_N);
         }
-        if (ds_on && ds_feat_slot(slot) >= 0) ds_feat(K, K.D.feat, K.cur, ds_feat_slot(slot), T);   // p6
+        if ((ds_on || d2_on) && ds_feat_slot(slot) >= 0) ds_feat(K, K.D.feat, K.cur, ds_feat_slot(slot), T);   // p6 (p74)
         if (dumping && c == 0) {
             CK(cudaStreamSynchronize(K.st));
             dump_rows(d_lout[slot], K.cur, T);
@@ -1845,6 +1873,286 @@ struct Engine {
                 const float tot = h_ams_pinned[0] * expf(m0 - m) + (NC > 1 ? h_ams_pinned[c1] * expf(m1 - m) : 0.0f);
                 if (1.0f / tot < ds_pmin) break;
             }
+            d.push_back(prev);
+        }
+        return d;
+    }
+
+    // ------------------------------------------------------------------------------------------------ p74: the DFlash 2 drafter
+    void d2_init() {   // the file's geometry, both cards, the mask token's row, the host's buffers
+        GgufMin* G = dsg;
+        auto need = [](bool ok, const char* what) {
+            if (!ok) throw std::runtime_error(std::string("DFlash 2: ") + what);
+        };
+        need(G->s("general.architecture") == "dflash" && G->i("dflash.block_count") == D2L && G->i("dflash.embedding_length") == N &&
+                 G->i("dflash.feed_forward_length") == D2FF && G->i("dflash.attention.head_count") == D2H &&
+                 G->i("dflash.attention.head_count_kv") == NKV && G->i("dflash.attention.key_length") == HD &&
+                 G->i("dflash.attention.sliding_window") == D2WIN && G->i("dflash.block_size") == DBLK &&
+                 G->i("dflash.selector_rank") == D2R && G->i("dflash.selector_top_k") == D2K && G->i("dflash.conv_kernel_size") == 2 &&
+                 G->i("dflash.conv_group_size") == D2G,
+             "the geometry differs from ink2_dflash2.cuh");
+        need(G->s("dflash.selector_softcap_mode") == "after_correction", "selector_softcap_mode is not after_correction");
+        need(G->ia("dflash.target_layers") == std::vector<int64_t>{5, 23, 41, 48}, "taps other than 5, 23, 41, 48");
+        d2_mask = (int) G->i("dflash.mask_token_id");
+        d2_cap = (float) G->f("dflash.final_logit_softcapping");
+        d2_eps = (float) G->f("dflash.attention.layer_norm_rms_epsilon");
+        d2_theta = (float) G->f("dflash.rope.freq_base");
+        const GTensor &a = G->t("selector_predecessor.weight"), &b = G->t("selector_successor.weight");
+        need(a.type == G_BF16 && b.type == G_BF16 && a.ne[0] == D2R && b.ne[0] == D2R && a.ne[1] >= NVU && b.ne[1] >= NVU,
+             "the codebooks are not BF16 [vocabulary][256]");
+        d2_A = (const uint16_t*) a.data;
+        d2_B = (const uint16_t*) b.data;
+        if (!g_draft_vocab.empty()) std::fprintf(stderr, "ink2_v1: --draft-vocab je samo za DSpark (DFlash 2 bere vse besedisce)\n");
+        each_card([&](int c) { d2_load(cards[c]); });
+        (void) embed(0, d2_mask);   // rms(tok_embd[mask]) * tok_norm, as the anchor's row (fix 3)
+        each_card([&](int c) {
+            Card& K = cards[c];
+            CK(cudaSetDevice(K.dev));
+            CK(cudaMemcpy(K.D2.mrow, h_x0, (size_t) N * 4, cudaMemcpyHostToDevice));
+            k_rms<<<1, 256, 0, K.st>>>(K.D2.mrow, N, K.tok_norm, K.D2.mrow, N, N, eps);
+            CK(cudaStreamSynchronize(K.st));
+        });
+        CK(cudaHostAlloc((void**) &h_d2v, (size_t) NC * DBLK * D2K * 4, cudaHostAllocPortable));
+        CK(cudaHostAlloc((void**) &h_d2i, (size_t) NC * DBLK * D2K * 4, cudaHostAllocPortable));
+        CK(cudaHostAlloc((void**) &h_d2g, (size_t) DBLK * D2R * 4, cudaHostAllocPortable));
+        d2_on = true;
+        std::fprintf(stderr, "ink2_v1: risar DFlash 2, %d vrstic bloka, prag q %.2f\n", d2_rows, d2_qmin);
+    }
+    void d2_load(Card& K) {
+        CK(cudaSetDevice(K.dev));
+        vt[K.c] = "risar";
+        D2W& D = K.D2;
+        GgufMin* G = dsg;
+        if (pf_min < (1 << 30) && K.L[5].cat.rows < N) throw std::runtime_error("DFlash 2: P.Wf holds no 2304 x 2304 block of fc");
+        D.fc = q8(K, "fc.weight", 0, -1, 0, -1, G);
+        D.selh = q8(K, "selector_hidden.weight", 0, -1, 0, -1, G);
+        D.hnorm = f32(K, "enc.output_norm.weight", 0, 0, G);
+        D.onorm = f32(K, "output_norm.weight", 0, 0, G);
+        for (int il = 0; il < D2L; ++il) {
+            const std::string b = "blk." + std::to_string(il) + ".";
+            D.wq[il] = q8(K, b + "attn_q.weight", 0, -1, 0, -1, G);
+            D.wk[il] = q8(K, b + "attn_k.weight", 0, -1, 0, -1, G);
+            D.wv[il] = q8(K, b + "attn_v.weight", 0, -1, 0, -1, G);
+            D.wo[il] = q8(K, b + "attn_output.weight", 0, -1, 0, -1, G);
+            D.gate[il] = q8(K, b + "ffn_gate.weight", 0, -1, 0, -1, G);
+            D.up[il] = q8(K, b + "ffn_up.weight", 0, -1, 0, -1, G);
+            D.down[il] = q8(K, b + "ffn_down.weight", 0, -1, 0, -1, G);
+            D.aproj[il] = q8(K, b + "attn_conv_proj.weight", 0, -1, 0, -1, G);
+            D.mproj[il] = q8(K, b + "ffn_conv_proj.weight", 0, -1, 0, -1, G);
+            D.anorm[il] = f32(K, b + "attn_norm.weight", 0, 0, G);
+            D.fnorm[il] = f32(K, b + "ffn_norm.weight", 0, 0, G);
+            D.qn[il] = f32(K, b + "attn_q_norm.weight", 0, 0, G);
+            D.kn[il] = f32(K, b + "attn_k_norm.weight", 0, 0, G);
+            D.abase[il] = f32(K, b + "attn_conv_base", 0, 0, G);   // [2 sides][2 taps][N]
+            D.mbase[il] = f32(K, b + "ffn_conv_base", 0, 0, G);
+            D.kc[il] = (__half*) alloc(K, (size_t) D2RING * NKVD * 2);
+            D.vc[il] = (__half*) alloc(K, (size_t) D2RING * NKVD * 2);
+        }
+        const size_t RM = (size_t) std::max(MAXT, std::min(D2PIECE, pfc));
+        D.cx = dev(K, RM * N);
+        D.xin = dev(K, RM * N);
+        D.kb = dev(K, RM * NKVD);
+        D.vb = dev(K, RM * NKVD);
+        D.mrow = dev(K, N);
+        D.x = dev(K, (size_t) DBLK * N);
+        D.xn = dev(K, (size_t) DBLK * N);
+        D.c = dev(K, (size_t) DBLK * N);
+        D.o = dev(K, (size_t) DBLK * N);
+        D.t1 = dev(K, (size_t) DBLK * N);
+        D.hid = dev(K, (size_t) DBLK * N);
+        D.dyn = dev(K, (size_t) DBLK * D2DYN);
+        D.q = dev(K, (size_t) DBLK * D2Q);
+        D.ao = dev(K, (size_t) DBLK * D2Q);
+        D.k = dev(K, (size_t) DBLK * NKVD);
+        D.v = dev(K, (size_t) DBLK * NKVD);
+        D.g = dev(K, (size_t) DBLK * D2FF);
+        D.u = dev(K, (size_t) DBLK * D2FF);
+        D.h = dev(K, (size_t) DBLK * D2FF);
+        D.nparts = (D2WIN + DBLK + D2KC - 1) / D2KC + 1;
+        D.part = dev(K, (size_t) DBLK * D2H * D.nparts * (HD + 2));
+        D.gout = dev(K, (size_t) DBLK * D2R);
+        D.tv = dev(K, (size_t) DBLK * D2K);
+        D.ti = (int*) alloc(K, (size_t) DBLK * D2K * 4);
+        D.tv1 = dev(K, (size_t) DBLK * D2TS * D2K);
+        D.ti1 = (int*) alloc(K, (size_t) DBLK * D2TS * D2K * 4);
+        D.partn = (size_t) 1 << 20;   // floats: k_d2_gemv3's chunks (at most ~0.6 M: q, 18 chunks x 8 rows x 4096)
+        D.part2 = dev(K, D.partn);
+        D.bpos = (int*) alloc(K, DBLK * 4);
+        K.D.feat = dev(K, (size_t) 4 * MAXT * N);   // the features: layer() and layer_pf() fill DSW's buffers
+        if (pf_min < (1 << 30)) K.D.pfeat = dev(K, (size_t) 4 * pfc * N);
+    }
+    // the drafter's GEMV of T rows, 8 at a time, by the fastest kernel for the shape (test/d2_hitrost.cu, 27. 11.): k_d2_gemv for the
+    // head and fc (many rows or 9216 columns), else k_d2_gemv2 (256 rows a block; few rows also split the columns into chunks,
+    // ~224 blocks in all, added by k_d2_sum)
+    template <int TT> void d2gemv_t(Card& K, const Mat& m, const float* x, int ldx, float* y, int ldy) {
+        if (m.rows >= 32768 || m.cols >= 9216) {
+            k_d2_gemv<TT, 4><<<(m.rows + 31) / 32, 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, ldx, y, ldy);
+            return;
+        }
+        const int rb = (m.rows + 255) / 256;
+        int nch = std::max(1, std::min((224 + rb - 1) / rb, (m.cols + D2PC - 1) / D2PC));
+        int cch = ((m.cols + nch - 1) / nch + 31) / 32 * 32;
+        nch = (m.cols + cch - 1) / cch;
+        if (nch > 1 && (size_t) nch * TT * m.rows > K.D2.partn) {   // fewer chunks, as many as the buffer holds
+            nch = std::max(1, (int) (K.D2.partn / ((size_t) TT * m.rows)));
+            cch = ((m.cols + nch - 1) / nch + 31) / 32 * 32;
+            nch = (m.cols + cch - 1) / cch;
+        }
+        k_d2_gemv2<TT><<<dim3(rb, nch), 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, x, ldx, cch, y, ldy, K.D2.part2);
+        if (nch > 1) k_d2_sum<<<(m.rows * TT + 255) / 256, 256, 0, K.st>>>(K.D2.part2, nch, m.rows, TT, y, ldy);
+    }
+    void d2gemv(Card& K, const Mat& m, const float* x, int ldx, float* y, int ldy, int T) {
+        for (int t0 = 0; t0 < T; t0 += 8) {
+            const float* xt = x + (size_t) t0 * ldx;
+            float* yt = y + (size_t) t0 * ldy;
+            switch (std::min(8, T - t0)) {
+                case 1: d2gemv_t<1>(K, m, xt, ldx, yt, ldy); break;
+                case 2: d2gemv_t<2>(K, m, xt, ldx, yt, ldy); break;
+                case 3: d2gemv_t<3>(K, m, xt, ldx, yt, ldy); break;
+                case 4: d2gemv_t<4>(K, m, xt, ldx, yt, ldy); break;
+                case 5: d2gemv_t<5>(K, m, xt, ldx, yt, ldy); break;
+                case 6: d2gemv_t<6>(K, m, xt, ldx, yt, ldy); break;
+                case 7: d2gemv_t<7>(K, m, xt, ldx, yt, ldy); break;
+                default: d2gemv_t<8>(K, m, xt, ldx, yt, ldy); break;
+            }
+        }
+    }
+    void sgemm_b(Card& K, const float* W, int rows, int cols, const float* x, int ldx, float* y, int ldy, int C, float beta) {
+        const float one = 1.0f;
+        cublasSgemm(K.P.cb, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, cols, x, ldx, &beta, y, ldy);
+    }
+    // the context of T rows (feat [T][4][N], device positions pos): x = rms(fc . feat) * hidden_norm, every layer's K / V into its
+    // ring. big: the reading path (cuBLAS on f32 copies in P.Wf; fc by its four 2304-column blocks), else the window GEMV
+    void d2_ingest(Card& K, const float* feat, const int* pos, int T, bool big) {
+        D2W& D = K.D2;
+        PFB& P = K.P;
+        for (int r0 = 0; r0 < T; r0 += D2PIECE) {
+            const int n = std::min(D2PIECE, T - r0);
+            const float* f = feat + (size_t) r0 * 4 * N;
+            const int* ps = pos + r0;
+            if (big)
+                for (int j = 0; j < 4; ++j) {
+                    k_q8s_f32_cols<<<(unsigned) (((size_t) N * N + 255) / 256), 256, 0, K.st>>>(D.fc.q, (const __half*) D.fc.d, N, 4 * N, j * N, N, P.Wf);
+                    sgemm_b(K, P.Wf, N, N, f + (size_t) j * N, 4 * N, D.cx, N, n, j ? 1.0f : 0.0f);
+                }
+            else
+                d2gemv(K, D.fc, f, 4 * N, D.cx, N, n);
+            k_rms<<<n, 256, 0, K.st>>>(D.cx, N, D.hnorm, D.xin, N, N, d2_eps);
+            for (int il = 0; il < D2L; ++il) {
+                if (big) {
+                    deq8(K, D.wk[il], P.Wf);
+                    sgemm(K, P.Wf, NKVD, N, D.xin, N, D.kb, NKVD, n);
+                    deq8(K, D.wv[il], P.Wf);
+                    sgemm(K, P.Wf, NKVD, N, D.xin, N, D.vb, NKVD, n);
+                } else {
+                    d2gemv(K, D.wk[il], D.xin, N, D.kb, NKVD, n);
+                    d2gemv(K, D.wv[il], D.xin, N, D.vb, NKVD, n);
+                }
+                k_ds_headrope<<<dim3(NKV, n), 128, 0, K.st>>>(D.kb, NKV, D.kn[il], d2_eps, ps, 0, d2_theta, D.kc[il], NKVD, D2RING);
+                k_ds_vstore<<<(n * NKVD + 255) / 256, 256, 0, K.st>>>(D.vb, ps, 0, D.vc[il], n, D2RING);
+            }
+        }
+    }
+    // card c: the block of R rows for the anchor (the pending token at P, its embedding row in h_x0[0]), the head's top-16 of
+    // rows 1..R-1 on the card's half of the vocabulary, card 0 also the selector's gate; one sync
+    void d2_block(int c, int P, int R) {
+        Card& K = cards[c];
+        D2W& D = K.D2;
+        CK(cudaSetDevice(K.dev));
+        int hp[DBLK];
+        for (int i = 0; i < DBLK; ++i) hp[i] = P + i;
+        CK(cudaMemcpyAsync(D.bpos, hp, R * sizeof(int), cudaMemcpyHostToDevice, K.st));
+        CK(cudaMemcpyAsync(K.x0, h_x0, (size_t) N * 4, cudaMemcpyHostToDevice, K.st));
+        k_rms<<<1, 256, 0, K.st>>>(K.x0, N, K.tok_norm, D.x, N, N, eps);
+        for (int i = 1; i < R; ++i) CK(cudaMemcpyAsync(D.x + (size_t) i * N, D.mrow, N * 4, cudaMemcpyDeviceToDevice, K.st));
+        const int lo = P - (D2WIN - 1), hi = P + R, np = (hi - std::max(0, lo) + D2KC - 1) / D2KC;
+        const dim3 cg((N + 255) / 256, R);
+        const unsigned nr = (unsigned) ((R * N + 255) / 256);
+        for (int il = 0; il < D2L; ++il) {
+            k_rms<<<R, 256, 0, K.st>>>(D.x, N, D.anorm[il], D.xn, N, N, d2_eps);
+            d2gemv(K, D.aproj[il], D.xn, N, D.dyn, D2DYN, R);
+            k_d2_conv<<<cg, 256, 0, K.st>>>(D.xn, D.dyn, D.abase[il], 0, D.c);
+            d2gemv(K, D.wq[il], D.c, N, D.q, D2Q, R);
+            d2gemv(K, D.wk[il], D.c, N, D.k, NKVD, R);
+            d2gemv(K, D.wv[il], D.c, N, D.v, NKVD, R);
+            k_ds_headrope<<<dim3(D2H, R), 128, 0, K.st>>>(D.q, D2H, D.qn[il], d2_eps, D.bpos, 0, d2_theta, nullptr, 0);
+            k_ds_headrope<<<dim3(NKV, R), 128, 0, K.st>>>(D.k, NKV, D.kn[il], d2_eps, D.bpos, 0, d2_theta, D.kc[il], NKVD, D2RING);
+            k_ds_vstore<<<(R * NKVD + 255) / 256, 256, 0, K.st>>>(D.v, D.bpos, 0, D.vc[il], R, D2RING);
+            k_d2_attn<<<dim3(np, NKV), 256, 0, K.st>>>(D.q, D.kc[il], D.vc[il], lo, hi, R, D.part, np);
+            k_d2_comb<<<dim3(D2H, R), 128, 0, K.st>>>(D.part, np, D.ao);
+            d2gemv(K, D.wo[il], D.ao, D2Q, D.o, N, R);
+            k_d2_conv<<<cg, 256, 0, K.st>>>(D.o, D.dyn, D.abase[il] + 2 * N, 1, D.t1);
+            k_add<<<nr, 256, 0, K.st>>>(D.x, D.x, D.t1, (size_t) R * N);
+            k_rms<<<R, 256, 0, K.st>>>(D.x, N, D.fnorm[il], D.xn, N, N, d2_eps);
+            d2gemv(K, D.mproj[il], D.xn, N, D.dyn, D2DYN, R);
+            k_d2_conv<<<cg, 256, 0, K.st>>>(D.xn, D.dyn, D.mbase[il], 0, D.c);
+            d2gemv(K, D.gate[il], D.c, N, D.g, D2FF, R);
+            d2gemv(K, D.up[il], D.c, N, D.u, D2FF, R);
+            k_ds_swiglu<<<(R * D2FF + 255) / 256, 256, 0, K.st>>>(D.g, D.u, D.h, R * D2FF);
+            d2gemv(K, D.down[il], D.h, D2FF, D.o, N, R);
+            k_d2_conv<<<cg, 256, 0, K.st>>>(D.o, D.dyn, D.mbase[il] + 2 * N, 1, D.t1);
+            k_add<<<nr, 256, 0, K.st>>>(D.x, D.x, D.t1, (size_t) R * N);
+        }
+        k_rms<<<R - 1, 256, 0, K.st>>>(D.x + N, N, D.onorm, D.hid, N, N, d2_eps);
+        d2gemv(K, K.out, D.hid, N, K.logits, NV_C, R - 1);   // raw logits (the cap comes after the selector's correction)
+        const int valid = std::min(NV_C, NVU - c * NV_C), span = (valid + D2TS - 1) / D2TS;   // the top-16 in two passes
+        k_d2_top16<<<dim3(R - 1, D2TS), 128, 0, K.st>>>(K.logits, nullptr, NV_C, valid, span, c * NV_C, D.tv1, D.ti1);
+        k_d2_top16<<<dim3(R - 1, 1), 128, 0, K.st>>>(D.tv1, D.ti1, D2TS * D2K, D2TS * D2K, D2TS * D2K, 0, D.tv, D.ti);
+        CK(cudaMemcpyAsync(h_d2v + (size_t) c * DBLK * D2K, D.tv, (size_t) (R - 1) * D2K * 4, cudaMemcpyDeviceToHost, K.st));
+        CK(cudaMemcpyAsync(h_d2i + (size_t) c * DBLK * D2K, D.ti, (size_t) (R - 1) * D2K * 4, cudaMemcpyDeviceToHost, K.st));
+        if (c == 0) {
+            d2gemv(K, D.selh, D.hid, N, D.gout, D2R, R - 1);
+            CK(cudaMemcpyAsync(h_d2g, D.gout, (size_t) (R - 1) * D2R * 4, cudaMemcpyDeviceToHost, K.st));
+        }
+        CK(cudaStreamSynchronize(K.st));
+    }
+    static float bf16f(uint16_t b) {
+        const uint32_t u = (uint32_t) b << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    }
+    // up to k drafts after the anchor (the pending token at position P = n_past): the block, then the greedy walk on the host. Draft
+    // e: the cards' top-16 of row e + 1 merged (values down, card 0's smaller ids first on a tie), score[c] = cap tanh((u[c] +
+    // <A[prev] * g_e, B[cand c]>) / cap) for the walked predecessor prev (the anchor, then the last draft) only; stops below d2_qmin
+    std::vector<int> d2_draft(int anchor, int k) {
+        std::vector<int> d;
+        if (!d2_on || k <= 0 || n_past + DBLK > ctx) return d;
+        k = std::min(k, DBLK - 1);
+        (void) embed(0, anchor);
+        const int P = n_past, R = std::max(k + 1, d2_rows);
+        both([&](int c) { d2_block(c, P, R); });
+        int prev = anchor;
+        for (int e = 0; e < k; ++e) {
+            float u[D2K];
+            int id[D2K];
+            const float *v0 = h_d2v + e * D2K, *v1 = h_d2v + (size_t) (NC - 1) * DBLK * D2K + e * D2K;
+            const int *i0 = h_d2i + e * D2K, *i1 = h_d2i + (size_t) (NC - 1) * DBLK * D2K + e * D2K;
+            for (int n = 0, a = 0, b = 0; n < D2K; ++n) {
+                const bool first = NC == 1 || b >= D2K || (a < D2K && v0[a] >= v1[b]);
+                u[n] = first ? v0[a] : v1[b];
+                id[n] = first ? i0[a++] : i1[b++];
+            }
+            float ag[D2R];
+            const uint16_t* ar = d2_A + (size_t) prev * D2R;
+            const float* gv = h_d2g + (size_t) e * D2R;
+            for (int r = 0; r < D2R; ++r) ag[r] = bf16f(ar[r]) * gv[r];
+            float s[D2K];
+            int best = -1;
+            for (int c = 0; c < D2K; ++c) {
+                s[c] = -INFINITY;
+                if (id[c] < 0 || id[c] >= NVU) continue;
+                const uint16_t* br = d2_B + (size_t) id[c] * D2R;
+                float a = 0.0f;
+                for (int r = 0; r < D2R; ++r) a += ag[r] * bf16f(br[r]);
+                s[c] = d2_cap * tanhf((u[c] + a) / d2_cap);
+                if (best < 0 || s[c] > s[best]) best = c;
+            }
+            if (best < 0) break;
+            float tot = 0.0f;
+            for (int c = 0; c < D2K; ++c) tot += s[c] == -INFINITY ? 0.0f : expf(s[c] - s[best]);
+            if (1.0f / tot < d2_qmin) break;
+            prev = id[best];
             d.push_back(prev);
         }
         return d;
@@ -2461,7 +2769,7 @@ struct Engine {
             xch_pf(K, P.MO, CN);
         conv_pf(K, P.MO, N, K.sf[slot], L.f_pconv, nullptr, 1, 1.0f / sqrtf(NCONV + 1.0f), P.F2, C);
         k_add<<<(unsigned) ((CN + 255) / 256), 256, 0, K.st>>>(P.cur, P.cur, P.F2, CN);
-        if (ds_on && ds_feat_slot(slot) >= 0) ds_feat(K, K.D.pfeat, P.cur, ds_feat_slot(slot), C);   // p6
+        if ((ds_on || d2_on) && ds_feat_slot(slot) >= 0) ds_feat(K, K.D.pfeat, P.cur, ds_feat_slot(slot), C);   // p6 (p74)
     }
     // a chunk of C tokens at positions p0.. through both cards; the last row's logits into h_logits when last
     void pf_card(int c, int C, int p0, bool last) {
@@ -2488,11 +2796,15 @@ struct Engine {
             for (int ip = LS; ip < LE; ++ip) layer_pf(K, ip, pass == 0 ? ip : NPHYS + (pass - 1) * NCORE + (ip - LS), pass > 0, p0, C);
         }
         for (int p = LE; p < NPHYS; ++p) layer_pf(K, p, p, false, p0, C);
-        if (ds_on) {   // p6: every row's final hidden, then the drafter's caches
+        if (ds_on || d2_on) {   // p6: every row's final hidden, then the drafter's caches
             mix(K, states_pf(K, P.cur), K.out_rq, 1, P.F, C);
             k_rms<<<C, 256, 0, K.st>>>(P.F, N, K.out_norm, P.F2, N, N, eps);
             ds_feat(K, K.D.pfeat, P.F2, 3, C);
-            ds_ingest(K, K.D.pfeat, K.D.pfrnn, K.D.pcbuf, K.D.pkb, K.D.pvb, P.pos, C, true);
+            if (ds_on) ds_ingest(K, K.D.pfeat, K.D.pfrnn, K.D.pcbuf, K.D.pkb, K.D.pvb, P.pos, C, true);
+            else {   // p74: only the rows the rings keep after this feed() (its last D2WIN + DBLK), and at most D2RING of the chunk
+                const int r0 = std::min(C, std::max(0, std::max(d2_from - p0, C - D2RING)));
+                if (r0 < C) d2_ingest(K, K.D.pfeat + (size_t) r0 * 4 * N, P.pos + r0, C - r0, true);
+            }
         }
         if (last) {   // the last row only: the depth mix, the norm and the head
             States S{};
@@ -2561,6 +2873,9 @@ struct Engine {
         if (ds_on) {   // p6: the final hidden is feature 3; the drafter's caches get every row
             ds_feat(K, K.D.feat, K.hx, 3, T);
             ds_ingest(K, K.D.feat, K.D.frnn, K.D.cbuf, K.D.kb, K.D.vb, K.pos, T, false);
+        } else if (d2_on) {   // p74
+            ds_feat(K, K.D.feat, K.hx, 3, T);
+            d2_ingest(K, K.D.feat, K.pos, T, false);
         }
         const int r0 = all_rows ? 0 : T - 1, nr = T - r0;
         if (nr == 1 && !stare) gemv8_t1(K, K.out, K.hx + (size_t) r0 * N, segs({{NV_C, K.logits}}));
@@ -2613,6 +2928,7 @@ struct Engine {
     // feeds tokens (windows of MAXT); returns the logits rows of the last window (all its rows when all_rows)
     int feed(const int* ids, int n, bool all_rows) {
         int T = 0;
+        d2_from = n_past + n - (D2WIN + DBLK);   // p74
         for (int i = 0; i < n; i += T) {
             if (!all_rows && n - i >= pf_min) {   // p3: the reading path, chunks of up to pfc
                 T = std::min(pfc, n - i);
@@ -2682,6 +2998,7 @@ struct Engine {
         for (int s = 0; s < NSLOT; ++s)
             if (win_slot(s)) b += (size_t) 2 * SWA * KVC * 2;
         if (ds_on && ds_ring) b += (size_t) (2 * DS_TAIL + DS_WIN1) * NKVD * 2 * 2;
+        if (d2_on) b += (size_t) D2L * 2 * D2WIN * NKVD * 2;   // p74
         return b;
     }
     // card c's state at position pos to RAM (save) or back: the conv states, then of every cache kept by position modulo a ring
@@ -2712,6 +3029,11 @@ struct Engine {
                 const int W = il == 1 ? DS_WIN1 : DS_TAIL, rg = il == 1 ? DS_RING1 : DS_RING;
                 rows(K.D.kc[il], W, rg, (size_t) NKVD * 2);
                 rows(K.D.vc[il], W, rg, (size_t) NKVD * 2);
+            }
+        if (d2_on)   // p74: the rings' last D2WIN rows
+            for (int il = 0; il < D2L; ++il) {
+                rows(K.D2.kc[il], D2WIN, D2RING, (size_t) NKVD * 2);
+                rows(K.D2.vc[il], D2WIN, D2RING, (size_t) NKVD * 2);
             }
         CK(cudaStreamSynchronize(K.st));
     }
@@ -2909,6 +3231,8 @@ struct Engine {
         __half* dkc[DSL] = {};   // pp4: the drafter's caches (rings), its context row, a verify window's f_rnn rows (the drafter's card)
         __half* dvc[DSL] = {};
         float *ctxv = nullptr, *frnnw = nullptr;
+        __half* d2kc[D2L] = {};   // p74tp: the DFlash 2 drafter's rings of this conversation
+        __half* d2vc[D2L] = {};
     };
     size_t conv_bytes = 0;   // one ConvDev's VRAM
     struct BGroup {   // pp7: one conversation's rows in a batch
@@ -2962,6 +3286,13 @@ struct Engine {
             d.ctxv = dev(K, N);
             d.frnnw = dev(K, (size_t) MAXT * N);
         }
+        if (d2_on) {   // p74tp
+            vt[ci] = "risar";
+            for (int il = 0; il < D2L; ++il) {
+                d.d2kc[il] = (__half*) alloc(K, (size_t) D2RING * NKVD * 2);
+                d.d2vc[il] = (__half*) alloc(K, (size_t) D2RING * NKVD * 2);
+            }
+        }
         conv_bytes = K.vram - v0;
     }
     float* ds_frnnw_c[NC] = {};   // tp1: each card's current ConvDev.frnnw
@@ -2989,6 +3320,11 @@ struct Engine {
             }
             K.D.ctxv = d.ctxv;
         }
+        if (d2_on)   // p74tp
+            for (int il = 0; il < D2L; ++il) {
+                K.D2.kc[il] = d.d2kc[il];
+                K.D2.vc[il] = d.d2vc[il];
+            }
     }
     // pp4: up to k drafts after the anchor at position P for this conversation (conv_use first); ctx_row >= 0: the drafter's
     // context is that row of the last verify window (Engine::verify's D.ctxv = frnn[right])
@@ -3689,7 +4025,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         if (d.empty() && mtp > 0) {   // p6: the DSpark drafter
             mtpd = true;
             const double td = now_s();
-            d = e.ds_draft(next, std::min(mtp, max - (int) g.out.size()));
+            d = e.d2_on ? e.d2_draft(next, std::min(mtp, max - (int) g.out.size())) : e.ds_draft(next, std::min(mtp, max - (int) g.out.size()));   // p74
             g.draft_s += now_s() - td;
         }
         if ((int) d.size() > e.ctx - e.n_past - 1) d.resize(std::max(0, e.ctx - e.n_past - 1));

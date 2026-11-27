@@ -1,6 +1,6 @@
 #!/bin/bash
-# engine-inkling2/run.sh DATA [CTX=32768] [PORT=8080]: the engine on both P100 (the model, the DSpark drafter and its draft
-# vocabulary), then the OpenAI-compatible server on http://127.0.0.1:PORT/v1. CTX up to 524288 with the drafter, two choices
+# engine-inkling2/run.sh DATA [CTX=32768] [PORT=8080]: the engine on both P100 (the model and its drafter: DFlash 2, or DSpark with
+# INK2_DRAFTER=dspark), then the OpenAI-compatible server on http://127.0.0.1:PORT/v1. CTX up to 524288 with the drafter, two choices
 # for a long context (names accepted):
 #   256k = 262144  the KV cache all in f16, 15.2 GiB a card
 #   512k = 524288  the full layers' KV from row 32,768 on in int8 (the rows below in f16, bit for bit as 256k), 15.24 GiB a card
@@ -13,7 +13,8 @@
 # none (low = 0.2; clients such as Open WebUI send none). The engine keeps conversations' checkpoints and parked
 # conversations in RAM (up to INK2_CKPT_MB = 24576 and INK2_PARK_MB = 32768 MiB, taken as they are needed; set them lower on
 # a machine with less RAM).
-# One P100 (docs/INKLING2.md "One P100"): INK2_CARDS=1 runs build/ink2_1c on CUDA_VISIBLE_DEVICES (default 0) without the drafter:
+# One P100 (docs/INKLING2.md "One P100"): INK2_CARDS=1 runs build/ink2_1c on CUDA_VISIBLE_DEVICES (default 0) without a drafter
+# (INK2_DRAFTER=dflash2 turns DFlash 2 on: fresh writing +5 %, edits 9 % slower, so it stays off by default):
 # the experts that fit stay in VRAM in data/plan_1c.txt's order, the rest in RAM (~5 GiB at 32k; checkpoints up to 2048 MiB, no
 # parked conversations), with an on-card cache of RAM experts (INK2_1C_CACHE_MB, 1536; since 26 Nov also slots in the reading
 # path's buffers, INK2_1C_SHARE=1, and no p34 scratch, INK2_1C_SCRATCH_MB=0: the same bits). INK2_LOSSY=1 (one card only) requantizes
@@ -38,9 +39,29 @@ if [ "$LOG" != 0 ] && touch "$LOG" 2>/dev/null; then
 elif [ "$LOG" != 0 ]; then
   echo "run.sh: cannot write $LOG, the log goes to the terminal only" >&2
 fi
-ENG=$B/ink2_v1; DRAFT=(--mtp "$D/dspark-Inkling-2-Mini-Q8_0.gguf" --draft-vocab "$H/data/draft_vocab_32768.bin"); MODE="both cards"
-if [ "${INK2_CARDS:-2}" = 1 ]; then   # one P100: build/ink2_1c, no drafter (on one card its rejected drafts cost PCIe transfers too)
-  ENG=$B/ink2_1c; DRAFT=(); MODE="one card"
+# the drafter (docs/INKLING2.md "DFlash 2"): INK2_DRAFTER=dflash2 (the default since 27 Nov: Inco AI's and z-lab's DFlash 2,
+# drafts at q >= INK2_D2_QMIN 0.7, the server's default INK2_OA_MTP 7) or dspark (Thinking Machines' DSpark through Unsloth's GGUF
+# with its draft vocabulary, the server's default 3 drafts, as before). The DFlash 2 GGUF is made from setup.sh's checkpoint at the
+# first start (tools/dflash2_gguf.py, ~2 min, needs build.sh's llama.cpp/gguf-py); without the checkpoint DSpark runs
+DRAFTER=${INK2_DRAFTER:-dflash2}; DF2=$D/dflash2-Inkling-2-Mini-Q8_0.gguf
+if [ "${INK2_MULTI:-}" = pp ]; then DRAFTER=dspark; fi   # the pipeline knows DSpark only (ink2_tpb has both since 27 Nov)
+if [ "$DRAFTER" = dflash2 ] && [ ! -f "$DF2" ]; then
+  if [ -f "$D/dflash2-Inkling-2-Mini.safetensors" ] && [ -d "$B/llama.cpp/gguf-py" ]; then
+    echo "run.sh: making $DF2 from the DFlash 2 checkpoint (once, ~2 min)"
+    "$D/venv/bin/python" "$H/tools/dflash2_gguf.py" "$D/dflash2-Inkling-2-Mini.safetensors" "$DF2.tmp" "$B/llama.cpp/gguf-py" && mv "$DF2.tmp" "$DF2"
+  else
+    echo "run.sh: no DFlash 2 checkpoint in $D (run setup.sh again), DSpark drafts instead" >&2; DRAFTER=dspark
+  fi
+fi
+case "$DRAFTER" in
+  dflash2) DRAFT=(--mtp "$DF2"); export INK2_D2_QMIN=${INK2_D2_QMIN:-0.7} INK2_OA_MTP=${INK2_OA_MTP:-7} ;;
+  dspark) DRAFT=(--mtp "$D/dspark-Inkling-2-Mini-Q8_0.gguf" --draft-vocab "$H/data/draft_vocab_32768.bin") ;;
+  *) echo "INK2_DRAFTER: dflash2 or dspark" >&2; exit 2 ;;
+esac
+ENG=$B/ink2_v1; MODE="both cards, drafter $DRAFTER"
+if [ "${INK2_CARDS:-2}" = 1 ]; then   # one P100: build/ink2_1c, no drafter unless INK2_DRAFTER names one (rejected drafts cost PCIe transfers too)
+  ENG=$B/ink2_1c; MODE="one card"
+  if [ -n "${INK2_DRAFTER:-}" ]; then MODE="one card, drafter $DRAFTER"; else DRAFT=(); fi
   export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} INK2_1C_PLAN=${INK2_1C_PLAN:-$H/data/plan_1c.txt} \
     INK2_1C_CACHE_MB=${INK2_1C_CACHE_MB:-1536} INK2_1C_MARGIN_MB=${INK2_1C_MARGIN_MB:-150} \
     INK2_1C_SHARE=${INK2_1C_SHARE:-1} INK2_1C_SCRATCH_MB=${INK2_1C_SCRATCH_MB:-0}
@@ -53,7 +74,7 @@ if [ -n "${INK2_MULTI:-}" ]; then   # several conversations at once (test builds
   ENG=$B/ink2_$INK2_MULTI; SLOTS=${INK2_SLOTS:-4}
   [ -n "$CTX_SET" ] || CTX=$([ "$INK2_MULTI" = tpb ] && echo 24576 || echo 65536)
   [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
-  MODE="both cards, up to $SLOTS conversations at once (ink2_$INK2_MULTI, a slot of $CTX each)"; INK2_PICTURES=0
+  MODE="both cards, up to $SLOTS conversations at once (ink2_$INK2_MULTI, a slot of $CTX each, drafter $DRAFTER)"; INK2_PICTURES=0
   SERVER=$B/ink2_server_multi.py; SL=(--slots "$SLOTS")
   "$D/venv/bin/python" "$H/serve/make_multi.py" "$H/serve/ink2_server.py" "$SERVER" "ink2_$INK2_MULTI" >&2 || exit 1
 fi

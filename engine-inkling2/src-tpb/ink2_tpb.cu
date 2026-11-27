@@ -157,6 +157,14 @@ static void fwd_card(Engine& e, int c, std::vector<Job*>& js) {
             CK(cudaMemcpyAsync(e.ds_frnnw_c[c], D.frnn, (size_t) j->T * N * 4, cudaMemcpyDeviceToDevice, K.st));
             r0 += j->T;
         }
+    } else if (e.d2_on) {   // p74tp: DFlash 2's ingest, conversation by conversation
+        int r0 = 0;
+        for (Job* j : js) {
+            e.conv_use(j->cv->dev[c], c);
+            e.ds_feat(K, K.D.feat + (size_t) r0 * 4 * N, K.hx + (size_t) r0 * N, 3, j->T);
+            e.d2_ingest(K, K.D.feat + (size_t) r0 * 4 * N, K.pos + r0, j->T, false);
+            r0 += j->T;
+        }
     }
     bool any = false;
     for (Job* j : js) any |= j->last;
@@ -219,6 +227,12 @@ static void pf_part(Engine& e, int c, Job& j, int part, ReadState& rs) {
             k_rms<<<C, 256, 0, K.st>>>(P.F, N, K.out_norm, P.F2, N, N, e.eps);
             e.ds_feat(K, K.D.pfeat, P.F2, 3, C);
             e.ds_ingest(K, K.D.pfeat, K.D.pfrnn, K.D.pcbuf, K.D.pkb, K.D.pvb, P.pos, C, true);
+        } else if (e.d2_on) {   // p74tp: the chunk's last D2RING rows into this conversation's rings
+            e.mix(K, e.states_pf(K, P.cur), K.out_rq, 1, P.F, C);
+            k_rms<<<C, 256, 0, K.st>>>(P.F, N, K.out_norm, P.F2, N, N, e.eps);
+            e.ds_feat(K, K.D.pfeat, P.F2, 3, C);
+            const int r0 = std::max(0, C - D2RING);
+            e.d2_ingest(K, K.D.pfeat + (size_t) r0 * 4 * N, P.pos + r0, C - r0, true);
         }
         if (j.last) {
             States S{};
@@ -257,11 +271,11 @@ static void run_draft(Engine& e, Job& j) {
         CK(cudaSetDevice(e.cards[c].dev));
         e.conv_use(j.cv->dev[c], c);
         Card& K = e.cards[c];
-        if (j.dctx >= 0)   // Engine::verify's D.ctxv = the kept row's f_rnn
+        if (j.dctx >= 0 && !e.d2_on)   // Engine::verify's D.ctxv = the kept row's f_rnn (DSpark's; p74tp)
             CK(cudaMemcpyAsync(K.D.ctxv, j.cv->dev[c].frnnw + (size_t) j.dctx * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, K.st));
     });   // tp2: no wait (ds_block follows on the same stream)
     e.n_past = j.dpos;
-    j.drafts = e.ds_draft(j.anchor, j.dk);
+    j.drafts = e.d2_on ? e.d2_draft(j.anchor, j.dk) : e.ds_draft(j.anchor, j.dk);   // p74tp
 }
 static void run_waiting(Engine& e) {
     for (;;) {

@@ -28,7 +28,12 @@ itself instead of sending 0.4 MB of logits a row to the host, and several smalle
 bits, reading as before. **And reading 5 % faster, writing at depth up to 16 %** (26 Nov, p59, p61 and Keoian's PR #15,
 [below](#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)): two reading chunks at once (1,031 tok/s at
 4k, was 981), the attention's parts joined by more blocks and a draft window's rows in one block (240k: 33.2 → 38.4 tok/s with
-drafts); the same bits.
+drafts); the same bits. **A second drafter, DFlash 2** (27 Nov, p74, [below](#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov)):
+Inco AI's and z-lab's block drafter writes 8.3 % faster than DSpark on our 56 prompts (91.7 → 99.3 tok/s) and 15 % faster in
+English (93.0 → 106.7); `run.sh` uses it by default, `INK2_DRAFTER=dspark` keeps DSpark; it runs on one card and in
+`INK2_MULTI=tpb` too. **A budget for the reasoning** (27 Nov, p75, [below](#a-budget-for-the-reasoning-p75-27-nov)): a
+reasoning that runs past its effort's budget is closed at a sentence end and the model answers; under it the output is the
+same bit for bit.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -101,7 +106,7 @@ words. Inkling reasons before it answers even at the lowest effort, and once spe
 ```bash
 git clone -b inkling2 https://github.com/Megla123/Scream-P100.git && cd Scream-P100
 bash engine-inkling2/build.sh                 # ink2_v1 (nvcc); ink2_vis, ink2_tok + llama.cpp's llama-tokenize on the CPU
-bash engine-inkling2/setup.sh /data/inkling2  # the model (17.6 GB), the DSpark drafter (0.4 GB), the projector (0.64 GB), a venv
+bash engine-inkling2/setup.sh /data/inkling2  # the model (17.6 GB), the drafters (DFlash 2 0.99 GB, DSpark 0.4 GB), the projector (0.64 GB), a venv
 bash engine-inkling2/run.sh /data/inkling2 256k   # or 512k; OpenAI-compatible API on http://127.0.0.1:8080/v1
 ```
 
@@ -156,6 +161,158 @@ coding agent's write / bash tools worked on our machine. **Pictures**: `image_ur
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## DFlash 2: a second drafter, 8 % faster writing (p74, 27 Nov)
+
+`src/` (`build/ink2_v1`) now has **a second drafter**: [DFlash 2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) by
+Inco AI and z-lab (Apache-2.0), made for Inkling 2 Mini. On English questions it writes **15 % faster** than DSpark (106.7 tok/s
+instead of 93.0 at 512k, 185 W a card), on code functions 12 %, on arithmetic 10 %, and on all our prompts 8.3 % (99.3 instead
+of 91.7). No kind of prompt got slower. Deep in a chat it is about as fast as DSpark. `run.sh` uses it by default. **DSpark
+stays a choice:** `INK2_DRAFTER=dspark`.
+
+DFlash 2 drafts a whole block in one pass: the anchor and 7 mask tokens through 5 layers, with a two-tap dynamic convolution
+before and after each attention and feed-forward. The model's own head gives 16 candidates at each of the 7 positions. Then a
+small selector (two codebooks of rank 256) scores each pair of neighbouring candidates and walks one path. The last checked
+token and the drafts become a window that the model checks as before, so **every written token is still the model's own**.
+
+How it runs here:
+- **Two cards.** It runs whole on both cards, like DSpark (the same inputs give the same bits). Each card's half of the head
+  gives a top-16 there, two passes of 32 parts. The host merges both lists and walks the selector. A draft needs only the row of
+  the predecessor the walk took: 16 dot products of 256. One sync a round (DSpark: one per draft).
+- **Context.** Its context is the same four features as DSpark's: the inputs of layer visits 5, 23 and 41 and the final normed
+  hidden. They go through `fc` and a norm into each layer's K/V, kept in rings of 2,560 rows (its window is 2,048).
+  - Checkpoints and parked conversations keep the rings' last 2,048 rows.
+  - Reading a long prompt, only the rows the rings keep are projected.
+- **Its own GEMV for 8 rows.** The target's kernels are built for single tokens and bit-exact windows. At 8 rows they read the
+  input once a warp from L2: ~107 µs for a 6912 × 2304 matrix. `k_d2_gemv2` takes a row a thread and 32 bytes a step, with the
+  input once a block in shared memory: 93 µs. The head and `fc` use `k_d2_gemv`, 4 rows a warp: 1.28 ms instead of 1.99 for
+  7 rows of the head. All of them are bound by instructions at 8 rows, not by memory. A round of the drafter takes ~4.7 ms
+  (DSpark ~2.4).
+- **The four things Inkling needs.** zzzprojectpage/inkling2-p100-dflash2 found them: without them DFlash 2 accepts almost
+  nothing on Inkling. All four are here:
+  1. the tap ids as in the checkpoint (5, 23, 41, 48);
+  2. the real vocabulary of 200,058 (the codebooks are cut, the top-16 is over real tokens only);
+  3. Inkling's embedding norm on the anchor's and the mask's rows;
+  4. the selector's soft cap after its correction (`selector_softcap_mode: after_correction`).
+- **Sources.** The arithmetic follows SGLang's `DFlash2DraftModel` with the checkpoint's Inkling patch, and llama.cpp's
+  `dflash` / `dflash2` graphs. A PyTorch reference of it judged both drafters on the model's own greedy answers before the port.
+- **Getting it.** `setup.sh` fetches the checkpoint (0.99 GB, BF16). At its first start `run.sh` makes the engine's GGUF with
+  `tools/dflash2_gguf.py` (0.62 GB: the matrices Q8_0, the codebooks BF16; only numpy and llama.cpp's gguf-py).
+  - `--mtp` takes either drafter's file; a DFlash 2 GGUF has `dflash.selector_rank`.
+- **Switches.**
+  - `INK2_D2_QMIN` (0.7): a draft stops below this probability of the selector's softmax over its 16 candidates.
+  - `INK2_D2_ROWS` (8): the block's rows, as trained. 4 rows were 11 % worse.
+  - With DFlash 2, `run.sh` sets the server's `INK2_OA_MTP` to 7 drafts.
+
+Writing, 56 prompts (greedy, at most 600 tokens, prompt lookup 15, 512k, 185 W a card), tok/s and drafts accepted a round:
+
+| prompts | DSpark, 3 drafts | DFlash 2, 5 drafts | **DFlash 2, 7 drafts** |
+|---|---|---|---|
+| English questions | 93.0 (1.75) | 105.8 | **106.7** (3.37) |
+| arithmetic | 90.0 (1.66) | 98.1 | **98.9** (3.04) |
+| code, functions | 94.8 (1.89) | 103.7 | **106.4** (3.56) |
+| code, edits | 109.0 (3.07) | 110.8 | **111.6** (4.12) |
+| new topics | 80.0 (1.32) | 84.7 | **84.5** (2.20) |
+| older tests | 85.2 (1.54) | 90.8 | **91.5** (2.65) |
+| **all** | **91.7** (1.85) | 98.3 (2.81) | **99.3** (3.13) |
+
+DFlash 2 at a gate of 0.5: 94.7 / 97.9 / 95.5 tok/s with 3 / 5 / 7 drafts. At 0.7: 93.6 / 98.3 / 99.3.
+
+At depth (our docs and sources cut to each depth and a question, 256 tokens), tok/s:
+
+| depth | DSpark, 3 drafts | DFlash 2, 3 drafts | DFlash 2, 7 drafts | no drafts |
+|---:|---|---|---|---|
+| 16k | 70.6 | 67.2 | 68.4 | 68.7 |
+| 64k | 82.0 | 79.6 | 77.5 | 59.3 |
+| 128k | 53.2 | 54.2 | 53.7 | 52.3 |
+| 240k | 42.3 | 41.6 | 41.0 | 43.2 |
+
+At depth it accepts more drafts than DSpark but pays for its bigger block, and its window of 2,048 keys sees less of the
+chat than DSpark's 12k layer.
+
+Through the server (`tools/bench.py`, 512k, the drafter at 7 drafts against the build before with DSpark at 3): fresh writing
+84.6 → **87.7** tok/s, an edit 155.5 → 156.0, reading 34.7k tokens 828 → 832, writing after it 67.6 → **69.3**.
+
+**The same model, slightly different texts.** Every draft is checked, but which tokens are checked together changes the order of a few
+sums in a window. Near a tie between two tokens that can pick the other one. So any drafter writes texts that differ from
+writing without drafts at some point, and two drafters differ from each other:
+
+| | the same of 56 |
+|---|---|
+| DSpark against no drafts | 33 |
+| DFlash 2 against no drafts | 33 |
+| DFlash 2 against DSpark | 34-38 |
+
+Without drafts the engine is bit for bit as before with DFlash 2 loaded: the 56 answers, the reads' logits (4k / 30k / 128k),
+checkpoints and parked conversations.
+
+**One P100** (`build/ink2_1c`, the same sources with `-DINK2_NC=1`): DFlash 2 runs there too, and it is a little faster than
+DSpark everywhere. Against writing without a drafter it gains on fresh text but loses on edits. So the one-card build still
+runs **without a drafter by default**, and `INK2_DRAFTER=dflash2` turns it on. The drafter's 0.58 GB of VRAM moves experts to
+RAM, and a rejected draft costs their transfers. Measured with `tools/bench.py` at CTX 40960 and 185 W, in tok/s:
+
+| one P100 | fresh | edit | read 34.7k | writing after it |
+|---|---|---|---|---|
+| exact, no drafter | 49.2 | **78.8** | 380 | **40.0** |
+| exact, DSpark, 3 drafts | 50.3 | 70.5 | 383 | 38.1 |
+| exact, DFlash 2, 7 drafts | **51.8** | 71.7 | 383 | 37.7 |
+| lossy (`INK2_LOSSY=1`), no drafter | 54.3 | **95.0** | 398 | 45.0 |
+| lossy, DSpark, 3 drafts | 57.8 | 90.9 | 394 | **47.1** |
+| lossy, DFlash 2, 7 drafts | **58.9** | 91.6 | 402 | 44.5 |
+
+**Several conversations at once** (`ink2_tpb`, `src-tpb/`): DFlash 2 runs there too, with its own rings in each conversation's
+slot (52 MB a card). Each conversation writes the same tokens alone and beside the others. It is the default there as well
+(`INK2_MULTI=tpb`). Fresh writing, 256 tokens a conversation, 4 slots of 24576, all conversations together, tok/s:
+
+| conversations at once | no drafts | DSpark, 3 drafts | DFlash 2, 7 drafts |
+|---:|---|---|---|
+| 1 | 61.5 | 88.4 | **94.9** |
+| 2 | 88.3 | **121.0** | 118.7 |
+| 4 | 102.5 | 135.2 | **137.4** |
+
+Alone, English writes 94.6 instead of 82.2 and code 107.0 instead of 98.1. With 2 or 4 conversations the two drafters are about
+the same. The pipeline build (`ink2_pp`) keeps DSpark: its drafter sits on card 1 and its head on card 0.
+
+Tried and left out:
+- **The head on the 32k draft vocabulary** (DSpark's way): the head would be 6 times cheaper, but 11 % fewer drafts were
+  accepted (17 % in English).
+- **4 rows of x a thread in the GEMV** (`k_d2_gemv3`): slower than `k_d2_gemv2`.
+- **A block of 4 rows** instead of 8: 11 % fewer drafts accepted.
+- **The next step** would be the drafter's block split over the two cards instead of whole on each (half the GEMVs, ~4
+  exchanges a layer).
+
+## A budget for the reasoning (p75, 27 Nov)
+
+`serve/ink2_server.py` now gives each answer's reasoning a **budget by its effort**. When a reasoning reaches it, the server waits for
+the end of its sentence (at most 512 tokens more) and closes it with a short note: "I have thought about this long enough and I
+have what I need, so I stop thinking here and write the answer now." Then the model writes its answer or its tool call. It works the
+same way as the loop guard closes a reasoning that repeats itself. An answer whose reasoning stays under its budget is **the same,
+bit for bit**, as before.
+
+| effort | none, minimal | low | medium | high | xhigh, max |
+|---|---|---|---|---|---|
+| budget (tokens) | 1,024 | 4,096 | 8,192 | 16,384 | 32,768 |
+
+A request with tools (an agent's step) gets at most 8,192 (`INK2_THINK_BUDGET_TOOLS`).
+
+Why these numbers:
+- In our agent's sessions all Inkling steps ran at high, and 99 % of their reasonings were under ~2,700 tokens. One ran 53,000
+  characters (~13k tokens) into the length limit and gave neither an answer nor a call.
+- A hard reasoning task at high took 9,200 tokens and was right, so high keeps 16k.
+- A request at 125k of context that once enumerated 33,768 characters of reasoning without an answer now answers (20,239
+  characters).
+
+Checked against the server before it, on the same engine:
+- a 125k-token request with 7,441 characters of reasoning and four short requests (low, medium, high, one with a tool) gave the
+  same output bit for bit;
+- with a budget of 300 the reasoning was closed at 319 tokens at a sentence end, and the answer that followed was right.
+
+The budget is in the server, so it works the same on one card and with several conversations at once (`INK2_MULTI`, whose
+server `make_multi.py` makes from this file). We checked both with a budget of 300 on a question that needs a longer reasoning:
+- one card: the reasoning was closed at 349 tokens and the answer was right;
+- `INK2_MULTI=tpb` with two conversations at once: both were closed at 355 tokens and gave the same right answer.
+
+`INK2_THINK_BUDGET` sets the five budgets (comma list); `INK2_THINK_BUDGET=0` turns it off.
 
 ## Attention at depth: the int8 rows up front (p70, p72, 27 Nov)
 
@@ -1162,14 +1319,18 @@ and from 26 Nov (p47-p57, each at its old value = the old code, all the same bit
 `INK2_G1W` (4, rows a warp for them; 0 the block kernel), `INK2_MIX3` (1, the depth mixes of few rows in two launches),
 `INK2_XLL` (1, single-token exchanges as 8-byte words), `INK2_CKSPARE` (1, the spare checkpoint buffer made between requests),
 `INK2_COMB2` (3 since p59, 4 blocks a head or the values ahead in registers; 1 p57's parallel join; 0 `k_attn_comb`), `INK2_R7TPB` / `INK2_R6WPB` (256 / 4, the expert
-kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts), and from 27 Nov (p70, p72): `INK2_ATT_PV` (1, the full layers' int8 parts read their K and V rows up front, P·V from shared memory, see [above](#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov); 0 the old kernels).
-Server switches (environment of `serve/ink2_server.py`): `INK2_EFFORT` (0.2 = low), `INK2_OA_MTP` (3), `INK2_OA_LOOKUP`
+kernels' blocks of a single token; smaller measured no gain), `INK2_G6` (0, p50, see below). `INK2_PF_ZIP` (2 in this build since 26 Nov, 0 before; 2 or 3 = so many reading chunks at once, see above; off by itself when its buffers do not fit beside the experts), and from 26 Nov (p59, p61): `INK2_COMB4_MIN` (48, parts from which `INK2_COMB2=3` uses its blocks), `INK2_ATT_W` (1, a draft window's rows in one block on the full layers; 0 one block a row) and `INK2_ATT_W_MIN` (64 parts), and from 27 Nov (p70, p72): `INK2_ATT_PV` (1, the full layers' int8 parts read their K and V rows up front, P·V from shared memory, see [above](#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov); 0 the old kernels), and from 27 Nov (p74, DFlash 2): `INK2_D2_QMIN` (0.5 in the engine, 0.7 from `run.sh`: a draft stops below this probability of the selector) and `INK2_D2_ROWS` (8, the drafter's block), see [DFlash 2](#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov).
+`run.sh` switches: `INK2_DRAFTER` (dflash2 since 27 Nov; dspark), `INK2_CARDS` (2; 1 = `build/ink2_1c`), `INK2_LOSSY` (0),
+`INK2_MULTI` (tpb or pp), `INK2_SLOTS` (4), `INK2_PICTURES` (1), `INK2_LOG`.
+Server switches (environment of `serve/ink2_server.py`): `INK2_EFFORT` (0.2 = low), `INK2_OA_MTP` (3; 7 from `run.sh` with DFlash 2), `INK2_OA_LOOKUP`
 (15), `INK2_LOOP_TEXT` (16000), `INK2_LOG_EVERY` (60), and from 26 Nov `INK2_LOOP_TURNS` (3: so many steps back to back with
 the same tool call and the same result get the loop's system message; 0 = off), `INK2_LOOP_DROP` (1), `INK2_LOOP_MODE`
 (s), from the evening of 26 Nov `INK2_LOOP_MASK` (1), `INK2_LOOP_PAR` (1), `INK2_LOOP_CYCLE` (2) and `INK2_LOOP_NORM` (4),
 and from 27 Nov `INK2_LOOP_CALL` (1: a looping tool call is cut and the model writes on after a system message; 0 = dropped)
 and `INK2_LOOP_CALL_NOTE` (that message's text, `{what}`: the tool's name),
-see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call).
+see [Loops](#loops-in-the-reasoning-the-answer-or-a-tool-call), and from 27 Nov (p75) `INK2_THINK_BUDGET`
+(1024,4096,8192,16384,32768: the reasoning's budget in tokens for none / low / medium / high / xhigh; 0 = off) and
+`INK2_THINK_BUDGET_TOOLS` (8192, the most for a request with tools), see [the budget](#a-budget-for-the-reasoning-p75-27-nov).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 

@@ -641,6 +641,26 @@ CALL_NOTE = os.environ.get("INK2_LOOP_CALL_NOTE") or (
 CALL_STOP = ("[ink2_server] I stopped here: my tool call ({what}) kept repeating the same text, so it was not run. Tell me how "
              "to go on.")
 LOOP_END = "[ink2_server] I stopped here: my reply kept repeating itself. Tell me how to go on."
+# p75: the reasoning's budget by effort (tokens of a reply's reasoning part): <= 0.1 / 0.2 / 0.7 / 0.9 / above; INK2_THINK_BUDGET=0 off
+THINK_BUDGET = [int(x) for x in os.environ.get("INK2_THINK_BUDGET", "1024,4096,8192,16384,32768").split(",") if x.strip()]
+THINK_BUDGET_TOOLS = int(os.environ.get("INK2_THINK_BUDGET_TOOLS", "8192"))   # p75: the most with tools (0: no extra limit)
+if THINK_BUDGET == [0]:
+    THINK_BUDGET = []
+BUDGET_WAIT = 512   # p75: tokens past the budget a reasoning may take to end its sentence
+BUDGET_NOTE = "\n\nI have thought about this long enough and I have what I need, so I stop thinking here and write the answer now."
+BUDGET_IDS = []
+_SENT_END = re.compile(r"(?:[.!?:;](?:[\"')\]]*)\s|\n)$")
+
+
+def think_budget(effort, tools=False):
+    """p75: the reasoning budget in tokens for a request's effort (a name of EFFORT or a number), at most THINK_BUDGET_TOOLS with
+    tools; 0: no budget"""
+    if not THINK_BUDGET:
+        return 0
+    num = EFFORT[effort] if isinstance(effort, str) and effort in EFFORT else float(effort if effort is not None else 0.9)
+    k = 0 if num <= 0.1 else 1 if num <= 0.2 else 2 if num <= 0.7 else 3 if num <= 0.9 else 4
+    b = THINK_BUDGET[min(k, len(THINK_BUDGET) - 1)]
+    return min(b, THINK_BUDGET_TOOLS) if tools and THINK_BUDGET_TOOLS > 0 and b > 0 else b
 Loop.TEXT_SPAN = int(os.environ.get("INK2_LOOP_TEXT", Loop.TEXT_SPAN))
 Loop.PAR = int(os.environ.get("INK2_LOOP_PAR", Loop.PAR))
 Loop.MASK = int(os.environ.get("INK2_LOOP_MASK", Loop.MASK))
@@ -726,7 +746,7 @@ def turn_loop2(messages):
     return None
 
 
-def reply(ids, mx, req, on_part=None, mode="c", gone=None):
+def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0):
     """The engine's reply to the prompt ids, at most mx tokens: (tokens, totals, stopped). Each token's parts go to
     on_part(kind, val) as they come ("r" reasoning, "c" content, "tool" a call). A loop in the reasoning (Loop) stops
     the engine; the reasoning is kept up to the end of the block's first copy, closed by NUDGE, and the model writes its
@@ -735,8 +755,10 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None):
     so does a loop in the answer (kept up to its first copy) or in a tool call (the call is dropped).
     mode: the part the prompt ends in ("r" when it ends inside a reasoning). gone() is asked about once a second while
     the engine writes; True (the client closed its connection) stops the engine with ConnectionResetError, also while
-    the reply is in a part that streams nothing (a tool call)."""
+    the reply is in a part that streams nothing (a tool call). p75: budget > 0, a reasoning part over budget tokens is closed at
+    its next sentence end by BUDGET_NOTE (once a reply) and the model writes its answer."""
     parts, guard, out = Parts(), Loop(), []
+    r_n, bud = 0, False   # p75: tokens of the current reasoning part; a budget cut asked
     parts.mode = mode
     tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
     t_gone = time.time()
@@ -767,6 +789,11 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None):
                         keep = guard.step(parts.mode, evs, len(out), raw)
                         if keep is not None:
                             break
+                        r_n = r_n + 1 if parts.mode == "r" else 0   # p75
+                        if (budget and parts.mode == "r" and r_n >= budget and not tot.get("budget")
+                                and (r_n >= budget + BUDGET_WAIT or _SENT_END.search(guard.text[-8:]))):
+                            keep, bud = len(out), True
+                            break
                     STATE["n_decoded"], STATE["part"] = len(out), parts.mode
                     if keep is not None:
                         break
@@ -792,6 +819,23 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None):
             tot["write_s"] += time.time() - (t_first or t_req)
         if keep is None:
             return shown(False)
+        if bud:   # p75: the reasoning over its budget, closed at a sentence end; not a loop cut
+            bud = False
+            tot["budget"] = r_n
+            if not BUDGET_IDS:
+                BUDGET_IDS.extend(i for i in tokenize(BUDGET_NOTE) if i not in SPECIAL)
+            forced = BUDGET_IDS + [T_END, T_MODEL, T_TEXT]
+            print(f"ink2_server: the reasoning reached its budget ({r_n} tokens, limit {budget}): closed, the model writes its answer",
+                  file=sys.stderr, flush=True)
+            if len(out) + len(forced) >= mx:
+                return shown(False)
+            evs = parts.feed(forced)
+            if on_part:
+                for kind, val in evs:
+                    on_part(kind, val)
+            out += forced
+            guard, r_n = Loop(), 0
+            continue
         tot["cuts"] += 1
         start, p = guard.hit
         print(f"ink2_server: a loop in {PART[guard.mode]} (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
@@ -1013,14 +1057,15 @@ class H(BaseHTTPRequestHandler):
                 if loop and note:
                     on_part("r", note)
             try:
-                out, tot, stopped = reply(ids, mx, req, on_part, mode="r" if loop and note else "c", gone=self._gone)
+                out, tot, stopped = reply(ids, mx, req, on_part, mode="r" if loop and note else "c", gone=self._gone,
+                                          budget=think_budget(effort_of(body), bool(tools)))   # p75
             except (BrokenPipeError, ConnectionResetError):   # closing the engine's socket stopped it at its next write
                 print(f"ink2_server: request: the client left after {STATE['n_decoded']} written tokens ({len(ids)} prompt tokens); "
                       f"the engine stopped", file=sys.stderr, flush=True)
                 return
             n = len(out)
             STATE["tokens_out"] += n
-            if not tot["cuts"]:   # a cut reads its kept part again, so its read_s is no measure
+            if not tot["cuts"] and not tot.get("budget"):   # a cut reads its kept part again, so its read_s is no measure (p75 too)
                 read_fit(tot["cached"], len(ids), tot["read_s"])
             STATE["n_cache"] = tot["cached"]   # the engine's own count from here on
             hints = req["ckpt"] + [len(ids) - 1] if "ckpt" in req else []   # the engine checkpoints n - 1 too (none without "ckpt")
@@ -1128,5 +1173,5 @@ if __name__ == "__main__":
     srv.daemon_threads = True
     if LOG_EVERY > 0:
         threading.Thread(target=ticker, daemon=True).start()
-    print(f"ink2_server: {A.alias} na {A.host}:{A.port}, ctx {A.ctx}, pogon {A.sock}", file=sys.stderr, flush=True)
+    print(f"ink2_server: {A.alias} on {A.host}:{A.port}, ctx {A.ctx}, engine {A.sock}", file=sys.stderr, flush=True)
     srv.serve_forever()

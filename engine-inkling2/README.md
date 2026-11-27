@@ -1,8 +1,8 @@
 # engine-inkling2: `ink2`, Inkling 2 Mini on two Tesla P100
 
 **Not a Strata fork:** an engine written from scratch for Thinking Machines' Inkling 2 Mini (no Strata code; llama.cpp only as a library for the tokenizer and the picture encoder). The Strata-derived engine of Scream P100 is the Flash-Next one, `engine/` on `main`. `ink2` runs Inkling 2 Mini (26.4B looped MoE, NVFP4 experts) on two Tesla P100 16 GB: both
-cards on every layer at once, the whole model in VRAM, DSpark (MTP) and prompt-lookup drafts, an OpenAI-compatible server
-with tool calls and pictures. Fresh writing 72 tok/s (97 with drafts), edits ~170,
+cards on every layer at once, the whole model in VRAM, two drafters (DFlash 2 by default since 27 Nov, 8 % faster writing than DSpark, 15 % in English; DSpark) and prompt-lookup drafts, an OpenAI-compatible server
+with tool calls, pictures and a reasoning budget by effort (27 Nov). Fresh writing 72 tok/s (97 with drafts), edits ~170,
 reading ~1,030 tok/s at 4k and ~800-825 at 35-38k, writing at a depth of 240k 42 tok/s with drafts, 43.5 without (27 Nov, 185 W a
 card); context
 **256k** (KV f16) or **512k** (KV int8 past 32k, the first 32k bit for bit as 256k, same speed); llama.cpp on the same cards:
@@ -17,7 +17,7 @@ The full write-up: [docs/INKLING2.md](../docs/INKLING2.md).
 
 ```bash
 bash engine-inkling2/build.sh                 # build/ink2_v1, ink2_1c, ink2_tpb, ink2_pp, ink2_vis, ink2_tok + llama-tokenize (CPU)
-bash engine-inkling2/setup.sh /data/inkling2  # model 17.6 GB + drafter 0.4 GB + projector 0.64 GB (--no-pictures: without), a venv
+bash engine-inkling2/setup.sh /data/inkling2  # model 17.6 GB + drafters 0.99 + 0.4 GB + projector 0.64 GB (--no-pictures: without), a venv
 bash engine-inkling2/run.sh /data/inkling2 [CTX=32768|256k|512k] [PORT=8080]   # log also in /data/inkling2/ink2-PORT.log
 INK2_CARDS=1 bash engine-inkling2/run.sh /data/inkling2   # one P100 (INK2_LOSSY=1: faster, ~2 GB less RAM, output changes)
 INK2_MULTI=tpb bash engine-inkling2/run.sh /data/inkling2  # up to 4 chats at once (test build; INK2_MULTI=pp: the pipeline)
@@ -34,6 +34,8 @@ python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # wit
 | `src/ink2_kern.cuh` | writing kernels: Q8 GEMVs, NVFP4 expert rows, attention by KV head, the fused exchange / convolution kernels |
 | `src/ink2_pf.cuh` | reading kernels: NVFP4 and Q8 expert tile GEMMs, convolutions over a chunk, softmax with the relative bias and sink |
 | `src/ink2_dspark.cuh` | the DSpark drafter's kernels (NeoX RoPE, block attention, the Markov head) |
+| `src/ink2_dflash2.cuh` | the DFlash 2 drafter (27 Nov): the block of 8 rows with its two-tap convolutions, its K/V rings, the two-pass top-16, own GEMVs for 8 rows; `src-tpb/` has a copy |
+| `tools/dflash2_gguf.py` | the DFlash 2 checkpoint (safetensors) to the engine's GGUF, numpy and gguf-py only; `run.sh` runs it at the first start |
 | `src/ink2_vis.cpp` | the picture encoder: llama.cpp's mtmd (the vision projector) on the CPU, rows to a file |
 | `src/ink2_tok.cpp` | llama.cpp's tokenizer as a process that stays up (the server's `--tok`) |
 | `src-1c/` | the one-card build of 23 Nov (`-DINK2_NC=1 -DINK2_RING=2048`, `gguf_min.*` from `src/`): experts placed by a plan, staged reading, the on-card cache of RAM experts, the lossy requantizing; kept for reference, `build.sh` builds `ink2_1c` from `src/` since 26 Nov |
@@ -41,7 +43,7 @@ python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # wit
 | `src-pp/` | several chats at once as a pipeline (`ink2_pp.cu`, one-card kernels, `-DINK2_RING=2048`): half of the layers on each card, 8 segments a token, a thread and a queue a card, the drafter on card 1 |
 | `src/gguf_min.*` | a small GGUF reader (NVFP4 = type 40) |
 | `src/bench_dec.cu`, `src/ink2_bench.cuh` | a one-card microbenchmark of the decode kernels on random weights |
-| `serve/ink2_server.py` | the HTTP server (OpenAI API + llama-server endpoints, tools, pictures), greedy |
+| `serve/ink2_server.py` | the HTTP server (OpenAI API + llama-server endpoints, tools, pictures, the loop guard and the reasoning budget), greedy |
 | `data/draft_vocab_32768.bin`, `tools/draft_vocab.py` | the drafter's reduced vocabulary and how it was made |
 | `data/plan_1c.txt`, `tools/plan_1c.py` | the one-card build's order of experts for VRAM and how to make one from routing traces |
 | `serve/make_multi.py` | the server for `INK2_MULTI` (`build/ink2_server_multi.py`): up to `--slots` requests at once |

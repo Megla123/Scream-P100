@@ -1,8 +1,9 @@
 #!/bin/bash
-# engine-inkling2/setup.sh DATA [--no-pictures]: downloads Inkling 2 Mini (Xylolabs's NVFP4-Q8_0 GGUF, 17.6 GB), its DSpark
-# drafter (Unsloth's Q8_0 GGUF, 0.4 GB) and, for pictures, Xylolabs's vision projector (BF16 GGUF, 0.64 GB; not with
-# --no-pictures) into DATA, checks each by SHA-256, and makes a Python venv for the server (numpy and what llama.cpp's gguf-py
-# imports: pyyaml, tqdm, requests; DATA/venv). Resumes a broken download. About 19 GB free in DATA.
+# engine-inkling2/setup.sh DATA [--no-pictures]: downloads Inkling 2 Mini (Xylolabs's NVFP4-Q8_0 GGUF, 17.6 GB), its two drafters
+# (DFlash 2: Inco AI's and z-lab's incoai/Inkling-2-Mini-DFlash2, BF16 safetensors, 0.99 GB, which run.sh turns into the engine's
+# GGUF at its first start, 0.62 GB; DSpark: Unsloth's Q8_0 GGUF, 0.4 GB) and, for pictures, Xylolabs's vision projector (BF16
+# GGUF, 0.64 GB; not with --no-pictures) into DATA, checks each by SHA-256, and makes a Python venv for the server (numpy and what
+# llama.cpp's gguf-py imports: pyyaml, tqdm, requests; DATA/venv). Resumes a broken download. About 21 GB free in DATA.
 set -euo pipefail
 D=${1:?usage: setup.sh DATA [--no-pictures]}; PICTURES=1
 [ "${2:-}" = --no-pictures ] && PICTURES=0
@@ -19,6 +20,9 @@ get https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-M
     Inkling-2-Mini-NVFP4-Q8_0.gguf d4fcaf47c7f3efbbe057bcf2e516076b7a517017308284b2032c92851edfbd37
 get https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/dspark-Inkling-2-Mini-Q8_0_Old.gguf \
     dspark-Inkling-2-Mini-Q8_0.gguf 2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773
+# the DFlash 2 drafter (Apache-2.0): run.sh makes DATA/dflash2-Inkling-2-Mini-Q8_0.gguf from it (tools/dflash2_gguf.py)
+get https://huggingface.co/incoai/Inkling-2-Mini-DFlash2/resolve/main/model.safetensors \
+    dflash2-Inkling-2-Mini.safetensors 217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee
 if [ $PICTURES = 1 ]; then
   get https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF/resolve/main/mmproj-Inkling-2-Mini-BF16.gguf \
       mmproj-Inkling-2-Mini-BF16.gguf 73b64fc98003b6fd5dca85dae26da3fe292d6075978138d319bdcbe4528f5b15
