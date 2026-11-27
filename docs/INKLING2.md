@@ -164,6 +164,8 @@ another one ([checkpoints and parked conversations](#conversations-keep-their-pl
 
 ## DFlash 2: a second drafter, 8 % faster writing (p74, 27 Nov)
 
+[![Inkling 2 Mini with the DFlash 2 drafter: 91.7 to 99.3 tok/s on 56 prompts at 512k, English questions 93.0 to 106.7, every token checked by the model](inkling2-dflash2.jpg)](#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov)
+
 `src/` (`build/ink2_v1`) now has **a second drafter**: [DFlash 2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) by
 Inco AI and z-lab (Apache-2.0), made for Inkling 2 Mini. On English questions it writes **15 % faster** than DSpark (106.7 tok/s
 instead of 93.0 at 512k, 185 W a card), on code functions 12 %, on arithmetic 10 %, and on all our prompts 8.3 % (99.3 instead
@@ -245,6 +247,8 @@ writing without drafts at some point, and two drafters differ from each other:
 
 Without drafts the engine is bit for bit as before with DFlash 2 loaded: the 56 answers, the reads' logits (4k / 30k / 128k),
 checkpoints and parked conversations.
+
+[![DFlash 2 on one P100 and with several chats at once: 94.9 tok/s one chat, 137.4 with four, 51.8 exact on one P100](inkling2-dflash2-1c-tpb.jpg)](#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov)
 
 **One P100** (`build/ink2_1c`, the same sources with `-DINK2_NC=1`): DFlash 2 runs there too, and it is a little faster than
 DSpark everywhere. Against writing without a drafter it gains on fresh text but loses on edits. So the one-card build still
