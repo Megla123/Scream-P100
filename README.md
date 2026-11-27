@@ -345,6 +345,16 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **27 Nov 2026 (evening):** 🦑 **Inkling 2 Mini has a second drafter, DFlash 2: 8 % faster writing, 15 % in English** on
+  branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov).
+  Inco AI's and z-lab's [DFlash 2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafts a block of 8 tokens in one
+  pass, and every written token is still the model's own. On our 56 prompts (512k, 185 W a card) writing went from 91.7 to
+  **99.3 tok/s** against DSpark; English questions from 93.0 to **106.7**, code functions from 94.8 to 106.4. Nothing got slower,
+  and deep in a chat it is about as fast as DSpark. `run.sh` uses it by default; `INK2_DRAFTER=dspark` keeps DSpark. It also runs
+  on **one P100** (a choice there: faster fresh writing, slower edits) and with **several chats at once** (`INK2_MULTI=tpb`, the
+  default there: 94.9 tok/s alone, 137.4 with 4). Also new: a **budget for the reasoning** by effort, so a reasoning that runs
+  long is closed at a sentence end and the model answers. Under the budget the output is the same bit for bit.
+
 - **27 Nov 2026 (mid-morning):** 🦑 **Inkling 2 Mini writes up to 18 % faster deep in a chat, every token the same** on branch
   [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov):
   the full layers' attention now reads its int8 K and V rows up front, in 16-byte loads that arrive while it works
