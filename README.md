@@ -355,6 +355,10 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
   default there: 94.9 tok/s alone, 137.4 with 4). Also new: a **budget for the reasoning** by effort, so a reasoning that runs
   long is closed at a sentence end and the model answers. Under the budget the output is the same bit for bit.
 
+  [![Inkling 2 Mini with the DFlash 2 drafter: 91.7 to 99.3 tok/s on 56 prompts at 512k, English questions 93.0 to 106.7](docs/inkling2-dflash2.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov)
+  [![DFlash 2 on one P100 and with several chats at once: 94.9 tok/s one chat, 137.4 with four](docs/inkling2-dflash2-1c-tpb.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#dflash-2-a-second-drafter-8--faster-writing-p74-27-nov)
+
+
 - **27 Nov 2026 (mid-morning):** 🦑 **Inkling 2 Mini writes up to 18 % faster deep in a chat, every token the same** on branch
   [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov):
   the full layers' attention now reads its int8 K and V rows up front, in 16-byte loads that arrive while it works
