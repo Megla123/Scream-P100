@@ -345,6 +345,14 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **27 Nov 2026 (morning):** 🦑 **Inkling 2 Mini's agent no longer stops without a word on a looping tool call** on branches
+  [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call)
+  and [`inkling2-m40`](https://github.com/Megla123/Scream-P100/blob/inkling2-m40/docs/INKLING2-M40.md#loops-26-nov): a call
+  whose JSON repeats itself is cut where it began, and the model writes on after a system message that says so
+  (`INK2_LOOP_CALL`); a reply that ends in a loop again says "[ink2_server] I stopped here" to the user. While a long prompt
+  is read, `/slots` now gives llama-server's `n_prompt_tokens_total`, `_cache` and `_processed` (the last estimated from the
+  reading cost by depth), so a chat app's progress line shows the real reading speed. Without a loop the replies are the same.
+
 - **26 Nov 2026 (late evening):** 🦑 **Inkling 2 Mini's loop guard holds at 125k of context** on branches [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call)
   and [`inkling2-m40`](https://github.com/Megla123/Scream-P100/blob/inkling2-m40/docs/INKLING2-M40.md#loops-26-nov): a
   reasoning that goes over the same points again under new numbers is now cut (`INK2_LOOP_MASK`), and so is an answer or a
