@@ -345,6 +345,15 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **27 Nov 2026 (mid-morning):** 🦑 **Inkling 2 Mini writes up to 18 % faster deep in a chat, every token the same** on branch
+  [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov):
+  the full layers' attention now reads its int8 K and V rows up front, in 16-byte loads that arrive while it works
+  (`INK2_ATT_PV`). One visit at 240k went from 1,521 to 979 µs. At 240k tokens deep, writing went from 36.8 to **43.5 tok/s**
+  without drafts and from 38.4 to **42.2** with them; at 128k it went from 47.7 to 52.8 and from 50.8 to 53.3. Short prompts and
+  reading are unchanged. Longer drafts at depth were tried and left out (6-10 % slower).
+
+  [![Inkling 2 Mini, p70 + p72: writing at 240k 36.8 to 43.5 tok/s without drafts and 38.4 to 42.2 with them, every token the same, 185 W a card](docs/inkling2-p72.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-the-int8-rows-up-front-p70-p72-27-nov)
+
 - **27 Nov 2026 (morning):** 🦑 **Inkling 2 Mini's agent no longer stops without a word on a looping tool call** on branches
   [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call)
   and [`inkling2-m40`](https://github.com/Megla123/Scream-P100/blob/inkling2-m40/docs/INKLING2-M40.md#loops-26-nov): a call
