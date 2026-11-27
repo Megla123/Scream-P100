@@ -35,9 +35,15 @@ Inkling 2 Mini (`ink2`, exact): **~79 tok/s writing · 100-127 tok/s edits · ~8
 
 ---
 
-Scream P100 is a port of [Strata](https://github.com/Niko1221/Strata)'s all-cards split engine (`strata-split-2`, from
-[sFNX](https://github.com/johnfink8/sfnx)) to the **NVIDIA Tesla P100** (Pascal, sm_60), a card that engine was never
-built for. Both cards work on every layer at once, the experts that do not fit in VRAM stream in from RAM over PCIe,
+Scream P100 holds **two different engines**, and only the Flash-Next one comes from Strata:
+
+| Engine | Models | Where it comes from |
+|---|---|---|
+| **`ink2`** (branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2), `engine-inkling2/`) | Inkling 2 Mini | **Not a Strata fork.** Written from scratch for Inkling 2's looped MoE: its own CUDA engine and kernels, GGUF reader, DSpark drafter path and server. No Strata code; llama.cpp only as a library for the tokenizer and the picture encoder (mtmd, on the CPU). |
+| **`strata-split-2`** (`engine/`) | Qwen3.8-Flash-Next, Edge0-145B | A port of [Strata](https://github.com/Niko1221/Strata)'s all-cards split engine (from [sFNX](https://github.com/johnfink8/sfnx)) to the P100, served by Strata v0.2.9's server. What is ours and what is Strata's: [docs/PROVENANCE.md](docs/PROVENANCE.md). |
+
+The rest of this part is about the Flash-Next engine. `strata-split-2` runs on the **NVIDIA Tesla P100** (Pascal, sm_60),
+a card that engine was never built for. Both cards work on every layer at once, the experts that do not fit in VRAM stream in from RAM over PCIe,
 and two drafters (the model's own MTP layer and prompt lookup) let the cards check several tokens per step.
 
 On the same two cards, our previous setup (Strata 0.2.9's layer-split engine with our P100 kernels, where one card
