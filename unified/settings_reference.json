@@ -1,0 +1,1253 @@
+{
+  "version": 1,
+  "entries": {
+    "config": {
+      "kind": "discovery",
+      "summary": "Select the user configuration file.",
+      "values": "Path to a readable JSON object. Omit it to use shipped profiles and other supplied inputs.",
+      "lookup_aliases": ["--cookbook", "cookbook"],
+      "related": [
+        "environment_prefix",
+        "legacy_names"
+      ]
+    },
+    "profile": {
+      "kind": "control",
+      "summary": "Select a named profile and its ancestors.",
+      "values": "A shipped or file-defined profile name. Omit it to apply the default profile when enabled. JSON null selects no explicit profile.",
+      "lookup_aliases": ["--recipe", "recipe"],
+      "related": [
+        "profiles.<profile>.extends",
+        "ignore_default_profile"
+      ]
+    },
+    "ignore_default_profile": {
+      "kind": "control",
+      "summary": "Skip automatic inheritance of the default profile.",
+      "values": "Boolean. Default false. Use --no-ignore-default-profile or --no-ignore-default-recipe to restore automatic inheritance. An explicit selection or extends: default still applies the profile.",
+      "lookup_aliases": ["--ignore-default-recipe", "--no-ignore-default-recipe"],
+      "related": [
+        "profile"
+      ]
+    },
+    "environment_precedence": {
+      "kind": "control",
+      "summary": "Choose which source wins between JSON and the environment.",
+      "values": "config (default) or environment. The command line keeps highest source priority.",
+      "related": [
+        "legacy_name_precedence"
+      ]
+    },
+    "environment_prefix": {
+      "kind": "control",
+      "summary": "Set the namespace for launcher inputs.",
+      "values": "Uppercase letters, digits, and single underscores, starting with a letter. The built-in prefix is shown in Environment. File discovery uses the bootstrap prefix.",
+      "related": [
+        "config",
+        "environment_precedence"
+      ]
+    },
+    "legacy_names": {
+      "kind": "control",
+      "summary": "Enable legacy input aliases in configured mode.",
+      "values": "Boolean. Default false. Use --no-legacy-names to override a file or bootstrap environment that enables it.",
+      "related": [
+        "legacy_name_precedence",
+        "config"
+      ]
+    },
+    "legacy_name_precedence": {
+      "kind": "control",
+      "summary": "Choose the winning spelling when canonical and legacy names coexist in one source.",
+      "values": "canonical (default) or legacy. A conflict is reported to standard error with names only.",
+      "related": [
+        "legacy_names",
+        "environment_precedence"
+      ]
+    },
+    "settings": {
+      "kind": "document",
+      "summary": "Supply file-wide launcher settings.",
+      "values": "JSON object. It applies beneath profile settings."
+    },
+    "profiles": {
+      "kind": "document",
+      "summary": "Define or customize named profiles.",
+      "values": "JSON object keyed by nonempty profile names. The shipped definitions are in builtin_profiles.json.",
+      "related": [
+        "profile",
+        "profiles.<profile>.extends",
+        "profiles.<profile>.settings"
+      ]
+    },
+    "profiles.<profile>.extends": {
+      "kind": "document",
+      "summary": "Inherit settings from a named parent profile.",
+      "values": "A known profile name or null. Cycles are invalid. The default profile has no parent. Omission preserves a shipped parent.",
+      "related": [
+        "profile",
+        "ignore_default_profile"
+      ]
+    },
+    "profiles.<profile>.settings": {
+      "kind": "document",
+      "summary": "Provide the settings that a profile adds or overrides.",
+      "values": "JSON object with the same keys as settings. A child overrides any ancestor settings that it supplies.",
+      "related": [
+        "settings",
+        "profiles.<profile>.extends"
+      ]
+    },
+    "export_profile": {
+      "kind": "command",
+      "summary": "Export a profile as versioned JSON.",
+      "values": "Path to a new file, or - for standard output. Resolves the selected file's declarations and profile inheritance without launch overrides.",
+      "lookup_aliases": ["--export-recipe", "export_recipe"],
+      "related": ["config", "profile", "import_profile"]
+    },
+    "import_profile": {
+      "kind": "command",
+      "summary": "Import an exported profile into a configuration file.",
+      "values": "Path to version 1 profile JSON. Use --config to select the destination and --profile to give the new entry a different name. An existing profile name is rejected.",
+      "lookup_aliases": ["--import-recipe", "import_recipe"],
+      "related": ["config", "profile", "export_profile", "parent_profile"]
+    },
+    "parent_profile": {
+      "kind": "command",
+      "summary": "Choose a parent for an imported profile.",
+      "values": "An existing shipped or file-defined profile name. Use with --import-profile. The new entry supplies differences against the inherited settings.",
+      "lookup_aliases": ["--parent-recipe", "parent_recipe"],
+      "related": ["import_profile", "profiles.<profile>.extends"]
+    },
+    "backend": {
+      "kind": "setting",
+      "summary": "Choose the worker implementation.",
+      "values": "ink2_v1, strata-inkling, strata, or strata-split. Availability depends on the build. The internal default is null. A model-specific profile usually selects it.",
+      "related": [
+        "profile",
+        "mode",
+        "model"
+      ]
+    },
+    "mode": {
+      "kind": "setting",
+      "summary": "Choose HTTP serving or a direct worker invocation.",
+      "values": "serve (default) or native. Server options apply to serve mode.",
+      "related": [
+        "backend",
+        "server_options",
+        "engine_options"
+      ]
+    },
+    "binary": {
+      "kind": "setting",
+      "summary": "Select the unified executable used for worker dispatch.",
+      "values": "Path to an executable. Default is the invoked executable, or the development build path from the Python entry point.",
+      "related": [
+        "backend"
+      ]
+    },
+    "host": {
+      "kind": "setting",
+      "summary": "Bind the HTTP service to this address.",
+      "values": "Nonempty listener address. Default 127.0.0.1.",
+      "related": [
+        "port",
+        "mode"
+      ]
+    },
+    "port": {
+      "kind": "setting",
+      "summary": "Bind the HTTP service to this TCP port.",
+      "values": "Integer 0–65535. Default 8080. Port 0 requests an ephemeral test port.",
+      "related": [
+        "host",
+        "mode"
+      ]
+    },
+    "data_dir": {
+      "kind": "setting",
+      "summary": "Locate conventional Megla files.",
+      "values": "Directory or null (default). Supplies conventional model, drafter, projector, and Python paths when applicable.",
+      "related": [
+        "model",
+        "server_python",
+        "vision_device",
+        "num_passes"
+      ]
+    },
+    "model": {
+      "kind": "setting",
+      "summary": "Select the worker's model.",
+      "values": "Model file or supported model directory, or null (default). Relative paths are resolved from the launch directory. The worker validates the format and architecture.",
+      "related": [
+        "backend",
+        "data_dir",
+        "strata_config"
+      ]
+    },
+    "context": {
+      "kind": "setting",
+      "summary": "Set the inference context length in tokens.",
+      "values": "Integer 1–2147483647 or null (default). Model and worker limits apply. Megla HTTP defaults to 32768 and caps it at 524288.",
+      "related": [
+        "model",
+        "backend"
+      ]
+    },
+    "num_passes": {
+      "kind": "setting",
+      "summary": "Select the number of times the looped layers are visited.",
+      "values": "Positive integer or null (default, trained count). Flash-Next takes one pass. Inkling is capped at its trained count. Reduced Inkling counts require disabling model drafters and, for Megla, layer dumps.",
+      "related": [
+        "backend",
+        "engine_options.draft",
+        "engine_options.mtp"
+      ]
+    },
+    "sampler": {
+      "kind": "setting",
+      "summary": "Choose the worker sampler implementation.",
+      "values": "native (default) or strata-inkling. The latter requires an Inkling backend and enables Megla's configurable sampling.",
+      "related": [
+        "backend",
+        "sampling"
+      ]
+    },
+    "sampling": {
+      "kind": "setting",
+      "summary": "Set default generation sampling fields.",
+      "values": "JSON object. Individual fields support null to clear inherited values. HTTP or native protocol requests can override supported fields. Megla requires sampler=strata-inkling.",
+      "related": [
+        "sampler",
+        "sampling.temperature",
+        "sampling.seed"
+      ]
+    },
+    "tool_streaming": {
+      "kind": "setting",
+      "summary": "Choose how an Inkling HTTP adapter delivers tool-call arguments.",
+      "values": "native (default), incremental, or buffered. Strata incremental delivery requires the staged adapter. Requests must also request streaming.",
+      "related": [
+        "backend",
+        "mode"
+      ]
+    },
+    "vision_device": {
+      "kind": "setting",
+      "summary": "Place the vision projector on the CPU or a particular NVIDIA GPU.",
+      "values": "cpu, a full NVIDIA GPU UUID, or null (default, backend placement). Explicit GPU placement needs a suitable staged helper. Native Strata Inkling accepts precomputed embeddings.",
+      "related": [
+        "vision_residency",
+        "strata_settings.vision",
+        "server_options.mmproj",
+        "server_options.vis"
+      ]
+    },
+    "vision_residency": {
+      "kind": "setting",
+      "summary": "Choose when the external vision projector loads and releases its memory.",
+      "values": "auto (shared default profile and fallback): load a GPU projector before HTTP readiness and keep it resident. Keep the backend's existing CPU lifecycle. resident: apply eager loading and residency to either device. on-demand: load for uncached images and release afterward (after vision.elastic_idle_s in Strata, default 120 seconds). Applies to HTTP projectors. A Strata model unload requested through the API releases the projector too.",
+      "related": [
+        "vision_device",
+        "strata_settings.vision",
+        "mode"
+      ]
+    },
+    "server_directory": {
+      "kind": "setting",
+      "summary": "Override the HTTP adapter directory.",
+      "values": "Directory or null (default, packaged or recorded adapter path).",
+      "related": [
+        "server_python",
+        "mode"
+      ]
+    },
+    "server_python": {
+      "kind": "setting",
+      "summary": "Choose the HTTP adapter Python executable.",
+      "values": "Executable path or null (default). Megla uses the data-directory virtual environment if supplied. Strata uses the launcher Python by default.",
+      "related": [
+        "server_directory"
+      ]
+    },
+    "strata_config": {
+      "kind": "setting",
+      "summary": "Import a saved Strata run configuration.",
+      "values": "Readable JSON path or null (default). Supplies the saved worker configuration and lower-priority host, port, environment, and sampling defaults.",
+      "related": [
+        "strata_settings",
+        "backend"
+      ]
+    },
+    "engine_options": {
+      "kind": "setting",
+      "summary": "Pass component-specific options to the worker.",
+      "values": "JSON object keyed by the snake_case form of the native flags. A scalar supplies one operand, true emits a bare flag, false or null removes it, a list supplies operands, and a list of lists repeats it.",
+      "related": [
+        "engine_options.<option>",
+        "backend",
+        "server_options"
+      ]
+    },
+    "server_options": {
+      "kind": "setting",
+      "summary": "Pass component-specific options to the HTTP adapter.",
+      "values": "JSON object using the same flag-value shape as engine_options. The launcher owns the listener and backend connection settings.",
+      "related": [
+        "server_options.<option>",
+        "mode",
+        "host",
+        "port"
+      ]
+    },
+    "env": {
+      "kind": "setting",
+      "summary": "Set environment variables forwarded to the worker or adapter.",
+      "values": "JSON object keyed by lowercase environment names. String, number, or boolean becomes text. Boolean becomes 1 or 0. Null clears a variable when it wins. Service-manager and launcher-owned variables can be reserved.",
+      "related": [
+        "env.<variable>",
+        "environment_precedence"
+      ]
+    },
+    "strata_settings": {
+      "kind": "setting",
+      "summary": "Customize fields in the Strata adapter run configuration.",
+      "values": "JSON object merged by key. Nested objects merge and arrays replace. exe, args, env, host, and port are launcher-owned in this map.",
+      "related": [
+        "strata_settings.<field>",
+        "strata_config",
+        "server_options"
+      ]
+    },
+    "sampling.temperature": {
+      "kind": "setting",
+      "summary": "Scale the next-token distribution; 0 selects greedy decoding.",
+      "values": "Finite value from 0 through the maximum 32-bit float. Zero selects greedy decoding. Strata's live shared-settings endpoint accepts 0–2. Null clears the configured field.",
+      "related": [
+        "sampling.top_p",
+        "sampling.top_k"
+      ],
+      "aliases": [
+        "Engine flags --temp (Strata Inkling native) and --temperature or --greedy (Strata layer native)."
+      ],
+      "lookup_aliases": [
+        "--temp",
+        "--temperature",
+        "--greedy"
+      ]
+    },
+    "sampling.top_p": {
+      "kind": "setting",
+      "summary": "Retain the highest-probability candidates covering this cumulative probability.",
+      "values": "Finite fraction greater than 0 and at most 1, or null.",
+      "related": [
+        "sampling.top_k",
+        "sampling.min_p"
+      ],
+      "aliases": [
+        "Strata layer native --top-p."
+      ]
+    },
+    "sampling.top_k": {
+      "kind": "setting",
+      "summary": "Limit the maximum number of candidate tokens.",
+      "values": "Integer 1–64 for Megla and Flash-Next or up to 128 for native Strata Inkling. Strata HTTP startup defaults accept 1–64. Null clears it.",
+      "related": [
+        "sampling.temperature",
+        "sampling.top_p"
+      ],
+      "aliases": [
+        "Strata layer native --top-k. The native legacy flag can treat 0 as the full shortlist."
+      ]
+    },
+    "sampling.min_p": {
+      "kind": "setting",
+      "summary": "Drop candidates below this fraction of the most likely candidate's probability.",
+      "values": "Finite fraction 0–1, or null. Zero disables the filter.",
+      "related": [
+        "sampling.top_p"
+      ]
+    },
+    "sampling.repetition_penalty": {
+      "kind": "setting",
+      "summary": "Rescale logits for tokens already present in the penalty history.",
+      "values": "Finite value greater than 0, or null. 1 leaves logits unchanged.",
+      "related": [
+        "sampling.penalty_last_n"
+      ],
+      "aliases": [
+        "repeat_penalty in an imported Strata sampling block."
+      ]
+    },
+    "sampling.frequency_penalty": {
+      "kind": "setting",
+      "summary": "Adjust a token's score in proportion to its prior occurrences.",
+      "values": "Finite value -2–2 for the shared native sampler and unified Flash-Next. Other Strata adapter startup validators may require a nonnegative value. Null clears it.",
+      "related": [
+        "sampling.penalty_last_n",
+        "sampling.presence_penalty"
+      ]
+    },
+    "sampling.presence_penalty": {
+      "kind": "setting",
+      "summary": "Adjust a token's score once if it occurs in the penalty history.",
+      "values": "Finite value -2–2 for the shared native sampler and unified Flash-Next. Other Strata adapter startup validators may require a nonnegative value. Null clears it.",
+      "related": [
+        "sampling.penalty_last_n",
+        "sampling.frequency_penalty"
+      ]
+    },
+    "sampling.penalty_last_n": {
+      "kind": "setting",
+      "summary": "Set the history window for the three token penalties.",
+      "values": "Nonnegative integer or null. Flash-Next native supports up to 4096 tokens. Backend protocol defaults apply when the value is omitted.",
+      "related": [
+        "sampling.repetition_penalty",
+        "sampling.frequency_penalty",
+        "sampling.presence_penalty"
+      ],
+      "aliases": [
+        "repeat_last_n in an imported Strata sampling block."
+      ]
+    },
+    "sampling.seed": {
+      "kind": "setting",
+      "summary": "Set the default seed for sampled generation.",
+      "values": "Unsigned 64-bit integer or null. Unified Flash accepts zero at startup. Strata's shared settings endpoint requires a positive seed.",
+      "related": [
+        "sampling.temperature"
+      ],
+      "aliases": [
+        "Strata layer native --seed also enables sampling."
+      ]
+    },
+    "engine_options.<option>": {
+      "kind": "setting",
+      "summary": "Configure any option supported by the selected worker.",
+      "values": "Use the worker flag's snake_case name and its documented operands. Worker options and ranges are specific to the backend and build. Use raw backend help or the pinned source for the complete native interface.",
+      "related": [
+        "engine_options",
+        "backend"
+      ]
+    },
+    "server_options.<option>": {
+      "kind": "setting",
+      "summary": "Configure any option supported by the selected HTTP adapter.",
+      "values": "Use the adapter flag's snake_case name and its documented operands. Launcher-owned flags cannot be replaced. Use the adapter's help or source for additional options.",
+      "related": [
+        "server_options",
+        "server_directory"
+      ]
+    },
+    "env.<variable>": {
+      "kind": "setting",
+      "summary": "Configure any supported worker or adapter environment variable.",
+      "values": "Use the variable name in lowercase in JSON and uppercase after ENV__. The selected component defines the interpretation and range.",
+      "related": [
+        "env",
+        "environment_prefix",
+        "legacy_names"
+      ]
+    },
+    "strata_settings.<field>": {
+      "kind": "setting",
+      "summary": "Configure a field belonging to the Strata run format.",
+      "values": "Use the field as defined by the pinned Strata adapter. For nested fields on the command line, pass the JSON object for the first key. Environment inputs use the whole STRATA_SETTINGS object.",
+      "related": [
+        "strata_settings",
+        "strata_config"
+      ]
+    },
+    "engine_options.parallel": {
+      "kind": "setting",
+      "summary": "Choose the maximum number of parallel Strata Inkling request slots.",
+      "values": "Integer 1–64 on Strata Inkling. Other backends have their own batching controls.",
+      "related": [
+        "engine_options.batch"
+      ],
+      "aliases": [
+        "--slots on Strata Inkling. --batch is also equivalent on that backend."
+      ]
+    },
+    "engine_options.batch": {
+      "kind": "setting",
+      "summary": "Set the worker's native batch slot count.",
+      "values": "Positive integer in the worker's supported range. On Strata Inkling use parallel for the same setting.",
+      "related": [
+        "engine_options.parallel"
+      ]
+    },
+    "engine_options.kv": {
+      "kind": "setting",
+      "summary": "Choose the worker's KV-cache representation.",
+      "values": "Strata Inkling accepts auto, fp16, fp8, k8v8, and k8v4. f16, fp8_e4m3, i8, and q8 are accepted aliases on that backend. Other workers have their own types.",
+      "related": [
+        "context"
+      ],
+      "aliases": [
+        "--kv-dtype on Strata Inkling."
+      ]
+    },
+    "engine_options.gpus": {
+      "kind": "setting",
+      "summary": "Select GPU devices for the native Strata Inkling worker.",
+      "values": "On Strata Inkling, use a GPU count or a comma-separated list of device ordinals. An explicit list puts the primary card first. Use devices when passing a single ordinal.",
+      "related": [
+        "env.cuda_visible_devices",
+        "vision_device",
+        "engine_options.ep_split"
+      ],
+      "aliases": [
+        "--devices on Strata Inkling."
+      ]
+    },
+    "engine_options.ep_split": {
+      "kind": "setting",
+      "summary": "Set the two-GPU Strata Inkling expert placement ratio.",
+      "values": "Fraction greater than 0 and less than 1. The default is 0.5. It sets the second GPU's share on the applicable expert-parallel path.",
+      "related": [
+        "engine_options.gpus"
+      ]
+    },
+    "engine_options.rope_scale": {
+      "kind": "setting",
+      "summary": "Set the Flash-Next split worker's rotary position scale.",
+      "values": "Finite number. 1 disables scaling. Values greater than 1 enable scaling. Omission uses the model's default rotary position behavior.",
+      "related": [
+        "context"
+      ]
+    },
+    "engine_options.draft": {
+      "kind": "setting",
+      "summary": "Choose the Strata Inkling drafter.",
+      "values": "off or dspark in the integrated Strata Inkling path. DSpark needs compatible weights and the trained loop-pass count.",
+      "related": [
+        "num_passes",
+        "engine_options.draft_beam"
+      ]
+    },
+    "engine_options.draft_beam": {
+      "kind": "setting",
+      "summary": "Set the Strata Inkling DSpark draft beam width.",
+      "values": "Integer 1–8 on the staged adapter's DSpark planner. Requires compatible drafting.",
+      "related": [
+        "engine_options.draft"
+      ]
+    },
+    "engine_options.draft_cost": {
+      "kind": "setting",
+      "summary": "Set the Strata Inkling draft search cost parameter.",
+      "values": "Finite numeric share of the verify-step cost model. The Strata Inkling backend default is 4.2.",
+      "related": [
+        "engine_options.draft"
+      ]
+    },
+    "engine_options.draft_plain": {
+      "kind": "setting",
+      "summary": "Choose the Strata Inkling plain DSpark path.",
+      "values": "Numeric threshold. A positive value enables fallback to a plain token when verification is too expensive. A value of 1.0 represents break-even.",
+      "related": [
+        "engine_options.draft"
+      ]
+    },
+    "engine_options.mtp": {
+      "kind": "setting",
+      "summary": "Supply the path to Megla DSpark or Flash-Next MTP draft weights.",
+      "values": "Megla takes a compatible DSpark file. The Flash-Next split worker takes its MTP runtime directory, required when spec is above zero. Null clears an inherited flag.",
+      "related": [
+        "data_dir",
+        "num_passes",
+        "engine_options.spec"
+      ]
+    },
+    "engine_options.spec": {
+      "kind": "setting",
+      "summary": "Set speculative draft depth for Flash-Next.",
+      "values": "Nonnegative integer supported by the worker. Zero disables MTP drafting on the split worker.",
+      "related": [
+        "engine_options.mtp",
+        "engine_options.lookup"
+      ]
+    },
+    "engine_options.lookup": {
+      "kind": "setting",
+      "summary": "Set the prompt-lookup draft window.",
+      "values": "Strata Inkling permits 0–7, with zero disabling it. The Flash-Next split worker also supports disabling prompt lookup with zero.",
+      "related": [
+        "engine_options.draft",
+        "engine_options.spec",
+        "env.ink2_oa_lookup"
+      ]
+    },
+    "engine_options.repetition_guard": {
+      "kind": "setting",
+      "summary": "Enable or disable the Inkling native repetition check.",
+      "values": "on or off. Omission uses the backend's mode default. Strata serving enables it by default. Megla leaves it off by default.",
+      "related": [
+        "tool_streaming"
+      ],
+      "aliases": [
+        "--no-anti-loop on Strata Inkling disables the guard."
+      ]
+    },
+    "server_options.lazy": {
+      "kind": "setting",
+      "summary": "Start the Strata listener before loading the worker.",
+      "values": "Boolean flag. true defers the first load to an inference or explicit load request.",
+      "related": [
+        "strata_settings.lazy_load",
+        "mode"
+      ]
+    },
+    "server_options.mmproj": {
+      "kind": "setting",
+      "summary": "Select a Megla image projector file.",
+      "values": "Readable projector model path. Requires the companion helper and a vision-enabled launch.",
+      "related": [
+        "server_options.vis",
+        "vision_device"
+      ]
+    },
+    "server_options.vis": {
+      "kind": "setting",
+      "summary": "Select a Megla projector helper executable.",
+      "values": "Executable path. Must match the requested CPU or CUDA placement.",
+      "related": [
+        "server_options.mmproj",
+        "vision_device"
+      ]
+    },
+    "server_options.alias": {
+      "kind": "setting",
+      "summary": "Set the model identifier advertised by the Megla HTTP adapter.",
+      "values": "Nonempty identifier. Managed clients must request the exact registered model alias.",
+      "related": [
+        "model",
+        "mode"
+      ]
+    },
+    "server_options.max_queue": {
+      "kind": "setting",
+      "summary": "Limit the Strata HTTP request queue.",
+      "values": "Integer from 0 through 4096. Zero rejects a request that would have to wait for a slot. Omit it for the adapter default.",
+      "related": [
+        "server_options.queue_timeout"
+      ]
+    },
+    "server_options.queue_timeout": {
+      "kind": "setting",
+      "summary": "Limit time spent waiting in the Strata HTTP request queue.",
+      "values": "Finite seconds from 0.1 through 600. Requires max_queue to be set. Omit it to leave the deadline disabled.",
+      "related": [
+        "server_options.max_queue"
+      ]
+    },
+    "server_options.api_key": {
+      "kind": "setting",
+      "summary": "Require a bearer or x-api-key credential for the Strata HTTP API.",
+      "values": "One nonempty secret, or multiple comma-separated secrets. Use a private configuration source.",
+      "related": [
+        "env.strata_api_key",
+        "host"
+      ]
+    },
+    "env.strata_api_key": {
+      "kind": "setting",
+      "summary": "Supply the Strata API credential through the service process environment.",
+      "values": "Nonempty secret. An existing service-manager credential remains recognized.",
+      "related": [
+        "server_options.api_key"
+      ]
+    },
+    "env.cuda_visible_devices": {
+      "kind": "setting",
+      "summary": "Limit and order CUDA devices visible to the text worker.",
+      "values": "CUDA visibility list of ordinals or UUIDs, or empty text to hide all devices. Separate projector placement has its own visibility.",
+      "related": [
+        "engine_options.gpus",
+        "vision_device"
+      ]
+    },
+    "env.ink2_ckpt_mb": {
+      "kind": "setting",
+      "summary": "Set Megla's checkpoint memory budget.",
+      "values": "Integer MiB. Megla's checkpoint engine controls its upper bound and eviction policy.",
+      "related": [
+        "env.ink2_park_mb",
+        "context"
+      ]
+    },
+    "env.ink2_park_mb": {
+      "kind": "setting",
+      "summary": "Set Megla's parked-conversation memory budget.",
+      "values": "Integer MiB. The worker uses this budget when parking conversation state.",
+      "related": [
+        "env.ink2_ckpt_mb"
+      ]
+    },
+    "env.ink2_vision_timeout_seconds": {
+      "kind": "setting",
+      "summary": "Set the Megla per-image deadline across queueing, initialization, and encoding.",
+      "values": "Nonnegative seconds. Default 0 leaves it disabled.",
+      "related": [
+        "vision_device",
+        "server_options.vis"
+      ]
+    },
+    "env.ink2_oa_lookup": {
+      "kind": "setting",
+      "summary": "Set Megla HTTP's default prompt-lookup window.",
+      "values": "Integer accepted by Megla. Existing adapter default is 15. A request can supply lookup.",
+      "related": [
+        "engine_options.lookup"
+      ]
+    },
+    "env.ink2_pictures": {
+      "kind": "setting",
+      "summary": "Control automatic Megla projector setup when conventional files are available.",
+      "values": "Text 0 disables automatic setup. Normal default enables it.",
+      "related": [
+        "vision_device",
+        "data_dir"
+      ]
+    },
+    "strata_settings.lazy_load": {
+      "kind": "setting",
+      "summary": "Defer Strata worker loading in the run configuration.",
+      "values": "Boolean. true activates lazy loading. An explicit server lazy flag also enables it.",
+      "related": [
+        "server_options.lazy"
+      ]
+    },
+    "strata_settings.tokenizer": {
+      "kind": "setting",
+      "summary": "Locate the tokenizer files for Strata serving.",
+      "values": "Nonempty path to supported tokenizer assets. Required by configured Strata HTTP unless supplied by the imported run.",
+      "related": [
+        "strata_config",
+        "model"
+      ]
+    },
+    "strata_settings.cwd": {
+      "kind": "setting",
+      "summary": "Set the Strata worker working directory.",
+      "values": "Nonempty directory path. Defaults to the launch directory. Relative paths in saved worker arguments use this directory.",
+      "related": [
+        "strata_config",
+        "model"
+      ]
+    },
+    "strata_settings.drafting": {
+      "kind": "setting",
+      "summary": "Choose the Strata run's drafting policy.",
+      "values": "The layer adapter accepts auto, mtp, dflash2, or off where supported. The split planner honors off in the absence of an explicit spec flag.",
+      "related": [
+        "engine_options.draft",
+        "engine_options.mtp",
+        "engine_options.spec"
+      ]
+    },
+    "strata_settings.user_args": {
+      "kind": "setting",
+      "summary": "Supply Strata user worker arguments in its saved-run format.",
+      "values": "Array of strings. Uses native flag and operand spelling. Higher-priority arrays replace the entire list.",
+      "related": [
+        "engine_options",
+        "strata_config"
+      ]
+    },
+    "strata_settings.vision": {
+      "kind": "setting",
+      "summary": "Supply the Strata projector configuration.",
+      "values": "JSON object. External Strata Inkling vision requires mmproj and model. CUDA placement additionally requires the staged adapter and a capable reader.",
+      "related": [
+        "strata_settings.vision.mmproj",
+        "strata_settings.vision.model",
+        "strata_settings.vision.exe",
+        "vision_device"
+      ]
+    },
+    "strata_settings.vision.mmproj": {
+      "kind": "setting",
+      "summary": "Set the GGUF projector path for Strata's external image reader.",
+      "values": "Readable model file path.",
+      "related": [
+        "strata_settings.vision",
+        "strata_settings.vision.model"
+      ]
+    },
+    "strata_settings.vision.model": {
+      "kind": "setting",
+      "summary": "Set the text vocabulary GGUF path for the external Strata Inkling projector.",
+      "values": "Readable compatible GGUF path.",
+      "related": [
+        "strata_settings.vision.mmproj"
+      ]
+    },
+    "strata_settings.vision.exe": {
+      "kind": "setting",
+      "summary": "Override the external vision helper executable.",
+      "values": "Executable path for the chosen CPU or CUDA projector device.",
+      "related": [
+        "strata_settings.vision",
+        "vision_device"
+      ]
+    },
+    "strata_settings.split_fallback": {
+      "kind": "setting",
+      "summary": "Define the layer worker used if split startup fails.",
+      "values": "Strata run object specifying a fallback executable, arguments, and optional environment and working directory. Configured unified mode points its executable to the bundled layer worker.",
+      "related": [
+        "strata_config",
+        "server_options.lazy"
+      ]
+    },
+    "help": {
+      "kind": "command",
+      "summary": "Show the canonical launcher options.",
+      "values": "Use -h or --help.",
+      "related": [
+        "help_settings"
+      ]
+    },
+    "help_settings": {
+      "kind": "command",
+      "summary": "Read the packaged settings reference.",
+      "values": "Omit the name for the full reference. Supply a canonical name, JSON path, or a supported legacy alias to look up an individual entry.",
+      "related": [
+        "help"
+      ]
+    },
+    "print_settings": {
+      "kind": "command",
+      "summary": "Print the resolved launcher settings as JSON and exit.",
+      "values": "Boolean command flag. The result can contain configured credentials and precedes adapter device planning and saved tuning.",
+      "related": [
+        "environment_precedence",
+        "profile"
+      ]
+    },
+    "set": {
+      "kind": "command",
+      "summary": "Override one setting or a member of a settings map.",
+      "values": "Repeat --set KEY=JSON as needed. For an object nested below a first-level map member, pass the member's whole object.",
+      "related": [
+        "settings",
+        "engine_options",
+        "env",
+        "strata_settings"
+      ]
+    },
+    "configured": {
+      "kind": "command",
+      "summary": "Force configured dispatch at the native executable.",
+      "values": "Use as the first argument when --backend would otherwise select raw worker dispatch.",
+      "related": [
+        "backend",
+        "mode"
+      ]
+    },
+    "list_backends": {
+      "kind": "command",
+      "summary": "List the worker implementations compiled into the executable.",
+      "values": "Use as the only argument to the native executable.",
+      "related": [
+        "backend"
+      ]
+    },
+    "server_options.api_monitor": {
+      "kind": "setting",
+      "summary": "Enable Strata's in-memory HTTP request monitor.",
+      "values": "Boolean flag, off by default. It retains recent request prompts and replies.",
+      "related": [
+        "server_options.api_key"
+      ]
+    },
+    "server_options.batch_groups": {
+      "kind": "setting",
+      "summary": "Choose the number of Strata pipeline batch groups.",
+      "values": "auto or a positive integer.",
+      "related": [
+        "server_options.batch_telemetry"
+      ]
+    },
+    "server_options.batch_telemetry": {
+      "kind": "setting",
+      "summary": "Enable low-rate Strata decode-window telemetry.",
+      "values": "Boolean flag. Opt in only when collecting batch telemetry.",
+      "related": [
+        "server_options.no_batch_telemetry"
+      ]
+    },
+    "server_options.before_load": {
+      "kind": "setting",
+      "summary": "Run a command before loading the Strata worker.",
+      "values": "Command string. Supply a string or an argument array through the run file.",
+      "related": [
+        "server_options.offline",
+        "server_options.lazy"
+      ]
+    },
+    "server_options.fit_max_tokens": {
+      "kind": "setting",
+      "summary": "Clamp the requested output budget to the available context.",
+      "values": "Boolean flag. The Strata adapter normally enables this behavior.",
+      "related": [
+        "server_options.no_fit_max_tokens"
+      ]
+    },
+    "server_options.gguf_py": {
+      "kind": "setting",
+      "summary": "Locate the GGUF Python helpers used by the Megla adapter.",
+      "values": "Directory containing compatible GGUF Python modules.",
+      "related": [
+        "server_options.tokenizer"
+      ]
+    },
+    "server_options.idle_unload": {
+      "kind": "setting",
+      "summary": "Unload the Strata worker after inactivity.",
+      "values": "Duration in seconds. Omission uses the run file, and zero disables the timer.",
+      "related": [
+        "server_options.lazy",
+        "server_options.min_free_vram_mib"
+      ]
+    },
+    "server_options.mcp_config": {
+      "kind": "setting",
+      "summary": "Load client-tool definitions into the Strata web application.",
+      "values": "Path to a JSON file containing an mcpServers object. Strict offline mode excludes MCP subprocesses.",
+      "related": [
+        "server_options.offline"
+      ]
+    },
+    "server_options.min_free_vram_mib": {
+      "kind": "setting",
+      "summary": "Require free GPU memory before reloading the Strata worker.",
+      "values": "Nonnegative integer in MiB. Zero leaves the gate disabled.",
+      "related": [
+        "server_options.lazy",
+        "server_options.idle_unload"
+      ]
+    },
+    "server_options.no_api_key": {
+      "kind": "setting",
+      "summary": "Select the Strata adapter's explicit unauthenticated mode.",
+      "values": "Boolean flag. Anyone who can reach the listener can use it in this mode.",
+      "related": [
+        "server_options.api_key"
+      ]
+    },
+    "server_options.no_batch_telemetry": {
+      "kind": "setting",
+      "summary": "Disable Strata batch telemetry.",
+      "values": "Boolean flag. Use it to override a telemetry-enabled setting.",
+      "related": [
+        "server_options.batch_telemetry"
+      ]
+    },
+    "server_options.no_fit_max_tokens": {
+      "kind": "setting",
+      "summary": "Reject requests that exceed the available context instead of clamping them.",
+      "values": "Boolean flag. A prompt that alone exceeds context is always rejected.",
+      "related": [
+        "server_options.fit_max_tokens"
+      ]
+    },
+    "server_options.offline": {
+      "kind": "setting",
+      "summary": "Enable Strata's strict offline serving policy.",
+      "values": "Boolean flag. It restricts external image fetches and disallows tool subprocesses and before-load hooks.",
+      "related": [
+        "server_options.mcp_config",
+        "server_options.before_load"
+      ]
+    },
+    "server_options.open": {
+      "kind": "setting",
+      "summary": "Open the Strata web application when the adapter is ready.",
+      "values": "Boolean flag. Omission uses the adapter's run settings.",
+      "related": [
+        "server_options.ready_file"
+      ]
+    },
+    "server_options.ready_file": {
+      "kind": "setting",
+      "summary": "Write the Strata instance record after listener startup.",
+      "values": "Writable path. The record includes bound port and model state.",
+      "related": [
+        "server_options.lazy"
+      ]
+    },
+    "server_options.replicas": {
+      "kind": "setting",
+      "summary": "Divide available Strata GPUs among multiple workers.",
+      "values": "Integer count accepted by the adapter. For explicit GPU groups, use the run-file replicas array.",
+      "related": [
+        "server_options.batch_groups",
+        "server_options.parallel"
+      ]
+    },
+    "server_options.shutdown_timeout": {
+      "kind": "setting",
+      "summary": "Set the Strata graceful-drain deadline.",
+      "values": "Finite number of seconds from 0 through 300. Omission uses the adapter's normal shutdown behavior."
+    },
+    "server_options.slot_save_path": {
+      "kind": "setting",
+      "summary": "Enable Strata conversation saves and restores through the slots API.",
+      "values": "Directory path for saved slot state."
+    },
+    "server_options.split_serve": {
+      "kind": "setting",
+      "summary": "Use separate Strata workers for prompt processing and decoding.",
+      "values": "Two comma-separated GPU ordinals, PREFILL,DECODE, in an adapter configuration that supports this mode.",
+      "related": [
+        "server_options.replicas"
+      ]
+    },
+    "server_options.strict_model": {
+      "kind": "setting",
+      "summary": "Require the requested model name to match the loaded model or its alias.",
+      "values": "Boolean flag. Strata run files can also enable strict_model.",
+      "related": [
+        "server_options.alias"
+      ]
+    },
+    "server_options.tok": {
+      "kind": "setting",
+      "summary": "Select the persistent Megla tokenizer helper.",
+      "values": "Path to the compatible executable. Omit it to use the launcher's packaged choice.",
+      "related": [
+        "server_options.tokenizer"
+      ]
+    },
+    "server_options.tokenizer": {
+      "kind": "setting",
+      "summary": "Specify the HTTP adapter's tokenizer.",
+      "values": "Megla accepts a tokenizer executable. Strata's native adapter flag uses a tokenizer directory; configured Strata serving supplies it through strata_settings.tokenizer.",
+      "related": [
+        "server_options.tok",
+        "server_options.gguf_py"
+      ]
+    },
+    "server_options.parallel": {
+      "kind": "setting",
+      "summary": "Request a Strata HTTP slot count without editing the imported run.",
+      "values": "Integer from 1 through 1024, subject to the worker limit. An explicit batch or slots flag in the saved worker args conflicts with this option.",
+      "related": [
+        "server_options.batch_groups"
+      ],
+      "aliases": [
+        "--parallel when passed to the Strata adapter directly. In configured mode use server_options to identify the adapter."
+      ]
+    },
+    "server_options.gpu": {
+      "kind": "setting",
+      "summary": "Select GPU ordinals for the Strata adapter.",
+      "values": "Comma-separated GPU identifiers understood by the adapter. Use the worker option map for GPU flags with worker-specific syntax.",
+      "related": [
+        "server_options.replicas"
+      ],
+      "aliases": [
+        "--gpu when passed to the Strata adapter directly. In configured mode use server_options to identify the adapter."
+      ],
+      "lookup_aliases": [
+        "--gpu"
+      ]
+    },
+    "engine_options.devices": {
+      "kind": "setting",
+      "summary": "Select one or more explicit Strata Inkling device ordinals.",
+      "values": "One ordinal or a comma-separated list in the worker's CUDA visibility. The first is primary.",
+      "related": [
+        "engine_options.gpus",
+        "env.cuda_visible_devices"
+      ]
+    },
+    "engine_options.layer_split": {
+      "kind": "setting",
+      "summary": "Control which layers are assigned to each GPU in a layer-split worker.",
+      "values": "auto or a worker-supported list of starting layers. The Flash-Next split worker splits each layer across its cards and does not use the operand.",
+      "related": [
+        "engine_options.gpus",
+        "strata_settings.layer_split"
+      ]
+    },
+    "engine_options.vram_reserve_mib": {
+      "kind": "setting",
+      "summary": "Reserve GPU memory for other applications or helpers.",
+      "values": "Nonnegative integer in MiB on supported workers. Hardware planning and worker defaults apply when omitted.",
+      "related": [
+        "vision_device",
+        "server_options.min_free_vram_mib"
+      ]
+    },
+    "engine_options.kv_offload": {
+      "kind": "setting",
+      "summary": "Select the Strata Inkling KV offload policy.",
+      "values": "auto, on, or off. Worker capabilities and selected compute platform apply.",
+      "related": [
+        "engine_options.kv",
+        "context"
+      ]
+    },
+    "engine_options.draft_vocab": {
+      "kind": "setting",
+      "summary": "Select the vocabulary remapping file used by a draft worker.",
+      "values": "Readable compatible vocabulary file. Megla can supply its bundled mapping for a conventional launch.",
+      "related": [
+        "engine_options.mtp"
+      ]
+    },
+    "engine_options.dspark": {
+      "kind": "setting",
+      "summary": "Point Strata Inkling at DSpark weights.",
+      "values": "Readable compatible drafter path. Requires matching Inkling weights and trained loop-pass count.",
+      "related": [
+        "engine_options.draft",
+        "num_passes"
+      ]
+    },
+    "strata_settings.backend": {
+      "kind": "setting",
+      "summary": "Select the Strata adapter's compute platform.",
+      "values": "Backend accepted by the pinned Strata adapter, such as cuda, cpu, hip, sycl, or metal where available. Launcher backend selects the worker implementation.",
+      "related": [
+        "backend",
+        "vision_device"
+      ]
+    },
+    "strata_settings.gpu": {
+      "kind": "setting",
+      "summary": "Select Strata's GPUs using the run-file interface.",
+      "values": "Strata GPU selection, typically one or more device numbers. Hardware roles and the chosen worker determine the effective visibility.",
+      "related": [
+        "server_options.gpu",
+        "engine_options.gpus"
+      ]
+    },
+    "strata_settings.layer_split": {
+      "kind": "setting",
+      "summary": "Set the Strata run's layer split policy.",
+      "values": "auto or a layout accepted by the selected Strata worker and adapter. It belongs to the layer path.",
+      "related": [
+        "engine_options.layer_split",
+        "strata_settings.gpu"
+      ]
+    },
+    "strata_settings.model_name": {
+      "kind": "setting",
+      "summary": "Set the model identifier advertised by Strata.",
+      "values": "Model name string used by the adapter and its compatibility routes.",
+      "related": [
+        "model",
+        "strata_settings.aliases"
+      ]
+    },
+    "strata_settings.aliases": {
+      "kind": "setting",
+      "summary": "Add model identifiers that may be used in requests.",
+      "values": "Names in the format accepted by the Strata run file. The adapter checks them when strict model matching is enabled.",
+      "related": [
+        "strata_settings.model_name",
+        "server_options.strict_model"
+      ]
+    },
+    "strata_settings.max_queue": {
+      "kind": "setting",
+      "summary": "Set Strata's pending request capacity in the run file.",
+      "values": "Integer 0–4096. Zero disallows queueing. The server option can override it.",
+      "related": [
+        "server_options.max_queue",
+        "strata_settings.queue_timeout"
+      ]
+    },
+    "strata_settings.queue_timeout": {
+      "kind": "setting",
+      "summary": "Set the Strata run's pending request deadline.",
+      "values": "Finite seconds from 0.1 through 600. Requires max_queue. The server option can override it.",
+      "related": [
+        "strata_settings.max_queue",
+        "server_options.queue_timeout"
+      ]
+    },
+    "strata_settings.reasoning_budget_tokens": {
+      "kind": "setting",
+      "summary": "Set the Strata adapter's default reasoning token budget.",
+      "values": "Nonnegative integer. Zero or an omitted value leaves the configurable cap unset.",
+      "related": [
+        "sampling",
+        "tool_streaming"
+      ]
+    },
+    "strata_settings.fit_max_tokens": {
+      "kind": "setting",
+      "summary": "Choose whether to clamp the output budget to the remaining context.",
+      "values": "Boolean. The pinned adapter defaults to clamping.",
+      "related": [
+        "context",
+        "server_options.no_fit_max_tokens"
+      ]
+    },
+    "strata_settings.anthropic_thinking": {
+      "kind": "setting",
+      "summary": "Control Strata thinking for Anthropic requests that omit an explicit choice.",
+      "values": "model or on_request.",
+      "related": [
+        "strata_settings.reasoning_budget_tokens"
+      ]
+    },
+    "strata_settings.effort_position": {
+      "kind": "setting",
+      "summary": "Choose where the Strata adapter places reasoning effort in the prompt.",
+      "values": "start (default) or end. The end position can retain more cached prompt when effort changes.",
+      "related": [
+        "strata_settings.reasoning_budget_tokens"
+      ]
+    },
+    "strata_settings.idle_unload_s": {
+      "kind": "setting",
+      "summary": "Set idle unloading in the Strata run file.",
+      "values": "Nonnegative duration in seconds. Zero or omission leaves idle unloading disabled.",
+      "related": [
+        "strata_settings.lazy_load",
+        "server_options.idle_unload"
+      ]
+    },
+    "strata_settings.mtp": {
+      "kind": "setting",
+      "summary": "Choose whether the Strata adapter enables its configured draft layer.",
+      "values": "Boolean. false requests startup without MTP. The split planner honors it when spec is not set explicitly.",
+      "related": [
+        "strata_settings.drafting",
+        "engine_options.spec"
+      ]
+    },
+    "strata_settings.engine_silence_s": {
+      "kind": "setting",
+      "summary": "Limit how long the Strata adapter waits for worker output.",
+      "values": "Nonnegative seconds. The adapter default is 300. Zero disables this worker silence deadline.",
+      "related": [
+        "server_options.queue_timeout"
+      ]
+    },
+    "strata_settings.api_monitor": {
+      "kind": "setting",
+      "summary": "Enable Strata request monitoring through the run file.",
+      "values": "Boolean. The adapter keeps recent request prompts and replies in memory when enabled.",
+      "related": [
+        "server_options.api_monitor"
+      ]
+    },
+    "strata_settings.open_browser": {
+      "kind": "setting",
+      "summary": "Open the Strata chat page when the model is ready.",
+      "values": "Boolean. Strata opens the browser when --open is supplied and this value is absent or true. False vetoes --open.",
+      "related": [
+        "server_options.open"
+      ]
+    }
+  }
+}

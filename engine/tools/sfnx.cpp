@@ -1,8 +1,10 @@
 // sFNX engine process for its front end (front/, Strata's line protocol): the engine half on stdin/stdout (token ids
 // only; the server tokenizes, applies the chat template, matches stop strings and parses tools).
 //
-//   sfnx --serve --native MODEL.gguf --mtp RT_DIR --draft-vocab VOCAB.bin [--max-context N] [--spec K] [--lookup K]
+//   sfnx --serve --native MODEL.gguf [--spec K] [--mtp RT_DIR] [--draft-vocab VOCAB.bin] [--lookup K] [--max-context N]
+//   --spec 0 skips the MTP layer; --lookup 0 disables prompt lookup.
 //        [--conversation-cache-mib M] [--batch SLOTS]
+//        [--sampling FIELDS] supplies defaults for GEN and BGEN.
 //
 // One request alone: GEN <max_new> [key=value ...] <ids>, answered with PP <done> <total> per prompt chunk, RESUME
 // <reused>, T <id> per token (speculative: the draft layer's chain and n-gram lookups, verified a window at a time),
@@ -46,6 +48,7 @@
 #include "../src/engine.hpp"
 #include "../src/env.hpp"
 #include "../src/session.hpp"
+#include "inference_sampling_fields.hpp"
 #include "sfnx_input.hpp"
 
 namespace fnx { void model_loaded(Model& m); void put_report(); void vram_step(const char* what); }   // model.cpp
@@ -68,6 +71,7 @@ void say(const std::string& line) {
 struct Args {
     std::string gguf, mtp_dir, draft_vocab;
     int max_ctx = 262144, K = 6, lookup = 15, batch = 1;
+    fnx::Sampling sampling;
     long cache_mib = 0;   // checkpoints and parked conversations in host memory (0: none)
     bool vision = false;  // GENI / BGENI: prompts with images (embeddings from sfnx-vision)
 };
@@ -86,10 +90,28 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--mtp") a.mtp_dir = val();
         else if (k == "--draft-vocab") a.draft_vocab = val();
         else if (k == "--max-context") a.max_ctx = std::stoi(val());
-        else if (k == "--spec") a.K = std::stoi(val());
-        else if (k == "--lookup") a.lookup = std::stoi(val());
+        else if (k == "--spec" || k == "--lookup") {
+            const std::string v = val();
+            size_t parsed = 0;
+            const int n = std::stoi(v, &parsed);
+            if (parsed != v.size() || n < 0 || n >= fnx::MAXT)
+                throw std::runtime_error(k + " must be 0.." + std::to_string(fnx::MAXT - 1));
+            (k == "--spec" ? a.K : a.lookup) = n;
+        }
         else if (k == "--conversation-cache-mib") a.cache_mib = std::stol(val());
         else if (k == "--batch") a.batch = std::stoi(val());
+        else if (k == "--sampling") {
+            const auto s = scream::read_sampling_fields(val(), 64, fnx::Engine::PEN_CAP);
+            a.sampling.temperature = s.temperature.value_or(a.sampling.temperature);
+            a.sampling.top_p = s.top_p.value_or(a.sampling.top_p);
+            a.sampling.top_k = s.top_k.value_or(a.sampling.top_k);
+            a.sampling.min_p = s.min_p.value_or(a.sampling.min_p);
+            a.sampling.pen_repeat = s.repetition_penalty.value_or(a.sampling.pen_repeat);
+            a.sampling.pen_freq = s.frequency_penalty.value_or(a.sampling.pen_freq);
+            a.sampling.pen_present = s.presence_penalty.value_or(a.sampling.pen_present);
+            a.sampling.pen_last_n = s.penalty_last_n.value_or(a.sampling.pen_last_n);
+            if (s.seed) a.sampling.seed = *s.seed;
+        }
         else if (k == "--layer-split") val();   // Strata's layer split; sFNX splits every layer across the cards
         else if (k == "--rope-scale") {   // YaRN for a longer context: the engine reads it as FNX_ROPE_SCALE
             const std::string s = val();
@@ -112,7 +134,8 @@ Args parse_args(int argc, char** argv) {
         else throw std::runtime_error("unknown argument " + k);
     }
     if (!serve) throw std::runtime_error("sfnx runs as --serve");
-    if (a.gguf.empty() || a.mtp_dir.empty()) throw std::runtime_error("--native and --mtp are required");
+    if (a.gguf.empty()) throw std::runtime_error("--native is required");
+    if (a.K > 0 && a.mtp_dir.empty()) throw std::runtime_error("--mtp is required when --spec is above 0");
     if (a.batch < 1 || a.batch > MAX_SLOTS) throw std::runtime_error("--batch must be 1.." + std::to_string(MAX_SLOTS));
     fnx::rope_scale();   // a bad scale stops here, not after the minute of loading (the context's limit needs the model)
     return a;
@@ -260,10 +283,11 @@ std::shared_ptr<const fnx::Bias> parse_bias(const std::string& cmd, const std::s
     return last;
 }
 
-GenReq parse_gen(const std::string& line, int vocab, int pad, bool batch, bool images) {
+GenReq parse_gen(const std::string& line, int vocab, int pad, bool batch, bool images, const fnx::Sampling& defaults) {
     std::istringstream is(line);
     std::string cmd, word;
     GenReq r;
+    r.s = defaults;
     is >> cmd;
     if (batch) {
         if (!(is >> word)) throw std::runtime_error(cmd + ": no slot");
@@ -481,9 +505,13 @@ struct Server {
         slots[0].sess = std::make_unique<fnx::Session>(e, a.K, a.lookup, EOS, 248045, cache, 0);
         // every lane and every window graph now: what they take, taken before the first request
         for (int i = 1; i < a.batch; ++i) lane_for(i);
-        if (a.batch > 1 && fnx::batch_drafts() != fnx::BatchDrafts::off)
-            dec = std::make_unique<fnx::BatchDecoder>(e, a.K, a.lookup, EOS, fnx::batch_drafts());
-        e.warm_graphs();
+        auto batch_mode = a.batch > 1 ? fnx::batch_drafts() : fnx::BatchDrafts::off;
+        if (a.K == 0 && batch_mode != fnx::BatchDrafts::off)
+            batch_mode = a.lookup > 0 ? fnx::BatchDrafts::lookup : fnx::BatchDrafts::off;
+        if (batch_mode != fnx::BatchDrafts::off)
+            dec = std::make_unique<fnx::BatchDecoder>(e, a.K, a.lookup, EOS, batch_mode);
+        const int solo_rows = a.K > 0 ? fnx::MAXT : a.lookup + 1;
+        e.warm_graphs(solo_rows, batch_mode != fnx::BatchDrafts::off);
     }
 
     // the slot's lane and session, made on first use (lane 0 is slot 0's from the start, but lanes move between
@@ -1075,7 +1103,7 @@ struct Server {
             }
             GenReq r;
             try {
-                r = parse_gen(line, m.vocab, (int) m.ple_image, batch, images);
+                r = parse_gen(line, m.vocab, (int) m.ple_image, batch, images, a.sampling);
                 if ((long) r.ids.size() + r.max_new + 8 > a.max_ctx) throw std::runtime_error(cmd + ": prompt + max_new exceed the context");
                 r.seq = seq;
             } catch (const std::exception& ex) {
@@ -1144,12 +1172,16 @@ int main(int argc, char** argv) {
         fnx::vram_step("zacetek");
         m.emplace(a.gguf.c_str());
         fnx::vram_step("model");
-        mtp.emplace(*m, a.mtp_dir, a.draft_vocab);
-        fnx::vram_step("plast ugibanja");
+        if (a.K > 0) {
+            mtp.emplace(*m, a.mtp_dir, a.draft_vocab);
+            fnx::vram_step("plast ugibanja");
+        }
         e.emplace(*m, a.max_ctx, a.batch);
         fnx::vram_step("pogon");
-        e->mtp_attach(*mtp);
-        fnx::vram_step("pripeta plast ugibanja");
+        if (mtp) {
+            e->mtp_attach(*mtp);
+            fnx::vram_step("pripeta plast ugibanja");
+        }
         fnx::model_loaded(*m);
         fnx::vram_step("konec nalaganja");
     } catch (const std::exception& ex) {

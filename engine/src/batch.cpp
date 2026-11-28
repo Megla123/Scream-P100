@@ -64,8 +64,9 @@ void BatchLane::cut(int rows) {
 BatchDecoder::BatchDecoder(Engine& e, int K, int lookup_k, std::vector<int> eos, BatchDrafts mode)
     : e_(e), K_(K), LK_(lookup_k), eos_(std::move(eos)), mode_(mode) {
     if (mode_ == BatchDrafts::off) throw std::runtime_error("batch decoder: FNX_BATCH_DRAFTS is off");
-    if (K_ < 1 || K_ + 1 > MAXT) throw std::runtime_error("batch decoder: K must be 1.." + std::to_string(MAXT - 1));
-    if (LK_ < 0 || LK_ + 1 > MAXT) throw std::runtime_error("batch decoder: lookup drafts must be 0.." + std::to_string(MAXT - 1));
+    if (K_ < 0 || K_ >= MAXT || (K_ == 0 && mode_ == BatchDrafts::mtp))
+        throw std::runtime_error("batch decoder: MTP needs a positive draft window, and K must be below " + std::to_string(MAXT));
+    if (LK_ < 0 || LK_ >= MAXT) throw std::runtime_error("batch decoder: lookup drafts must be 0.." + std::to_string(MAXT - 1));
     // as Session::generate reads them: whole numbers, a bad value an error here (at start) rather than read as on
     pen_drafts_ = env_int("FNX_DRAFT_PEN", 1) != 0;
 #if FNX_HIP

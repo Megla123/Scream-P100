@@ -1,0 +1,45 @@
+{
+  "default": {
+    "settings": {
+      "vision_residency": "auto"
+    }
+  },
+  "qwen": {},
+  "qwen-3.8": {
+    "extends": "qwen",
+    "settings": {
+      "backend": "strata"
+    }
+  },
+  "qwen-flash-next-3.8": {
+    "extends": "qwen-3.8",
+    "settings": {
+      "backend": "strata-split"
+    }
+  },
+  "qwen-flash-next-3.8-strata": {
+    "extends": "qwen-flash-next-3.8",
+    "settings": {
+      "backend": "strata"
+    }
+  },
+  "inkling": {},
+  "inkling-2-mini": {
+    "extends": "inkling",
+    "settings": {
+      "backend": "ink2_v1"
+    }
+  },
+  "inkling-2-mini-megla-sampling": {
+    "extends": "inkling-2-mini",
+    "settings": {
+      "sampler": "strata-inkling"
+    }
+  },
+  "inkling-2-mini-strata": {
+    "extends": "inkling-2-mini",
+    "settings": {
+      "backend": "strata-inkling"
+    }
+  }
+}

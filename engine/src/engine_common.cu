@@ -374,7 +374,7 @@ void Engine::batch_graph_stash(int T) {
 }
 
 void vram_step(const char* what);   // model.cpp (FNX_PROF)
-void Engine::warm_graphs() {
+void Engine::warm_graphs(int solo_rows, bool warm_batch_drafts) {
     const int was = cur_;
     warming_ = true;
     std::vector<int> lanes;
@@ -394,10 +394,10 @@ void Engine::warm_graphs() {
             if (!D.mrope_buf) D.mrope_buf = dalloc<int>((size_t) max_ctx_ * 3);
     }
     std::fprintf(stderr, "fnx: warm: verify windows ...\n");
-    for (int T = 1; T <= MAXT; ++T) {
+    for (int T = 1; T <= solo_rows; ++T) {
         verify(std::vector<int>((size_t) T, tok));
         commit(1);
-        if (T == 1 || T == MAXT) std::fprintf(stderr, "fnx: warm: verify %d rows done\n", T);
+        if (T == 1 || T == solo_rows) std::fprintf(stderr, "fnx: warm: verify %d rows done\n", T);
     }
     vram_step("ogrevanje: okna");
     if (mtp_)
@@ -409,7 +409,8 @@ void Engine::warm_graphs() {
         step(std::vector<int>(lanes.begin(), lanes.begin() + n), std::vector<int>((size_t) n, tok));
     // batched windows with drafts (they share step()'s graph slots, one per row count): 2 .. MAXT rows over as many lanes
     // as there are, up to the rows, dealt out evenly
-    if (batched && batch_drafts() != BatchDrafts::off && precap()) {
+    const bool batch_windows = batched && warm_batch_drafts && batch_drafts() != BatchDrafts::off;
+    if (batch_windows && precap()) {
         // FNX_PRECAP: every uniform layout (k rows a lane) of the first n lanes, n = 1 .. lanes, kept as graphs: a window of the lanes
         // in order with the same drafts each (or none) then never captures. The mean capture is what the planner is charged
         const auto t0 = std::chrono::steady_clock::now();
@@ -429,7 +430,7 @@ void Engine::warm_graphs() {
         for (const auto& v : cb_[0]->batch_cache) total += (long) v.size();
         std::fprintf(stderr, "fnx: warm: precapture done: %lu captures, %.1f ms each, %ld graphs held, %.1f s\n", n_cap, warm_capture_ms, total,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    } else if (batched && batch_drafts() != BatchDrafts::off)
+    } else if (batch_windows)
         for (int T = 2; T <= MAXT; ++T) {
             const int n = std::min((int) lanes.size(), T);
             std::vector<int> counts((size_t) n, T / n);

@@ -6,6 +6,7 @@
 #   CUDA=/usr/local/cuda-12.4 JOBS=8 bash build.sh   # a toolkit root and the parallel jobs
 #   PF_JOB=64 bash build.sh                         # the default until 17 Nov 2026: prompt-path jobs of 64 rows
 #   bash build.sh --32g                             # the low-RAM engine (32 GB and 64 GB modes), build-32g/split/strata-split-2
+#   bash build.sh --unified                         # single native executable with all three P100 paths, build-unified/scream-p100
 #
 # --32g: a fresh copy of engine/ in build-32g/engine-32g with engine-32g/'s patches applied (FNX_SSD_EXPERTS: the experts the
 # cards do not hold come from the model's files through a RAM tier; the fast UD-Q4_K_XL's 32 GB mode and the exact
@@ -29,12 +30,20 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 V32=0
+UNIFIED=OFF
 case "${1:-}" in
   --32g) V32=1 ;;
+  --unified) UNIFIED=ON ;;
   "") ;;
-  *) echo "build.sh: unknown option $1 (the only one is --32g)" >&2; exit 1 ;;
+  *) echo "build.sh: unknown option $1" >&2; exit 1 ;;
 esac
-if [ "$V32" = 1 ]; then B=${B:-$HERE/build-32g}; else B=${B:-$HERE/build}; fi
+if [ "$UNIFIED" = ON ]; then
+  B=${B:-$HERE/build-unified}
+elif [ "$V32" = 1 ]; then
+  B=${B:-$HERE/build-32g}
+else
+  B=${B:-$HERE/build}
+fi
 JOBS=${JOBS:-8}
 PF_JOB=${PF_JOB:-96}
 GG=${GG:-$HERE/third_party/llama.cpp}
@@ -85,7 +94,19 @@ fi
 cmake -S "$HERE" -B "$B" -DCMAKE_BUILD_TYPE=Release -DSCREAM_ENGINE_DIR="$ENGINE" \
   -DCMAKE_CUDA_COMPILER="$NVCC" -DCMAKE_CUDA_HOST_COMPILER="$HOSTCXX" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
   -DCMAKE_CUDA_ARCHITECTURES=60 -DSTRATA_SPLIT_ARCH=60 -DSTRATA_SPLIT_CARDS=2 -DSTRATA_SPLIT_PF_JOB="$PF_JOB" \
-  -DSTRATA_GGML_DIR="$GG" ${CUDA:+-DCUDAToolkit_ROOT="$CUDA"}
+  -DSTRATA_GGML_DIR="$GG" -DSCREAM_BUILD_UNIFIED="$UNIFIED" \
+  ${CUDA:+-DCUDAToolkit_ROOT="$CUDA"} ${SCREAM_STRATA_SOURCE:+-DSCREAM_STRATA_SOURCE="$SCREAM_STRATA_SOURCE"}
+if [ "$UNIFIED" = ON ]; then
+  nice -n 10 cmake --build "$B" --target scream-p100 -j "$JOBS"
+  peers=$(nm -u "$B/split/libstrata-split-2.a" | grep -E ' U (cuda|cu)[A-Za-z0-9_]*Peer' || true)
+  if [ -n "$peers" ]; then
+    echo "$peers" >&2
+    die "the P100 split path must exchange through host memory"
+  fi
+  "$B/scream-p100" --list-backends
+  sha256sum "$B/scream-p100"
+  exit
+fi
 say "building with $JOBS jobs, prompt-path jobs of $PF_JOB rows (a full build took about 20 minutes on 2 x Xeon Bronze 3106; kernels_p2.cu alone about 17)"
 nice -n 10 cmake --build "$B" --target strata-split-2 -j "$JOBS"
 

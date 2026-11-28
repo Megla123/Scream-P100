@@ -1,0 +1,1324 @@
+diff --git a/serve/frontend.py b/serve/frontend.py
+index 13cb445..3768ad7 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -3093,11 +3093,14 @@ class InklingOutputParser(JsonOutputParser):
+     so `reasoning_effort=none`, interleaved thinking, and direct tool calls all parse cleanly."""
+ 
+     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+-                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
++                 recover: bool = False, declared_only: bool = False, deferred: bool = False,
++                 incremental_envelopes: bool = False):
+         super().__init__(thinking=False, tools=tools, stream_tools=stream_tools, recover=True,
+                          declared_only=declared_only, deferred=deferred)
+         from serve import inkling_dialect
+-        self._dialect = inkling_dialect.InklingDialect()
++        names = self.schemas.keys() if stream_tools and incremental_envelopes else ()
++        self._dialect = inkling_dialect.InklingDialect(names, self._can_stream_tool)
++        self._streamed_call = None
+         self.wrap_up = inkling_dialect.REASONING_WRAP_UP       # what closes the thinking when its budget is spent (#6734)
+         self.wrap_up_short = inkling_dialect.END_MSG          # ... and when the room left to answer is short: just the block's end
+ 
+@@ -3112,13 +3115,29 @@ class InklingOutputParser(JsonOutputParser):
+     def clean(self) -> bool:
+         """A clean point to close the thinking at: nothing held in the base parser, the dialect holds no half tag, and the
+         block's end is not waiting to be confirmed (`think_end`: the next token decides whether `<|end_message|>` was quoted)."""
+-        return super().clean and not self._dialect.buf and self._dialect.state != "think_end"
++        return (super().clean and not self._dialect.buf and self._dialect.state != "think_end"
++                and not self._dialect.tool_pending)
++
++    def _can_stream_tool(self) -> bool:
++        return self.state == "content" and super().clean and not self._in_code()
+ 
+-    def _dispatch(self, chunks: list[tuple[str, str]]) -> list[Event]:
++    def _dispatch(self, chunks) -> list[Event]:
+         out: list[Event] = []
+         for kind, chunk in chunks:
+             if kind == "reasoning":
+                 out.append(Event("reasoning", chunk))
++            elif kind == "tool_args":
++                name, fragment = chunk
++                if self._streamed_call is None:
++                    self._streamed_call = ToolCall(name, {})
++                    out.append(Event("tool_start", call=self._streamed_call))
++                out.append(Event("tool_args", fragment, self._streamed_call))
++            elif kind == "tool_end":
++                suffix, arguments = chunk
++                call, self._streamed_call = self._streamed_call, None
++                out.append(Event("tool_args", suffix, call))
++                out.append(Event("tool_call", call=ToolCall(call.name, arguments, call.id)))
++                self.lead = True
+             elif chunk:
+                 out.extend(super().feed(chunk))
+         return out
+diff --git a/serve/inkling_dialect.py b/serve/inkling_dialect.py
+index 9f613ae..fb38560 100644
+--- a/serve/inkling_dialect.py
++++ b/serve/inkling_dialect.py
+@@ -21,6 +21,7 @@
+ import json
+ import os
+ import re
++from typing import Union
+ 
+ MSG_MODEL = "<|message_model|>"
+ CONTENT_THINK = "<|content_thinking|>"
+@@ -46,6 +47,7 @@
+ _MAX_TAG = max(len(t) for t in _HEADER_TAGS)
+ _MAX_HEADER_CHARS = 128
+ _MAX_THINK_ACC = 65536
++ChannelEvent = tuple[str, Union[str, tuple[str, str], tuple[str, dict]]]
+ 
+ 
+ def _safe_json_call(name: str, arguments) -> str:
+@@ -122,7 +124,7 @@
+ class InklingDialect:
+     """Stateful streaming translator: one instance per assistant reply."""
+ 
+-    def __init__(self):
++    def __init__(self, stream_names=(), can_stream=None):
+         self.state = "idle"          # idle | header | think | think_end | text | text_end | tool_json | tool_text
+         self.buf = ""
+         self.header_acc = ""
+@@ -132,6 +134,13 @@
+         self._emitted_visible = False
+         self.calls = 0
+         self._in_think = False
++        self._stream_names = stream_names
++        self._can_stream = can_stream
++        self._tool_stream = None
++
++    @property
++    def tool_pending(self) -> bool:
++        return self._tool_stream is not None
+ 
+     def _tags_for(self):
+         if self.state == "idle":
+@@ -165,11 +174,11 @@
+             return -1, None, len(self.buf) - 1
+         return -1, None, -1
+ 
+-    def feed_channels(self, text: str = "", final: bool = False, reason: str | None = None) -> list[tuple[str, str]]:
++    def feed_channels(self, text: str = "", final: bool = False, reason: str | None = None) -> list[ChannelEvent]:
+         """Stream raw Inkling-2-Mini output into typed `("reasoning" | "content", text)` chunks.
+         Tool invocations are emitted in the `"content"` channel as `<tool_call>\\n{...}\\n</tool_call>` JSON frames."""
+         self.buf += text
+-        out: list[tuple[str, str]] = []
++        out: list[ChannelEvent] = []
+         while True:
+             tags = self._tags_for()
+             i, tag, hold = self._split(tags)
+@@ -188,12 +197,12 @@
+             self._finish_typed(out, reason=reason)
+         return out
+ 
+-    def feed_token(self, piece: str, *, is_special: bool) -> list[tuple[str, str]]:
++    def feed_token(self, piece: str, *, is_special: bool) -> list[ChannelEvent]:
+         """Token-aware streaming entry point (#6675): ordinary BPE tokens (`is_special=False`) are emitted as
+         literal text in the current channel and can never trigger structural channel transitions even when they
+         spell `<|message_model|>`, `<|content_thinking|>`, or `<|end_message|>`. Real special channel tokens
+         (`is_special=True`) drive the state machine directly."""
+-        out: list[tuple[str, str]] = []
++        out: list[ChannelEvent] = []
+         if not piece:
+             return out
+         if self.buf:
+@@ -201,7 +210,7 @@
+             self._emit_typed(pending, out)
+         if is_special and piece in ALL_CHANNEL_TAGS:
+             if piece in self._tags_for():
+-                self._handle_tag_typed(piece, out)
++                self._handle_tag_typed(piece, out, special_token=True)
+             else:
+                 self._emit_typed(piece, out)
+             return out
+@@ -231,7 +240,7 @@
+         if chunk and len(self._think_acc) < _MAX_THINK_ACC:
+             self._think_acc += chunk[:_MAX_THINK_ACC - len(self._think_acc)]
+ 
+-    def _emit_typed(self, chunk: str, out: list[tuple[str, str]]) -> None:
++    def _emit_typed(self, chunk: str, out: list[ChannelEvent]) -> None:
+         if not chunk:
+             return
+         if self.state == "think":
+@@ -279,15 +288,27 @@
+                 self.state = "text"
+         elif self.state in ("tool_json", "tool_text"):
+             self.tool_acc += chunk
+-
+-    def _close_channel_typed(self, out: list[tuple[str, str]]) -> None:
++            if self._tool_stream is not None:
++                fragment = self._tool_stream.feed(chunk)
++                if fragment:
++                    out.append(("tool_args", (self._tool_stream.name, fragment)))
++
++    def _close_channel_typed(self, out: list[ChannelEvent], *, end_message=False) -> None:
+         if self.state in ("tool_json", "tool_text"):
+-            rendered = _parse_tool_body(self.header_acc, self.tool_acc, self.state)
+-            if rendered:
+-                if "<tool_call>" in rendered:
+-                    self.calls += 1
+-                out.append(("content", rendered))
+-                self._emitted_visible = True
++            stream, self._tool_stream = self._tool_stream, None
++            if stream is not None and stream.started:
++                if not end_message:
++                    raise ValueError("streamed Inkling tool call ended before its envelope closed")
++                suffix, arguments = stream.finish()
++                out.append(("tool_end", (suffix, arguments)))
++                self.calls += 1
++            else:
++                rendered = _parse_tool_body(self.header_acc, self.tool_acc, self.state)
++                if rendered:
++                    if "<tool_call>" in rendered:
++                        self.calls += 1
++                    out.append(("content", rendered))
++                    self._emitted_visible = True
+             self.tool_acc = ""
+             self.header_acc = ""
+         elif self.state == "header":
+@@ -301,7 +322,7 @@
+         elif self.state == "text_end":
+             self._end_ws = ""
+ 
+-    def _handle_tag_typed(self, tag: str, out: list[tuple[str, str]]) -> None:
++    def _handle_tag_typed(self, tag: str, out: list[ChannelEvent], *, special_token=False) -> None:
+         if tag in (END_SAMPLING, ENDOFTEXT):
+             self._close_channel_typed(out)
+             self.state = "idle"
+@@ -326,7 +347,7 @@
+                 self._emitted_visible = True
+                 self._end_ws = ""
+                 return
+-            self._close_channel_typed(out)
++            self._close_channel_typed(out, end_message=special_token)
+             self.state = "idle"
+             return
+         if tag == MSG_MODEL:
+@@ -351,6 +372,9 @@
+                 self._close_channel_typed(out)
+             self.state = "tool_json"
+             self.tool_acc = ""
++            if special_token and self._stream_names and self._can_stream():
++                from serve.inkling_tool_stream import CanonicalToolStream
++                self._tool_stream = CanonicalToolStream(self._stream_names)
+             return
+         if tag in (CONTENT_TOOL_TEXT, CONTENT_XML):
+             if self.state in ("think", "think_end", "text_end"):
+@@ -359,8 +383,15 @@
+             self.tool_acc = ""
+             return
+ 
+-    def _finish_typed(self, out: list[tuple[str, str]], reason: str | None = None) -> None:
+-        if self.state == "header" and self.header_acc:
++    def _finish_typed(self, out: list[ChannelEvent], reason: str | None = None) -> None:
++        stream, self._tool_stream = self._tool_stream, None
++        if stream is not None and stream.started:
++            if reason not in ("length", "cancel"):
++                raise ValueError("streamed Inkling tool call ended before its envelope closed")
++        elif reason == "native_loop":
++            # A buffered tool envelope interrupted by the native guard has no end marker.
++            pass
++        elif self.state == "header" and self.header_acc:
+             out.append(("content", self.header_acc))
+             self._emitted_visible = True
+         elif self.state in ("tool_json", "tool_text") and (self.tool_acc.strip() or self.header_acc.strip()):
+diff --git a/serve/server.py b/serve/server.py
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -321,6 +321,7 @@
+     openai_collect,
+ )
+ from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
++                            InklingOutputParser,
+                             parser_for_template, anthropic_to_messages, anthropic_tools,
+                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                             tool_choice_of, unmark_think_literals)
+@@ -1285,8 +1286,18 @@
+                 self.ended = True
+                 try:
+                     self.__init__(*self.spawn)
++                    self.__dict__.pop("_lazy_split_fallback", None)
+                     break
+-                except RuntimeError:
++                except Exception as error:
++                    fallback = getattr(self, "_lazy_split_fallback", None)
++                    if fallback is not None:
++                        self.close()
++                        del self._lazy_split_fallback
++                        fallback(self, error)
++                        info = {}    # report the layer worker's capabilities after the switch
++                        break
++                    if not isinstance(error, RuntimeError):
++                        raise
+                     try:
+                         self.proc.wait(timeout=60)
+                     except (subprocess.TimeoutExpired, OSError):
+@@ -1310,6 +1321,8 @@
+                      "decode_ms": float(f[4]), "finish": f[5]}
+         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
+             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
++        if len(f) == 10 and f[9] == "loop_stop=1" and getattr(self, "inkling_engine", False):
++            self.last["loop_stop"] = True
+         if len(f) >= 11:                                  # decode hit rate fields
+             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
+@@ -1397,6 +1410,13 @@
+         if getattr(self, "split_engine", False) or getattr(self, "hy4_engine", False) or getattr(self, "inkling_engine", False) or prompt_len <= orig_len:
+             return ""
+         return f" pen_from={orig_len - 1}"
++
++    def inkling_lookup_key(self, sampling: dict) -> str:
++        limit = getattr(self, "info", {}).get("lookup")
++        lookup = sampling.get("lookup")
++        if getattr(self, "inkling_engine", False) and type(limit) is int and limit > 0 and type(lookup) is int:
++            return f" lookup={max(0, min(lookup, limit))}"
++        return ""
+ 
+     @staticmethod
+     def sampling_keys(sampling: dict, *, hy4: bool = False, inkling: bool = False) -> str:
+@@ -1717,6 +1737,8 @@
+                         self.last["prompt_ms"] = (self.last.get("prompt_ms") or 0.0) + float(value)
+                     except ValueError:
+                         pass
++                elif tok == "loop_stop=1" and getattr(self, "inkling_engine", False):
++                    self.last["loop_stop"] = True
+                 elif eq and key == "drafts":                 # drafts=<checked>:<kept>: the slot's own --batch-mtp counters (#5890)
+                     offered, colon, accepted = value.partition(":")
+                     if colon and offered.isdigit() and accepted.isdigit():
+@@ -2103,6 +2125,7 @@
+         keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY},
+                                    hy4=getattr(self, "hy4_engine", False),
+                                    inkling=getattr(self, "inkling_engine", False))   # (the hold's key goes on per leg: leg_keys below)
++        keys0 += self.inkling_lookup_key(sampling or {})
+         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
+         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
+         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
+@@ -2121,11 +2144,14 @@
+         prompt, left = list(ids), int(max_new)
+ 
+         def leg_keys() -> str:
+-            """The budget's hold counts what this pass still has: a leg that starts after `out` tokens of it holds the rest (at least one);
+-            once </think> is in `out` the hold is over and no key goes."""
++            keys = keys0
++            # A resumed Inkling leg replays these reply tokens as part of its input.
++            if out and self.info.get("reply_prefix") == 1:
++                keys += f" reply_prefix={len(out)}"
++            # A continued leg only holds the remaining reasoning budget, until it has emitted </think>.
+             if isinstance(hold, tuple) and len(hold) == 2 and hold[0] > 0 and hold[1] >= 0 and hold[1] not in out:
+-                return keys0 + f" hold={max(1, hold[0] - len(out))}:{hold[1]}"
+-            return keys0
++                keys += f" hold={max(1, hold[0] - len(out))}:{hold[1]}"
++            return keys
+         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
+         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+@@ -2696,6 +2722,8 @@
+             raise EngineDied("the engine is unavailable; this request was not sent")
+         bias_api.validate_request(sampling or {}, self, None)
+         refuse_for_split(self, sampling or {})
++        if embeddings and getattr(self, "inkling_engine", False):
++            embeddings = inkling_kind.encode_path(embeddings)
+         if getattr(self, "batch", 0):
+             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+             return
+@@ -2710,8 +2738,9 @@
+         self.lp_lines = LPLines(cancel)
+         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
+         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
+-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))} {embeddings}" if embeddings else \
+-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))}"
++        keys = self.sampling_keys(sampling or {}, hy4=getattr(self, "hy4_engine", False),
++                                  inkling=getattr(self, "inkling_engine", False)) + self.inkling_lookup_key(sampling or {})
++        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
+         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
+             if embeddings or int(max_new) != 0:
+                 raise ValueError("prefill_only is a text prompt and max_new 0")
+@@ -3126,6 +3155,8 @@
+         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
+ 
+     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
++        self.inkling_embeddings = cfg.get("inkling_embeddings") is True
++        self.embedding_width = 0
+         args = self.reader_args(cfg)
+         self.dir = self.work_dir()
+         self.spawn = (args, log, env)                   # to start it again after an unload
+@@ -3133,7 +3164,7 @@
+         # fall back on when it does not start; _start switches to it by itself
+         # the NVIDIA reader (strata-vision) is the CPU reader too, without --gpu: a GPU reader that does not start, resident or on demand, reads on the
+         # processor instead of ending the launch (owner, 2026-11-10); the person's image limit stays
+-        cpu = vision_reader.cpu_fallback(cfg, same_program=True)
++        cpu = None if cfg.get("require_gpu") else vision_reader.cpu_fallback(cfg, same_program=True)
+         self.fallback = (self.reader_args(cpu), log, env) if cpu else None
+         self.gpu_spawn, self.cpu_spawn = self.spawn, self.fallback   # an on-demand reader tries the GPU one again at every start
+         self.on_cpu = False                             # the CPU reader is what runs (the GPU one did not start, or there was no room)
+@@ -3148,6 +3179,7 @@
+         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
+         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
+         self.max_tokens = self.token_limit(cfg)
++        self.resident = cfg.get("scream_resident") is True
+         self.elastic = cfg.get("elastic") is True
+         self.elastic_mib = self.elastic_ask_mib(cfg, self.max_tokens)
+         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
+@@ -3188,6 +3220,8 @@
+         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
+         if cfg.get("gpu"):
+             args.append("--gpu")
++        if cfg.get("inkling_embeddings") is True:
++            args.append("--strata-protocol")
+         if cfg.get("threads"):
+             args += ["--threads", str(cfg["threads"])]
+         limit = Vision.token_limit(cfg)
+@@ -3296,7 +3330,11 @@
+             if VISION_READY_S:
+                 raise RuntimeError(vision_start_error("", log, waited=VISION_READY_S, strays=strays, since=since)) from None
+             raise RuntimeError(str(e)) from None
+-        if not line.startswith("READY"):
++        words = line.split()
++        self.embedding_width = 0
++        if getattr(self, "inkling_embeddings", False) and len(words) == 3 and words[2] == "mtmd" and words[1].isdigit():
++            self.embedding_width = int(words[1])
++        if not line.startswith("READY") or (getattr(self, "inkling_embeddings", False) and self.embedding_width < 1):
+             proc, self.proc = self.proc, None
+             self.stopped = True
+             code = proc.poll() if hasattr(proc, "poll") else None   # an encoder that died by itself has its status already
+@@ -3313,7 +3351,6 @@
+         self.stopped = False
+         # "READY <n_embd> <reader>": the reader that runs (own: Strata's; an older strata-vision says only "READY <n_embd>", or "mtmd" for llama.cpp's).
+         # Since 0.2.16 strata-vision has no other reader to fall back on: a GPU reader that does not start is replaced by the CPU reader (_start).
+-        words = line.split()
+         self.reader = words[2] if len(words) > 2 else None
+ 
+     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a child it started) before the start is
+@@ -3373,7 +3410,7 @@
+                 if said <= self.STRAY_KEEP:
+                     print(f"[strata] the image encoder printed on its output, not an answer: {stray[:200]}", flush=True)
+ 
+-    def _readline(self, timeout: float, what: str) -> str:
++    def _readline(self, timeout: float, what: str, cancel=None) -> str:
+         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
+         next request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
+         proc = self.proc
+@@ -3386,14 +3423,26 @@
+                 got.put("")
+ 
+         threading.Thread(target=read, daemon=True).start()
+-        try:
+-            return got.get(timeout=timeout)
+-        except queue.Empty:
++        deadline = time.monotonic() + timeout
++        while True:
++            if cancel is not None and cancel.is_set():
++                try:
++                    proc.kill()
++                except OSError:
++                    pass
++                self.close()
++                raise ClientGone()
++            remaining = max(0.0, deadline - time.monotonic())
+             try:
+-                proc.kill()
+-            except OSError:
+-                pass
+-            raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
++                return got.get(timeout=remaining if cancel is None else min(0.1, remaining))
++            except queue.Empty:
++                if time.monotonic() < deadline:
++                    continue
++                try:
++                    proc.kill()
++                except OSError:
++                    pass
++                raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
+ 
+     def alive(self) -> bool:
+         return self.proc is not None and not self.stopped and self.proc.poll() is None
+@@ -3539,10 +3588,11 @@
+         for src in sources:
+             if cancel is not None and cancel.is_set():
+                 raise ClientGone()
+-            out.append(self.encode(src, keep=[p for p, _ in out]))
++            opts = {"cancel": cancel} if getattr(self, "inkling_embeddings", False) else {}
++            out.append(self.encode(src, keep=[p for p, _ in out], **opts))
+         return out
+ 
+-    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
++    def encode(self, source: str | bytes, keep=(), cancel=None) -> tuple[Path, int]:
+         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
+         `keep`: files the caller still needs (never evicted by this call)."""
+         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+@@ -3558,27 +3608,42 @@
+                 raise ValueError("the picture reader is not running")
+             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
+             img.write_bytes(data)
++            read_opts = {"cancel": cancel} if cancel is not None else {}
+             try:
+                 self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
+                 self.proc.stdin.flush()
+                 try:
+-                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
++                    line = self._readline(VISION_ENCODE_S, "the image could not be read", **read_opts).strip()
+                     if line.startswith("ERR cannot read the image"):
+                         converted = self.normalize(data, force=True)
+                         if converted != data:
+                             img.write_bytes(converted)
+                             self.proc.stdin.write(f"ENC {img.name} {out.name}\n")
+                             self.proc.stdin.flush()
+-                            line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
++                            line = self._readline(VISION_ENCODE_S, "the image could not be read", **read_opts).strip()
+                 except RuntimeError as e:                 # silent for VISION_ENCODE_S: the encoder was ended (#1317)
+                     self.stopped = True                   # alive() is False, so the next request starts it again
+                     raise ValueError(str(e)) from None
++            except Exception:
++                out.unlink(missing_ok=True)
++                raise
+             finally:                                                   # #352: also when the encoder's pipe is gone
+                 img.unlink(missing_ok=True)
+             if not line.startswith("OK"):
++                out.unlink(missing_ok=True)
+                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                      "the vision encoder stopped"))
+-            self.cache[key] = (out, int(line.split()[1]))
++            fields = line.split()
++            if len(fields) < 2 or not fields[1].isdigit():
++                out.unlink(missing_ok=True)
++                raise ValueError("invalid projector response")
++            rows = int(fields[1])
++            if getattr(self, "inkling_embeddings", False) and (
++                    rows < 1 or (self.max_tokens and rows > self.max_tokens) or
++                    not out.is_file() or out.stat().st_size != 20 + rows * self.embedding_width * 4):
++                out.unlink(missing_ok=True)
++                raise ValueError("invalid Inkling projector output")
++            self.cache[key] = (out, rows)
+             self.warn_if_over_limit(self.cache[key][1])
+             if not self.cache_batches:
+                 held = {str(p) for p in keep} | {str(out)}
+@@ -3628,6 +3693,11 @@
+         shutil.rmtree(self.dir, ignore_errors=True)
+ 
+ 
++def scream_split_worker(cfg: dict, exe: str | None = None) -> bool:
++    # A linked binary contains strings from every backend. The launch alias identifies the native split worker.
++    return cfg.get("scream_backend") == "strata-split" and Path(exe or cfg.get("exe") or "").name == "strata-split-2"
++
++
+ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
+     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
+     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
+@@ -3638,11 +3708,13 @@
+         raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
+     if pos == "start":
+         return None
+-    try:
+-        with open(engine_binary(exe, cfg), "rb") as f:
+-            known = b"--tail-role-token" in f.read()
+-    except OSError:
+-        known = False
++    known = False
++    if not scream_split_worker(cfg, exe):
++        try:
++            with open(engine_binary(exe, cfg), "rb") as f:
++                known = b"--tail-role-token" in f.read()
++        except OSError:
++            pass
+     role = tok.encode("system", parse_special=True)
+     if not known or len(role) != 1:
+         print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
+@@ -3699,7 +3771,7 @@
+     """The arguments to start again with when an Auto start that picked DFlash2 ends before the engine is ready: the same start with the MTP (or no drafter, when
+     the MTP layer is not on this computer). None when there is nothing to retry: the person named DFlash2 themselves (that start fails with its reason, as it
+     should), the choice was not DFlash2, or the MTP arguments are the same. Builds the arguments without any line or note (engine_args announce=False)."""
+-    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg):
++    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg) or scream_split_worker(cfg, exe):
+         return None
+     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
+         return None
+@@ -3717,7 +3789,7 @@
+     """The arguments to start again with when an Auto start ends before the engine is ready because a card ran out of memory: the same start with no drafter
+     (the draft layer and DFlash2's buffers are the biggest optional part on a card that is short), never the MTP in place of DFlash2.  None when the drafting
+     was not Auto (the person named a drafter: that start fails with the engine's reason), when the first start has no drafter anyway, or when nothing differs."""
+-    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg):
++    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg) or scream_split_worker(cfg, exe):
+         return None
+     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
+         return None
+@@ -3749,6 +3821,15 @@
+     mine = user_args.capture(cfg)
+     if mine:
+         args = user_args.merge(args, mine)
++    if scream_split_worker(cfg, exe):
++        if "--spec" not in mine and (cfg.get("drafting") == "off" or cfg.get("mtp") is False):
++            args = user_args.merge(args, ["--spec", "0"])
++        if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
++            args.append("--vision")
++        parallel = cfg.get("parallel")
++        if "--batch" not in args and type(parallel) is int and parallel > 1:
++            args += ["--batch", str(min(parallel, SPLIT_MAX_LANES))]
++        return args
+     # "drafting": auto | mtp | dflash2 | off (strata_control/drafting.py; the Models screen and `strata launch --drafting` write it): which drafter
+     # guesses ahead. ONE drafter per run: DFlash2 alone (no --mtp, --draft-fallback none) or the MTP alone (no DFlash2 option). Auto is DFlash2 where the engine
+     # has it, on one card and on a layer split over several cards. A choice that cannot be applied (no drafter file yet, several requests at once) starts the other one if it is on this computer,
+@@ -4108,6 +4189,10 @@
+     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
+     compiled it) first on the library search path."""
+     env = arena_env(quiet_crash_env(dict(os.environ)))   # no debugger on a user's machine (ggml's abort path forks gdb); glibc arenas capped (strata_control/childenv.py)
++    configured_env = cfg.get("env") or {}
++    for key, value in configured_env.items():
++        if value is None:
++            env.pop(str(key), None)
+     if gpu_all_off(cfg):                             # every card Off: the engine sees none (a CPU engine runs; the others say so at start)
+         env["CUDA_VISIBLE_DEVICES"] = ""
+         env["HIP_VISIBLE_DEVICES"] = ""
+@@ -4124,8 +4209,9 @@
+     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
+         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
+-    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
+-        env[str(k)] = str(v)
++    for k, v in configured_env.items():               # engine settings the config carries (AMD: the GEMM tuning table)
++        if v is not None:
++            env[str(k)] = str(v)
+     # #6497: honor an explicit CPU thread cap (`--pool-workers N` or `threads`) in OpenMP/BLAS runtimes too unless
+     # the user already set OMP_NUM_THREADS explicitly.
+     pw = _configured_pool_workers(cfg)
+@@ -4304,7 +4390,9 @@
+         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
+         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+         self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
+-        self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
++        self.runtime_settings = None
++        self.incremental_tool_stream = os.environ.get("SCREAM_INKLING_TOOL_STREAM") == "1"
++        self.shared = {}                              # standalone Strata's Chat settings
+         self.shared_path = None                       # where they are kept between starts (next to the config)
+         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
+@@ -4409,7 +4497,8 @@
+             self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + hy4_kind.literal_tags(tokenizer))
+         elif self.inkling:
+             self.stop_ids |= inkling_kind.end_ids(tokenizer)
+-            self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + inkling_kind.literal_tags(tokenizer))
++            self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) +
++                                         inkling_kind.literal_tags(tokenizer) + [inkling_kind.IMAGE_PAD_TOKEN])
+         self.family = None                            # the model family: set_family() below (None: the Qwen form)
+         self.parser_cls = parser_for_template(getattr(template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
+         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
+@@ -4798,7 +4887,29 @@
+         """The VRAM the engine keeps free for other programs outside an elastic encoder's turn: the last POST /v1/vram
+         reserve, or 0 when none was asked (the cache grows back to its full size; None would leave the reserve the engine
+         started with, a segment or more below the size it had)."""
+-        return self.vram_reserve if self.vram_reserve_asked else 0
++        reserve, asked = self._runtime_reserve()
++        return reserve if asked else 0
++
++    def _runtime_reserve(self):
++        if self.runtime_settings:
++            return self.runtime_settings.reserve()
++        return self.vram_reserve, self.vram_reserve_asked
++
++    def _record_vram_reserve(self, value, device=None):
++        if self.runtime_settings:
++            self.runtime_settings.record_reserve(value, device)
++        else:
++            self.vram_reserve, self.vram_reserve_asked = value, True
++
++    def _device_reserves(self):
++        return self.runtime_settings.reserve_devices() if self.runtime_settings else {}
++
++    def _vision_vram(self, extra=0):
++        reserve = self._engine_reserve()
++        out = self.engine.vram((reserve or 0) + extra if extra else reserve)
++        for device, value in self._device_reserves().items():
++            self.engine.vram(value + extra, device=device)
++        return out
+ 
+     def _engine_has_vram_command(self) -> bool:
+         """Does the running engine know the VRAM command?  The Strata engine says so in its INFO line (vram_elastic=0 or 1, every engine
+@@ -4827,7 +4938,7 @@
+             self.vision_no_shrink = self.vision_no_shrink_said = True      # the Qwen3.6 engine: no VRAM command (it would answer with its usage text)
+         if hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
+             try:
+-                out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
++                out = self._vision_vram(v.elastic_mib)
+                 self.vision_held = True
+                 print(f"[strata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
+                       f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
+@@ -4852,7 +4963,7 @@
+         if on_cpu and self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+             # the CPU reader needs no VRAM: the cache takes back what it made room for
+             try:
+-                self.engine.vram(self._engine_reserve())
++                self._vision_vram()
+             except ValueError as e:
+                 print(f"[strata] images: the expert cache did not grow back ({e})", flush=True)
+             self.vision_held = False
+@@ -4883,7 +4994,7 @@
+             v.unload()
+             back = ""
+             if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+-                out = self.engine.vram(self._engine_reserve())
++                out = self._vision_vram()
+                 back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
+                         f"{out.get('expert_cache_full_mib')} MiB)")
+             # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
+@@ -5105,11 +5216,19 @@
+         print("[strata] the engine is running again", flush=True)
+         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
+             images_api.restore_session(self)
+-        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
+-            try:
+-                self.engine.vram(self.vram_reserve)
+-            except (ValueError, EngineDied) as e:
+-                print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
++        reserve, _ = self._runtime_reserve()
++        reserves = list(self._device_reserves().items())
++        if reserve is not None:
++            reserves.insert(0, (None, reserve))
++        if hasattr(self.engine, "vram"):
++            for device, value in reserves:
++                try:
++                    if device is None:
++                        self.engine.vram(value)
++                    else:
++                        self.engine.vram(value, device=device)
++                except (ValueError, EngineDied) as e:
++                    print(f"[strata] the VRAM reserve ({value} MiB) was not applied: {e}", flush=True)
+ 
+     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
+ 
+@@ -5132,12 +5251,12 @@
+             self.engine._ctl_held = True                 # engine.vram() below must not wait for the lines this call holds
+         try:
+             if not self.loaded():
+-                self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
++                self._record_vram_reserve(reserve_mib, device)
+                 return {"status": "not loaded", "reserve_mib": reserve_mib,
+                         "note": "applied when the model loads"}
+             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
+             out = self.engine.vram(((reserve_mib or 0) + self.vision.elastic_mib) if self.vision_held else reserve_mib, device=device)
+-            self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
++            self._record_vram_reserve(reserve_mib, device)
+             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
+                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
+             return {"status": "ok", **out}
+@@ -5225,8 +5344,10 @@
+         if not self.fifo.acquire(blocking=False):
+             return "busy"
+         try:
++            release_projector = idle_for is None or not getattr(self.vision, "resident", False)
+             if not self.engine.alive():
+-                self._release_orphan_encoder()                  # POST /unload gives the card back even when the engine already died (#4352)
++                if release_projector:
++                    self._release_orphan_encoder()              # POST /unload gives the card back even when the engine already died (#4352)
+                 return "not loaded"
+             with self.status_lock:
+                 if self.status.get("busy") or self.status.get("queued"):
+@@ -5234,7 +5355,7 @@
+             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                 return "busy"
+             self.engine.unload()
+-            if self.vision is not None and hasattr(self.vision, "unload"):
++            if release_projector and self.vision is not None and hasattr(self.vision, "unload"):
+                 self.vision.unload()
+             self.vision_held = False
+             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+@@ -5257,9 +5378,20 @@
+                     print(f"[strata] idle unload: {e}", flush=True)
+         threading.Thread(target=loop, daemon=True).start()
+ 
++    @property
++    def shared(self):
++        return self.runtime_settings.shared() if self.runtime_settings else self._shared
++
++    @shared.setter
++    def shared(self, value):
++        self._shared = value
++
+     def set_shared(self, defaults) -> dict:
+         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
+-        self.shared = clean_shared_defaults(defaults, hy4=self.hy4)
++        validated = clean_shared_defaults(defaults, hy4=self.hy4)
++        if self.runtime_settings:
++            return self.runtime_settings.queue_shared(validated)
++        self.shared = validated
+         if self.shared_path:
+             try:
+                 if self.shared:
+@@ -5680,7 +5812,10 @@
+         had_images = bool(images)
+         self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))
+         self.embeddings.inkling = self._drop_hy4_images(getattr(self.embeddings, "inkling", None))      # an earlier pass of this request left its files: gone first
+-        if images and (self.hy4 or self.inkling):                     # Hy4-Flash / Inkling-2-Mini: in-process engine reads pictures directly (INFO images=1)
++        inkling_embeddings = self.inkling and getattr(self.vision, "inkling_embeddings", False)
++        if images and inkling_embeddings and str((getattr(self.engine, "info", None) or {}).get("image_embd")) != "1":
++            raise ValueError("the Inkling engine does not support projector embedding files")
++        if images and (self.hy4 or (self.inkling and not inkling_embeddings)):
+             kind_mod = inkling_kind if self.inkling else hy4_kind
+             if (getattr(self.engine, "info", None) or {}).get("images") != 1:
+                 raise ValueError(kind_mod.NO_IMAGES_REPLY)
+@@ -5726,8 +5861,9 @@
+                     if src.startswith(("http://", "https://")) else src
+             images = [fetch(src) for src in images]
+         if images:
+-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+-            start = self.tok.encode(VISION_START, parse_special=True)[0]
++            pad_text = inkling_kind.IMAGE_PAD_TOKEN if inkling_embeddings else IMAGE_PAD
++            pad = self.tok.encode(pad_text, parse_special=True)[0]
++            start = None if inkling_embeddings else self.tok.encode(VISION_START, parse_special=True)[0]
+             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
+             # run on the GPU at the same time - an encode during a running request left that request stuck at
+             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
+@@ -5745,10 +5881,10 @@
+                 # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
+                 # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
+                 # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+-                literal = self.tok.encode(IMAGE_PAD, parse_special=False)
++                literal = self.tok.encode(pad_text, parse_special=False)
+                 out, k = [], 0
+                 for j, t in enumerate(ids):
+-                    if t == pad and j > 0 and ids[j - 1] == start:
++                    if t == pad and (inkling_embeddings or (j > 0 and ids[j - 1] == start)):
+                         # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
+                         if k == len(encoded):
+                             raise ValueError("the prompt and its images do not match")
+@@ -5812,7 +5948,8 @@
+                 # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+                 # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
+                 # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
+-                self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
++                if not inkling_embeddings:
++                    self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
+                 write_temporary(combined, [p for p, _ in encoded])
+         auto_prefix = False
+         inkling_shared_ok = str((getattr(self.engine, "info", None) or {}).get("shared_prefix")) == "1"
+@@ -6056,9 +6193,12 @@
+                     print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                           f"the answer (budget {budget})", flush=True)
+                 budget = max(1, max_new - reserve)
+-        parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+-                                 recover=self.tool_call_recovery, declared_only=declared_only,
+-                                 deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
++        parser_options = dict(tools=with_history_tools(tools, sampling), stream_tools=True,
++                              recover=self.tool_call_recovery, declared_only=declared_only,
++                              deferred=deferred or self.undeclared_tool_calls == "call")  # #4622: opt-in, as for a deferred tool
++        if self.parser_cls is InklingOutputParser and sampling and sampling.get("stream"):
++            parser_options["incremental_envelopes"] = self.incremental_tool_stream
++        parser = self.parser_cls(thinking=thinking, **parser_options)
+         inkling_special_ids = None
+         if self.inkling and hasattr(parser, "feed_token"):
+             types = getattr(self.tok, "token_types", None)
+@@ -6069,6 +6209,7 @@
+                     if ty == 3 and i < len(toks) and toks[i] in inkling_dialect.ALL_CHANNEL_TAGS
+                 }
+         detok, n, finish = Detokenizer(self.tok), 0, "length"
++        native_loop_stop = False
+         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+         stop_list = stop_strings(sampling)
+@@ -6404,6 +6545,12 @@
+                                   "reads its prompt from the start", flush=True)
+                             finish = "length"
+                             break
++                        # The native guard stops without emitting an end token. Finish before the adapter considers a retry.
++                        if (self.inkling and len(segments) > segments_before and segments[-1].get("loop_stop")
++                                and not (wrap or opens or repeated or looped or recover_prompt or cancel.is_set())):
++                            native_loop_stop = True
++                            finish = "stop"
++                            break
+                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
+                             recovery_count += 1
+                             # Only the two settings that keep the same words coming are raised (temperature to at
+@@ -6509,10 +6656,7 @@
+                                           flush=True)
+                                     max_new -= len(extra)       # the note is prompt: the reply keeps inside the context
+                                     prompt = prompt + seg + extra
+-                                    parser = self.parser_cls(thinking=False, tools=with_history_tools(tools, sampling),
+-                                                             stream_tools=True, recover=self.tool_call_recovery,
+-                                                             declared_only=declared_only,
+-                                                             deferred=deferred or self.undeclared_tool_calls == "call")
++                                    parser = self.parser_cls(thinking=False, **parser_options)
+                                     detok, tail, parser_done, force, budget = Detokenizer(self.tok), "", False, None, None
+                                     if forced_text:     # a forced call (tool_choice): its opening again, read as
+                                         for ev in cut(parser.feed(forced_text)):     # if the model had written it
+@@ -6577,6 +6721,8 @@
+                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
+                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
+                               "same, restart the server and report it (#606)", flush=True)
++                    if self.runtime_settings and not cancel.is_set():
++                        self.runtime_settings.complete()
+                 except GpuBusy:
+                     # #3040 (PR #5044's approach): a batch engine can use up its BGEN retries before it has admitted this
+                     # request.  The monitor keeps an error row, but it is not a completed generation: no prompt tokens
+@@ -6699,7 +6845,7 @@
+             if emb:
+                 Path(emb).unlink(missing_ok=True)
+         if not parser_done:
+-            for ev in cut(parser.finish(finish)):
++            for ev in cut(parser.finish("native_loop" if native_loop_stop else finish)):
+                 answered = answered or ev.kind in ("content", "tool_start", "tool_call") and bool((ev.text or "").strip() or ev.kind != "content")
+                 yield "event", ev
+         for ev in hold.release():                   # no retry (or its reply): the held text goes out as it is
+@@ -7751,14 +7897,19 @@
+             if path == "/api/expert-heat":                   # #5723: the web page's Experts view (serve/expert_heat.py)
+                 if self._authorized():
+                     try:
+-                        cfg = runconfig.load(svc.config_path) if svc.config_path else None
++                        if svc.runtime_settings:
++                            cfg = svc.runtime_settings.config()
++                        else:
++                            cfg = runconfig.load(svc.config_path) if svc.config_path else None
+                     except (OSError, ValueError):
+                         cfg = None
+                     self._json(*expert_heat.view(cfg))
+                 return
+             if path == "/settings":
+                 if self._authorized():
+-                    self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
++                    state = svc.runtime_settings.shared_status() if svc.runtime_settings else {
++                        "shared": bool(svc.shared), "defaults": svc.shared}
++                    self._json(200, state)
+                 return
+             if path == "/config":                            # #564: the Settings view's keys of the run config
+                 if self._authorized():
+@@ -7897,6 +8048,12 @@
+             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
+             if path.startswith("/v1/") and self._foreign_page():
+                 return
++            inference = path in ("/v1/chat/completions", "/v1/messages", "/v1/responses")
++            context = svc.runtime_settings.request() if inference and svc.runtime_settings else contextlib.nullcontext()
++            with context:
++                return self._post_authorized(path)
++
++        def _post_authorized(self, path):
+             if path == "/settings":
+                 self._settings()
+                 return
+@@ -8002,6 +8159,10 @@
+                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                     return
+                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
++                    if getattr(svc, "inkling", False) and "lookup" in req:
++                        lookup = req["lookup"]
++                        if type(lookup) is not int or not 0 <= lookup <= 7:
++                            raise ValueError("lookup must be an integer from 0 to 7")
+                     check_model = getattr(svc, "check_model", None)
+                     if callable(check_model):
+                         model_err = check_model(req)
+@@ -8215,11 +8376,19 @@
+                 self._json(404, {"error": {"message": "this server was started without a run config"}})
+                 return
+             try:
+-                cfg = runconfig.load(svc.config_path)
++                cfg = (svc.runtime_settings.config(proposed=True) if svc.runtime_settings
++                       else runconfig.load(svc.config_path))
+             except (OSError, ValueError) as e:
+                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be read: {e}"}})
+                 return
+-            self._json(200, runconfig.view(cfg, svc.config_path))
++            self._json(200, self._config_view(cfg))
++
++        def _config_view(self, cfg):
++            view = runconfig.view(cfg, svc.config_path)
++            if svc.runtime_settings:
++                view["keys"] = [item for item in view["keys"] if item["key"] in svc.runtime_settings.startup_fields]
++                view["note"] = "Edits are queued for the next configured launch. Environment and CLI precedence still apply."
++            return view
+ 
+         def _config_post(self):
+             """#564: change a few documented keys of the run config - JSON from Strata's own page only, as
+@@ -8232,21 +8401,27 @@
+                 return
+             try:
+                 req = json.loads(body or b"{}")
+-                with svc.config_lock:
+-                    cfg = runconfig.load(svc.config_path)
+-                    new, changed = runconfig.apply(cfg, req.get("set") if isinstance(req, dict) else None)
+-                    if changed:
+-                        bak = runconfig.save(svc.config_path, new)
++                edits = req.get("set") if isinstance(req, dict) else None
++                if svc.runtime_settings:
++                    new, changed = svc.runtime_settings.queue_startup(edits, runconfig.apply, runconfig.value_of)
++                else:
++                    with svc.config_lock:
++                        cfg = runconfig.load(svc.config_path)
++                        new, changed = runconfig.apply(cfg, edits)
++                        if changed:
++                            bak = runconfig.save(svc.config_path, new)
+             except ValueError as e:
+                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                 return
+             except OSError as e:
+                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
+                 return
+-            if changed:
++            if changed and svc.runtime_settings:
++                print(f"[strata] queued {', '.join(changed)} for the next configured launch", flush=True)
++            elif changed:
+                 print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
+                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
+-            self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
++            self._json(200, {**self._config_view(new), "changed": changed})
+         def _foreign_origin(self) -> bool:
+             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
+             or an origin the config trusts (trusted_origins: the web app behind a reverse proxy or tunnel); no Origin
+@@ -8283,6 +8458,12 @@
+                 shared = svc.set_shared(req["defaults"])
+             except ValueError as e:
+                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
++                return
++            except OSError as e:
++                self._json(500, {"error": {"type": "server_error", "message": f"settings could not be saved: {e}"}})
++                return
++            if svc.runtime_settings:
++                self._json(200, {"shared": bool(shared), "defaults": shared, "pending": True})
+                 return
+             print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
+                   if shared else "[strata] other apps use their own settings again", flush=True)
+@@ -8955,32 +9136,79 @@
+     return httpd
+ 
+ 
++def startup_tuning(cfg):
++    """Apply backend preset defaults while building the configured startup snapshot."""
++    plan = cfg.get("scream_runtime_settings")
++    tuned = apply_saved_tuning(cfg)
++    if tuned is cfg or plan is None:
++        return tuned
++    explicit_user_args = user_args.capture(cfg)
++    flags = set(plan.get("tuning_flags", ()))
++    flags.update(user_args.flag_of(group) for group in user_args.groups(explicit_user_args))
++    original = user_args.groups(cfg.get("args"))
++    chosen = [group for group in original if user_args.flag_of(group) in flags]
++    defaults = [group for group in user_args.groups(tuned.get("args")) if user_args.flag_of(group) not in flags]
++    tuned["args"] = user_args.flat(defaults + chosen)
++    if "args_written" in cfg or "user_args" in cfg:
++        user_args.stamp(tuned, explicit_user_args)
++    protected_env = set(plan.get("tuning_environment", ()))
++    tuning = (tuned.get("sampling") or {}).get("strata_tune")
++    if isinstance(tuning, dict) and "strata_tune" not in (cfg.get("sampling") or {}):
++        raw = dict(tuning)
++        for key in ("pcie_frac", "spec_min_p", "prefill_pipe", "aux_cpus"):
++            if "--" + key.replace("_", "-") in flags or "STRATA_" + key.upper() in protected_env:
++                raw.pop(key, None)
++        tuned["sampling"] = {**tuned["sampling"], "strata_tune": raw}
++    env = dict(tuned.get("env") or {})
++    explicit = cfg.get("env") or {}
++    for key in protected_env & env.keys():
++        if key in explicit:
++            env[key] = explicit[key]
++        else:
++            env.pop(key)
++    tuned["env"] = env
++    return tuned
++
++
+ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, env: dict, lazy: bool, tok, *, offline: bool = False,
+                              batch_telemetry=None):
+     """Start the run config's engine. A config written for the all-cards split engine (strata_control/split_engine.py) carries the
+     normal layer-split config under "split_fallback": if that engine refuses or fails to come up, say so in one plain line and start the
+     normal one instead, so a start never fails because of the option. Any other config starts exactly as before."""
+     fb = cfg.get("split_fallback")
++    has_fallback = isinstance(fb, dict) and bool(fb.get("exe"))
+     try:
+-        return StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
+-                            retry_args=mtp_retry_args(cfg, exe, effort_end), retry_vram_args=nodraft_retry_args(cfg, exe, effort_end))
+-    except Exception as e:
+-        if not isinstance(fb, dict) or not fb.get("exe"):
++        engine = StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
++                              retry_args=mtp_retry_args(cfg, exe, effort_end), retry_vram_args=nodraft_retry_args(cfg, exe, effort_end))
++    except Exception as error:
++        if not has_fallback:
+             raise
+-        msg = str(e).strip()
+-        why = msg.splitlines()[0][:200] if msg else type(e).__name__
+-        # the engine's own reason ("sfnx: failed: ..." in its log tail, which the exception carries) is what a person needs to read
+-        own = next((ln.split("sfnx: failed: ", 1)[1].strip() for ln in reversed(msg.splitlines()) if "sfnx: failed: " in ln), "")
+-        if own:
+-            why = own[:300]
+-        log = cfg.get("log")
+-        if log:                                     # the normal engine writes the same log file: keep the split engine's
+-            try:
+-                os.replace(log, str(log) + ".split-engine")
+-            except OSError:
+-                pass
+-        print(f"[strata] The all-cards split engine could not start ({why}). Starting the normal layer split instead.", flush=True)
+-    cfg2 = {k: v for k, v in cfg.items() if k not in SPLIT_KEYS + ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting")}
++        return start_layer_fallback(cfg, fb, tok, error, lazy=lazy, offline=offline, batch_telemetry=batch_telemetry)
++    if lazy and has_fallback:
++        def deferred_fallback(failed, error):
++            # Keep the engine object held by the service and its request queue.
++            start_layer_fallback(cfg, fb, tok, error, offline=offline, batch_telemetry=batch_telemetry, engine=failed)
++
++        engine._lazy_split_fallback = deferred_fallback
++    return engine
++
++
++def start_layer_fallback(cfg, fb, tok, error, *, lazy=False, offline=False, batch_telemetry=None, engine=None):
++    msg = str(error).strip()
++    why = msg.splitlines()[0][:200] if msg else type(error).__name__
++    own = next((ln.split("sfnx: failed: ", 1)[1].strip() for ln in reversed(msg.splitlines()) if "sfnx: failed: " in ln), "")
++    if own:
++        why = own[:300]
++    log = cfg.get("log")
++    if log:
++        try:
++            os.replace(log, str(log) + ".split-engine")
++        except OSError:
++            pass
++    print(f"[strata] The all-cards split engine could not start ({why}). Starting the normal layer split instead.", flush=True)
++    cfg2 = {k: v for k, v in cfg.items()
++            if k not in SPLIT_KEYS + ("exe", "args", "args_written", "env", "layer_split", "replicas", "user_args", "drafting",
++                                      "scream_backend")}
+     cfg2.update(fb)
+     cfg2 = with_component_engine(cfg2)
+     if engine_component.is_reference(cfg2["exe"]):
+@@ -8990,8 +9218,13 @@
+     env2 = child_env(cfg2, offline=offline)
+     configure_batch_telemetry_env(env2, cfg2, batch_telemetry)
+     effort2 = effort_end_args(cfg2, exe2, tok)
+-    engine = StrataEngine(exe2, engine_args(cfg2, exe2) + (effort2 or []), cwd=cfg2.get("cwd"), log=cfg2.get("log"), env=env2, lazy=lazy,
+-                          retry_args=mtp_retry_args(cfg2, exe2, effort2), retry_vram_args=nodraft_retry_args(cfg2, exe2, effort2))
++    args2 = engine_args(cfg2, exe2) + (effort2 or [])
++    launch = {"cwd": cfg2.get("cwd"), "log": cfg2.get("log"), "env": env2, "lazy": lazy,
++              "retry_args": mtp_retry_args(cfg2, exe2, effort2), "retry_vram_args": nodraft_retry_args(cfg2, exe2, effort2)}
++    if engine is None:
++        engine = StrataEngine(exe2, args2, **launch)
++    else:
++        engine.__init__(exe2, args2, **launch)
+     engine.info["split_fallback"] = True
+     return engine
+ 
+@@ -9454,8 +9687,9 @@
+     if _ds:                                             # DeepSeek: this Strata no longer runs it; stop before the engine starts (retired.py)
+         print(retired.server_line(_ds), flush=True)
+         return 2
+-    if a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg) and not inkling_kind.is_inkling(cfg):     # (custom shape engines have no Flash-Next tuning knobs)
+-        cfg = apply_saved_tuning(cfg)
++    if (a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg) and
++            not inkling_kind.is_inkling(cfg) and not scream_split_worker(cfg)):
++        cfg = startup_tuning(cfg)
+     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
+     launch_attestation = None
+     if a.owner_fd is not None:
+@@ -9569,7 +9803,9 @@
+     if a.engine == "strata":
+         if not cfg:
+             ap.error("--engine strata needs --config")
+-        cfg = apply_vision_defaults(with_component_engine(cfg))
++        cfg = with_component_engine(cfg)
++        if not scream_split_worker(cfg):
++            cfg = apply_vision_defaults(cfg)
+         vision = None
+         # The engine's own environment. It carries the offline policy too: an engine that fetched a
+         # missing shard or a plugin would break the promise the flag makes.
+@@ -9584,8 +9820,9 @@
+             print(line, flush=True)
+         if cfg.get("vision"):
+             elastic = cfg["vision"].get("elastic") is True
++            vision_lazy = lazy and cfg["vision"].get("scream_resident") is not True
+             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
+-                  "loading the vision encoder ..." if not lazy else
++                  "loading the vision encoder ..." if not vision_lazy else
+                   "vision encoder unloaded; it starts with the model ...", flush=True)
+             # relative paths are the config's cwd's, as for the engine below
+             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+@@ -9603,7 +9840,7 @@
+                       'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
+                       "encoder's GPU, or the first picture may not get it", flush=True)
+             vision = Vision(vcfg, log=appendlog.open_append(cfg["log"]) if cfg.get("log") else None,
+-                            env=vision_env(cfg, env), lazy=lazy)
++                            env=vision_env(cfg, env), lazy=vision_lazy)
+         print("model unloaded; the first request loads it ..." if lazy else
+               "loading the model (the first start takes a minute or two) ...", flush=True)
+         warn_budget_over_ram(engine_args(cfg, announce=False) if "args" in cfg else [])      # #1080
+@@ -9897,7 +10134,12 @@
+     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
+     if a.config:
+         svc.config_path = a.config                      # #564: the web page's Settings view
+-    if a.config:                                        # the Chat settings shared with other apps, from last time
++    runtime_plan = cfg.get("scream_runtime_settings") if cfg.get("scream_backend") else None
++    if runtime_plan is not None:
++        from serve.scream_runtime_settings import RuntimeSettings
++        svc.runtime_settings = RuntimeSettings(cfg, runtime_plan, lambda data: clean_shared_defaults(data, hy4=svc.hy4))
++        svc.incremental_tool_stream = runtime_plan["incremental_tools"]
++    elif a.config:                                      # standalone shared Chat settings from last time
+         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+         svc.shared = load_shared_settings(svc.shared_path, hy4=svc.hy4)   # #4933: one unknown key no longer clears the rest
+         if svc.shared:
+diff --git a/serve/test_inkling_dialect.py b/serve/test_inkling_dialect.py
+index 02a01c4..52c1a76 100644
+--- a/serve/test_inkling_dialect.py
++++ b/serve/test_inkling_dialect.py
+@@ -14,6 +14,50 @@
+ 
+ 
+ class TestInklingDialect(unittest.TestCase):
++    @staticmethod
++    def native_tool_parser(incremental=True):
++        parser = frontend.InklingOutputParser(tools=[{"name": "apply_patch"}], stream_tools=True,
++                                               declared_only=True, incremental_envelopes=incremental)
++        parser.feed_token(inkling_dialect.MSG_MODEL, is_special=True)
++        parser.feed_token("apply_patch", is_special=False)
++        parser.feed_token(inkling_dialect.CONTENT_TOOL_JSON, is_special=True)
++        return parser
++
++    def test_native_tool_arguments_stream_before_the_closing_token(self):
++        args = {"patch": 'é 🐍 \\" {} </tool_call> <|end_message|>' * 32, "options": [{"value": True}]}
++        body = json.dumps({"name": "apply_patch", "args": args}, ensure_ascii=False)
++        parser = self.native_tool_parser()
++        chunks = []
++        for i in range(0, len(body), 7):
++            chunks.extend(parser.feed_token(body[i:i + 7], is_special=False))
++        self.assertEqual(chunks[0].kind, "tool_start")
++        call = chunks[0].call
++        self.assertEqual(call.name, "apply_patch")
++        self.assertGreater(len(chunks), 3)
++        self.assertTrue(all(event.kind == "tool_args" and event.call.id == call.id for event in chunks[1:]))
++        fragments = "".join(event.text for event in chunks[1:])
++        with self.assertRaises(json.JSONDecodeError):
++            json.loads(fragments)
++        ending = parser.feed_token(inkling_dialect.END_MSG, is_special=True)
++        self.assertEqual([event.kind for event in ending], ["tool_args", "tool_call"])
++        self.assertEqual(json.loads(fragments + ending[0].text), args)
++        self.assertEqual(ending[1].call, frontend.ToolCall("apply_patch", args, call.id))
++
++    def test_invalid_or_interrupted_native_tool_envelope_is_never_confirmed(self):
++        parser = self.native_tool_parser()
++        body = json.dumps({"name": "apply_patch", "args": {"patch": "A" * 600}})
++        parser.feed_token(body, is_special=False)
++        parser.feed_token('garbage after the outer brace', is_special=False)
++        with self.assertRaisesRegex(ValueError, "invalid streamed Inkling tool envelope"):
++            parser.feed_token(inkling_dialect.END_MSG, is_special=True)
++        parser = self.native_tool_parser()
++        parser.feed_token(body, is_special=False)
++        self.assertEqual(parser.finish("length"), [])
++        parser = self.native_tool_parser(incremental=False)
++        self.assertEqual(parser.feed_token(body, is_special=False), [])
++        ending = parser.feed_token(inkling_dialect.END_MSG, is_special=True)
++        self.assertEqual([event.kind for event in ending], ["tool_call"])
++
+     @staticmethod
+     def channels(raw, step=1):
+         """(reasoning, content) the dialect streams for raw model output fed `step` characters at a time."""
+@@ -450,6 +494,13 @@
+         self.assertEqual(len(calls), 1)
+         self.assertEqual(calls[0].arguments["content"], "MSG = '<|message_model|>'")
+ 
++    def test_native_loop_stop_does_not_recover_an_unclosed_buffered_tool(self):
++        parser = frontend.InklingOutputParser(tools=[{"name": "edit", "parameters": {"type": "object"}}])
++        raw = ('<|message_model|>edit<|content_invoke_tool_json|>'
++               '{"name":"edit","args":{"patch":"unfinished"}}')
++        events = parser.feed(raw) + parser.finish("native_loop")
++        self.assertFalse(any(event.kind in ("tool_start", "tool_call") for event in events))
++
+     def test_truncated_thinking_on_length_surfaces_reasoning_6682_and_bool_draft_off_6670(self):
+         # #6682: if max_tokens runs out inside <|content_thinking|> with zero visible answer, surface reasoning
+         p_cut = frontend.InklingOutputParser()
+diff --git a/serve/inkling_kind.py b/serve/inkling_kind.py
+--- a/serve/inkling_kind.py
++++ b/serve/inkling_kind.py
+@@ -81,9 +81,11 @@
+         return None
+     vision = next((args[i + 1] for i, a in enumerate(args) if a == "--vision" and i + 1 < len(args)), None)
+     dspark = next((args[i + 1] for i, a in enumerate(args) if a == "--dspark" and i + 1 < len(args)), None)
++    exe = Path(exe).absolute()
++    cwd = Path((cfg or {}).get("cwd") or exe.parent).absolute()
+     try:
+-        st = Path(str(exe)).stat()
+-        key = (str(exe), st.st_mtime_ns, st.st_size, str(model), str(vision or ""), str(dspark or ""))
++        st = exe.stat()
++        key = (str(exe), str(cwd), st.st_mtime_ns, st.st_size, str(model), str(vision or ""), str(dspark or ""))
+     except OSError:
+         return None
+     if key in _PROBES:
+@@ -101,7 +103,7 @@
+         cmd += ["--dspark", str(dspark)]
+     try:
+         done = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+-                              timeout=timeout, env=env, cwd=str(Path(str(exe)).parent))
++                              timeout=timeout, env=env, cwd=cwd)
+         info = parse_info(done.stdout) if done.returncode == 0 else None
+     except (OSError, subprocess.SubprocessError):
+         info = None
+@@ -240,7 +242,8 @@
+             args += ["--threads", pw_val]
+     # Propagate top-level cfg["parallel"] (1..64) into `--parallel <N>` when not explicitly in args
+     par = cfg.get("parallel")
+-    if isinstance(par, int) and 1 <= par <= inkling_family.MAX_PARALLEL and "--parallel" not in args:
++    if isinstance(par, int) and 1 <= par <= inkling_family.MAX_PARALLEL and not any(
++            flag in args for flag in ("--parallel", "--batch", "--slots")):
+         if par > 1:
+             args += ["--parallel", str(par)]
+     # Propagate 2..4 GPU selection (`cfg["gpu"]` or `gpu_roles`) into Main-first `--gpus` and `--layer-split` (#6592, #6631).
+@@ -250,16 +253,18 @@
+     n_gpus = len(gpu_list(cfg))
+     is_cuda = cfg.get("backend") not in ("hip", "sycl", "metal", "cpu")
+     mine_flags = {str(a) for a in (mine or ()) if str(a).startswith("--")}
++    worker_env = cfg.get("env") or {}
+     if n_gpus >= 2:
+         max_g = 4 if is_cuda else 2
+         local_spec = _local_gpu_ordinals(n_gpus, max_g)
+         if "--gpus" not in args:
+-            args += ["--gpus", local_spec]
++            if "--devices" not in args and not worker_env.get("IK2_GPUS"):
++                args += ["--gpus", local_spec]
+         elif "--gpus" not in mine_flags:
+             at = args.index("--gpus")
+             if at + 1 < len(args) and "," not in str(args[at + 1]):
+                 args[at + 1] = local_spec
+-        if is_cuda and "--layer-split" not in args and "--ep-split" not in args:
++        if is_cuda and "--layer-split" not in args and "--ep-split" not in args and not worker_env.get("IK2_EP_SPLIT"):
+             args += ["--layer-split", str(cfg["layer_split"]) if cfg.get("layer_split") else "auto"]
+         # Drop single-GPU expert caps when running multi-GPU unless the user explicitly pinned them in user_args.
+         if "--vram-experts-gb" not in mine_flags:
+@@ -285,6 +290,8 @@
+         args += ["--draft", "off"]
+     elif need_draft:
+         add = drafter_args(cfg, info)
++        if "--draft-beam" in args or "STRATA_INK_SPEC_BEAM" in worker_env:
++            add = _strip_flag(add, "--draft-beam")
+         args += add
+         if not add and announce:
+             print(f"[strata] {NO_DRAFTER_NOTE}", flush=True)
+diff --git a/serve/server_parts/http_api.py b/serve/server_parts/http_api.py
+--- a/serve/server_parts/http_api.py
++++ b/serve/server_parts/http_api.py
+@@ -523,6 +523,7 @@
+     are named at startup and ignored."""
+     out = {}
+     block = dict(cfg.get("sampling") or {})
++    unified_flash = cfg.get("scream_backend") in ("strata", "strata-split")
+     for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
+         if block.get(alias) is not None:
+             if block.get(canon) is not None:
+@@ -549,13 +550,11 @@
+             if not number or value != int(value) or not 1 <= value <= 64:
+                 raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+             out[key] = int(value)
+-        elif key == "presence_penalty":
+-            if not number or value < 0:
+-                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+-            out[key] = float(value)
+-        elif key == "frequency_penalty":
+-            if not number or value < 0:
+-                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
++        elif key in ("presence_penalty", "frequency_penalty"):
++            valid = number and (-2 <= value <= 2 if unified_flash else value >= 0)
++            if not valid:
++                accepted = "from -2 to 2" if unified_flash else ">= 0"
++                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected a number {accepted}")
+             out[key] = float(value)
+         elif key == "repetition_penalty":
+             if not number or value <= 0:
+@@ -566,8 +565,10 @@
+                 raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+             out[key] = int(value)
+         elif key == "seed":
+-            if not number or value != int(value) or value <= 0:
+-                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
++            valid = number and value == int(value) and (0 <= value <= (1 << 64) - 1 if unified_flash else value > 0)
++            if not valid:
++                accepted = "an unsigned 64-bit integer" if unified_flash else "a positive integer"
++                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected {accepted}")
+             out[key] = int(value)
+         elif key == "strata_tune":           # a saved tuning's per-request settings (strata_control/presets.py)
+             if not isinstance(value, dict):
