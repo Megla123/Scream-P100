@@ -4157,7 +4157,9 @@ static int serve(Engine& e, const std::string& path, int eos) {
                           e.ckpts.size(), g.ck_s, g.park, e.parks.size(), e.park_bytes >> 20, g.lh, g.lh2);
             rep += hd;
         } catch (const PrefillCancelled&) {
-            // feed() only checks between windows, with the processed prefix still valid.
+            // DFlash retains only the drafter rows close to the planned end of prefill.
+            // A canceled prefill may have skipped rows needed by the next request.
+            if (e.d2_on) e.reset();
             close(c);
             continue;
         } catch (const std::exception& ex) {
