@@ -2,7 +2,8 @@
 // preprocessing and ViT, the same code llama-server runs). Loads the text model's vocabulary only (mtmd wants the model for
 // its input width) and the projector, then reads lines "IMAGE_PATH OUT_PATH" on stdin; for each it writes the image's rows
 // (n_tokens x n_embd f32) to OUT_PATH and prints "ok N_TOKENS N_EMBD MS", or "err MESSAGE". Runs on the CPU unless --gpu
-// (the P100s are full of the engine at long contexts; start it with CUDA_VISIBLE_DEVICES= so no CUDA context is made).
+// with a CUDA backend available. CUDA_VISIBLE_DEVICES selects the card for this process.
+#include "ggml-backend.h"
 //   ink2_vis --mmproj M.gguf --model Inkling.gguf [--threads N] [--gpu] [--max-tokens N]
 #include "llama.h"
 #include "mtmd-helper.h"
@@ -34,6 +35,11 @@ int main(int argc, char ** argv) {
         return 2;
     }
     llama_backend_init();
+    ggml_backend_dev_t device = gpu ? ggml_backend_dev_by_name("CUDA0") : nullptr;
+    if (gpu && !device) {
+        std::fprintf(stderr, "ink2_vis: --gpu requires a visible CUDA device and a CUDA-enabled helper build\n");
+        return 1;
+    }
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     mp.n_gpu_layers = 0;
@@ -44,6 +50,7 @@ int main(int argc, char ** argv) {
     }
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;
+    cp.device = device;
     cp.n_threads = threads;
     cp.print_timings = false;
     cp.warmup = false;

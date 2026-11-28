@@ -31,7 +31,28 @@
 # reasoning's budget.
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); B=$H/build
-D=${1:?usage: run.sh DATA [CTX|256k|512k] [PORT]}; CTX=${2:-32768}; CTX_SET=${2:+1}; PORT=${3:-8080}
+D=${1:?usage: run.sh DATA [CTX|256k|512k] [PORT] [--vision-device cpu|GPU-UUID] [--vision-residency auto|resident|on-demand]}
+shift
+CTX=32768; CTX_SET=; PORT=8080
+if [ $# -gt 0 ] && [[ "$1" != --* ]]; then CTX=${1:-32768}; CTX_SET=${1:+1}; shift; fi
+if [ $# -gt 0 ] && [[ "$1" != --* ]]; then PORT=${1:-8080}; shift; fi
+DEVICE=${INK2_VISION_DEVICE-cpu}
+RESIDENCY=${INK2_VISION_RESIDENCY-auto}
+while [ $# -gt 0 ]; do
+  [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }
+  case "$1" in
+    --vision-device) DEVICE=$2 ;;
+    --vision-residency) RESIDENCY=$2 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift 2
+done
+case "$RESIDENCY" in
+  auto|resident|on-demand) ;;
+  *) echo "vision residency must be auto, resident or on-demand" >&2; exit 2 ;;
+esac
+[[ "$DEVICE" == cpu || "$DEVICE" =~ ^GPU-[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] ||
+  { echo "vision device must be cpu or a full NVIDIA GPU UUID" >&2; exit 2; }
 case "$CTX" in 256k|256K) CTX=262144 ;; 512k|512K) CTX=524288 ;; esac
 [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -le 524288 ] || { echo "CTX: a number up to 524288, 256k or 512k" >&2; exit 2; }
 # everything below (this script's, the engine's and the server's lines) also goes to a log file, each line with its time:
@@ -84,7 +105,14 @@ if [ -n "${INK2_MULTI:-}" ]; then   # several conversations at once (test builds
   "$D/venv/bin/python" "$H/serve/make_multi.py" "$H/serve/ink2_server.py" "$SERVER" "ink2_$INK2_MULTI" >&2 || exit 1
 fi
 MMPROJ=$D/mmproj-Inkling-2-Mini-BF16.gguf; VIS=()
-if [ "${INK2_PICTURES:-1}" != 0 ] && [ -f "$MMPROJ" ] && [ -x "$B/ink2_vis" ]; then VIS=(--mmproj "$MMPROJ" --vis "$B/ink2_vis"); fi
+ENCODER=$B/ink2_vis
+if [ "$DEVICE" != cpu ]; then ENCODER=$B/ink2_vis_cuda; fi
+if [ "${INK2_PICTURES:-1}" != 0 ] && [ -f "$MMPROJ" ] && [ -x "$ENCODER" ]; then
+  VIS=(--mmproj "$MMPROJ" --vis "$ENCODER")
+elif [ "$DEVICE" != cpu ] || [ "$RESIDENCY" = resident ]; then
+  echo "requested vision configuration requires pictures, the projector, and $ENCODER" >&2
+  exit 2
+fi
 echo "run.sh: $MODE, context $CTX ($([ "$CTX" -gt 262144 ] && echo "KV int8 from row 32768" || echo "KV f16")), pictures $([ ${#VIS[@]} -gt 0 ] && echo on || echo off), port $PORT, commit $(git -C "$H" log -1 --format=%h 2>/dev/null || echo ?)" >&2
 SOCK=$D/ink2-$PORT.sock
 rm -f "$SOCK"
@@ -96,4 +124,4 @@ for i in $(seq 180); do [ -S "$SOCK" ] && break; kill -0 $EP 2>/dev/null || { ec
 export INK2_ENGINE_PID=$EP
 TOK=(); [ -x "$B/ink2_tok" ] && TOK=(--tok "$B/ink2_tok")   # the tokenizer that stays up (a build from before it: llama-tokenize a request)
 "$D/venv/bin/python" "$SERVER" --port "$PORT" --sock "$SOCK" --ctx "$CTX" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" \
-  --tokenizer "$B/llama.cpp/build/bin/llama-tokenize" --gguf-py "$B/llama.cpp/gguf-py" ${VIS[@]+"${VIS[@]}"} ${TOK[@]+"${TOK[@]}"} ${SL[@]+"${SL[@]}"}
+  --tokenizer "$B/llama.cpp/build/bin/llama-tokenize" --gguf-py "$B/llama.cpp/gguf-py" --vision-device "$DEVICE" --vision-residency "$RESIDENCY" ${VIS[@]+"${VIS[@]}"} ${TOK[@]+"${TOK[@]}"} ${SL[@]+"${SL[@]}"}

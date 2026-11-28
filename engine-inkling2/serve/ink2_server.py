@@ -7,8 +7,8 @@ client expects: /health, /props, /slots, /tokenize, /apply-template, /metrics, /
 without "stream". The prompt is Inkling 2's chat template as text (tools go in as the template's tool_declare and the model's
 <|content_invoke_tool_json|> calls come back as tool_calls), tokens come from llama.cpp's llama-tokenize (vocabulary only), text
 back from the GGUF vocabulary (GPT-2 byte level). Pictures with --mmproj and --vis: an image_url part (a data: URL, an http(s)
-URL or a local path) goes through ink2_vis (llama.cpp's mtmd projector on the CPU, ~20 s for 1600x900 = 920 rows; the rows are
-cached by the picture's SHA-256 in INK2_IMG_DIR, default /tmp/ink2-img) and its rows take the template's picture placeholder. Greedy by default. Set
+URL or a local path) goes through ink2_vis, llama.cpp's mtmd projector. Use --vision-device to select CPU or one NVIDIA GPU.
+The projector's embedding rows replace the template's picture placeholder. Greedy by default. Set
 INK2_SAMPLING=1 to enable per-request sampling. Drafts: DSpark (MTP) 3 + prompt lookup 15 unless a request says
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
@@ -37,18 +37,20 @@ import array
 import base64
 import codecs
 import collections
+from contextlib import contextmanager
 import hashlib
 import json
 import math
 import os
 import re
 import select
+import signal
 import socket
 import subprocess
+import tempfile
 import sys
 import threading
 import time
-import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,7 +67,21 @@ ap.add_argument("--gguf-py", required=True, help="llama.cpp's gguf-py folder (kn
 ap.add_argument("--mmproj", default="", help="the vision projector GGUF; none = text only")
 ap.add_argument("--tok", default="", help="ink2_tok (the tokenizer that stays up); none = llama-tokenize once a request")
 ap.add_argument("--vis", default="", help="ink2_vis (build/ink2_vis, the image encoder)")
+ap.add_argument("--vision-device", default=os.environ.get("INK2_VISION_DEVICE", "cpu"),
+                help="cpu (default) or the CUDA GPU UUID for the image encoder")
+ap.add_argument("--vision-residency", default=os.environ.get("INK2_VISION_RESIDENCY", "auto"),
+                choices=("auto", "resident", "on-demand"), help="projector lifecycle (auto: resident on GPU)")
 A, _ = ap.parse_known_args()
+if A.vision_residency not in ("auto", "resident", "on-demand"):
+    ap.error("INK2_VISION_RESIDENCY must be auto, resident or on-demand")
+VISION_RESIDENT = A.vision_residency == "resident" or (A.vision_residency == "auto" and A.vision_device != "cpu")
+if A.vision_device != "cpu" and not re.fullmatch(
+        r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", A.vision_device):
+    ap.error("--vision-device must be cpu or a full NVIDIA GPU UUID")
+if bool(A.mmproj) != bool(A.vis):
+    ap.error("--mmproj and --vis must be supplied together")
+if (A.vision_device != "cpu" or A.vision_residency == "resident") and not A.vis:
+    ap.error("the requested vision configuration requires --mmproj and --vis")
 TOKENIZE = A.tokenizer
 sys.path.insert(0, A.gguf_py)
 import gguf  # noqa: E402
@@ -318,78 +334,263 @@ def tokenize(text):
     return TOKENS.ids(text)[0]
 
 
-VIS = {"proc": None, "lock": threading.Lock(), "cache": {}}
-IMG_DIR = Path(os.environ.get("INK2_IMG_DIR", "/tmp/ink2-img"))
+class VisionInputError(ValueError):
+    pass
 
 
-def _image_bytes(src):
+PRIVATE_IMAGES = None
+if A.vis:
+    image_parent = os.environ.get("INK2_IMG_DIR")
+    if image_parent:
+        Path(image_parent).mkdir(parents=True, exist_ok=True)
+    PRIVATE_IMAGES = tempfile.TemporaryDirectory(prefix="ink2-images-", dir=image_parent)
+
+VISION_BATCH_GATE = threading.Lock()
+VIS = {"batches": 0, "proc": None, "lock": threading.Lock(), "ids": collections.OrderedDict(), "next_id": IMG_BASE,
+       "embeddings": collections.OrderedDict(), "embedding_bytes": 0, "engine_initialized": False}
+VISION_SLOTS = threading.BoundedSemaphore(2)
+VISION_SECONDS = 180
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 16 << 20
+MAX_IMAGE_ROWS = 4096
+IMAGE_WIDTH = 2304
+IMAGE_ID_CACHE = 1024
+IMAGE_CACHE_BYTES = 64 << 20
+
+
+def download_image(src, check):
+    """Keep the image deadline and client checks active across DNS, headers and body reads."""
+    proc = subprocess.Popen(["curl", "-q", "--silent", "--fail", "--globoff", "--location", "--max-redirs", "5",
+                             "--proto", "=http,https", "--proto-redir", "=http,https",
+                             "--max-time", str(VISION_SECONDS), "--", src],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    try:
+        fd = proc.stdout.fileno()
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        data = bytearray()
+        while True:
+            check()
+            if not poller.poll(100):
+                continue
+            chunk = os.read(fd, min(65536, MAX_IMAGE_BYTES + 1 - len(data)))
+            if not chunk:
+                result = proc.wait(timeout=1)
+                if result == 28:
+                    raise TimeoutError("timed out downloading the image")
+                if result != 0:
+                    raise VisionInputError("could not download the image")
+                return bytes(data)
+            data.extend(chunk)
+            if len(data) > MAX_IMAGE_BYTES:
+                raise VisionInputError("image exceeds the encoded size limit")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=1)
+        proc.stdout.close()
+
+
+def _image_bytes(src, check):
     if src.startswith("data:"):
-        return base64.b64decode(src.split(",", 1)[1])
-    if src.startswith(("http://", "https://")):
-        with urllib.request.urlopen(src, timeout=60) as r:
-            return r.read()
-    return Path(src).read_bytes()
+        _, sep, payload = src.partition(",")
+        if not sep:
+            raise VisionInputError("invalid inline image")
+        if len(payload) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+            raise VisionInputError("image exceeds the encoded size limit")
+        try:
+            data = base64.b64decode(payload)
+        except ValueError as ex:
+            raise VisionInputError("invalid base64 image") from ex
+    elif src.startswith(("http://", "https://")):
+        data = download_image(src, check)
+    else:
+        if not Path(src).is_file():
+            raise VisionInputError("the image path must refer to a regular file")
+        with open(src, "rb") as source:
+            data = source.read(MAX_IMAGE_BYTES + 1)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise VisionInputError("image exceeds the encoded size limit")
+    return data
 
 
-def encode_image(src):
-    """(hash, rows file, rows): the picture's projector rows from ink2_vis, cached by its SHA-256."""
-    data = _image_bytes(src)
-    h = hashlib.sha256(data).hexdigest()
-    hit = VIS["cache"].get(h)
-    if hit and Path(hit[0]).exists():
-        return h, hit[0], hit[1]
-    IMG_DIR.mkdir(parents=True, exist_ok=True)
-    img, rows = IMG_DIR / f"{h}.img", IMG_DIR / f"{h}.f32"
-    img.write_bytes(data)
-    with VIS["lock"]:
-        if VIS["proc"] is None or VIS["proc"].poll() is not None:
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES="")   # the cards are the engine's
-            VIS["proc"] = subprocess.Popen([A.vis, "--mmproj", A.mmproj, "--model", A.model, "--max-tokens", "4096"],
-                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
-            first = VIS["proc"].stdout.readline().split()
-            if not first or first[0] != "ready":
-                raise RuntimeError("ink2_vis did not start")
-        VIS["proc"].stdin.write(f"{img} {rows}\n")
-        VIS["proc"].stdin.flush()
-        ans = VIS["proc"].stdout.readline().split()
-    if not ans or ans[0] != "ok":
-        raise RuntimeError("ink2_vis: " + " ".join(ans))
-    n = int(ans[1])
-    VIS["cache"][h] = (str(rows), n)
-    print(f"ink2_server: picture {h[:12]}: {n} rows in {ans[3]} ms", file=sys.stderr, flush=True)
-    return h, str(rows), n
+def stop_vision():
+    proc = VIS["proc"]
+    if proc is None:
+        return
+    if proc.returncode is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        return
+    proc.stdin.close()
+    proc.stdout.close()
+    VIS["proc"] = None
 
 
-def place_images(ids, images, starts=None):
-    """ids with every placeholder replaced by its picture's rows, and the engine's image fields; starts (the pieces' offsets)
-    move with the rows put in before them."""
-    if not images:
-        return ids, {}
-    ph = [i for i, t in enumerate(ids) if t == T_IMGPH]
+def vision_fields(proc, check):
+    fd = proc.stdout.fileno()
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    line = bytearray()
+    while b"\n" not in line:
+        check()
+        if not poller.poll(100):
+            continue
+        chunk = os.read(fd, 256)
+        if not chunk:
+            raise RuntimeError(f"ink2_vis exited on {A.vision_device}; see server log")
+        line.extend(chunk)
+        if len(line) > 4096:
+            raise RuntimeError("ink2_vis returned an oversized response")
+    return line.split(b"\n", 1)[0].decode("utf-8").split()
+
+
+def image_id(digest, count):
+    """Keep IDs stable for recent images. Evicted ranges are never reused."""
+    old = VIS["ids"].pop(digest, None)
+    if old is not None and old[1] == count:
+        base = old[0]
+    else:
+        base = VIS["next_id"]
+        if base + count > 1 << 31:
+            raise RuntimeError("image token IDs exhausted; restart the engine and server together")
+        VIS["next_id"] += count
+    VIS["ids"][digest] = (base, count)
+    if len(VIS["ids"]) > IMAGE_ID_CACHE:
+        VIS["ids"].popitem(last=False)
+    return base
+
+
+def start_vision(check):
+    """Start the projector and wait for READY. The caller owns the encoder lock after startup."""
+    if VIS["proc"] is not None and VIS["proc"].poll() is not None:
+        stop_vision()
+    if VIS["proc"] is None:
+        gpu = A.vision_device != "cpu"
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=A.vision_device if gpu else "")
+        exe = os.path.abspath(A.vis) if os.path.dirname(A.vis) else A.vis
+        args = [exe, "--mmproj", os.path.abspath(A.mmproj), "--model", os.path.abspath(A.model),
+                "--max-tokens", str(MAX_IMAGE_ROWS)]
+        if gpu:
+            args.append("--gpu")
+        VIS["proc"] = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+                                       cwd=PRIVATE_IMAGES.name, start_new_session=True, env=env)
+        os.set_blocking(VIS["proc"].stdin.fileno(), False)
+        if vision_fields(VIS["proc"], check) != ["ready", str(IMAGE_WIDTH)]:
+            raise RuntimeError(f"ink2_vis could not start on {A.vision_device}; see server log")
+
+
+def preload_vision():
+    if not (A.vis and VISION_RESIDENT):
+        return
+    deadline = time.monotonic() + VISION_SECONDS
+
+    def check():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out starting the vision projector on {A.vision_device}")
+
+    start_vision(check)
+    print(f"ink2_server: resident vision projector ready on {A.vision_device}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def vision_batch():
+    """Keep an on-demand projector until the last active image preparation finishes."""
+    if A.vision_residency != "on-demand":
+        yield
+        return
+    with VISION_BATCH_GATE:
+        VIS["batches"] += 1
+    try:
+        yield
+    finally:
+        with VISION_BATCH_GATE:
+            VIS["batches"] -= 1
+            if not VIS["batches"]:
+                stop_vision()
+
+
+def encode_image(src, work, check):
+    check()
+    data = _image_bytes(src, check)
+    digest = hashlib.sha256(data).digest()
+    img, rows = work / "input.img", work / "image.f32"
+    lock = VIS["lock"]
+    while not lock.acquire(timeout=0.1):
+        check()
+    try:
+        check()
+        cache = VIS["embeddings"]
+        hit = cache.get(digest)
+        if hit is not None:
+            cache.move_to_end(digest)
+            values, count = hit
+            return image_id(digest, count), values, count
+        start_vision(check)
+        img.write_bytes(data)
+        proc = VIS["proc"]
+        command = f"{work.name}/{img.name} {work.name}/{rows.name}\n".encode()
+        if proc.stdin.write(command) != len(command):
+            raise RuntimeError("ink2_vis did not accept the image")
+        answer = vision_fields(proc, check)
+        if answer and answer[0] == "err":
+            raise VisionInputError("the projector could not decode this image")
+        if len(answer) != 4 or answer[0] != "ok" or not answer[1].isdigit() or answer[2] != str(IMAGE_WIDTH):
+            raise RuntimeError("invalid ink2_vis response")
+        count = int(answer[1])
+        expected = count * IMAGE_WIDTH * 4
+        if not 1 <= count <= MAX_IMAGE_ROWS or not rows.is_file() or rows.stat().st_size != expected:
+            raise RuntimeError("invalid ink2_vis embedding file")
+        values = rows.read_bytes()
+        if len(values) != expected:
+            raise RuntimeError("invalid ink2_vis embedding file")
+        if len(values) <= IMAGE_CACHE_BYTES:
+            while VIS["embedding_bytes"] + len(values) > IMAGE_CACHE_BYTES:
+                _, (evicted, _) = cache.popitem(last=False)
+                VIS["embedding_bytes"] -= len(evicted)
+            cache[digest] = (values, count)
+            VIS["embedding_bytes"] += len(values)
+        return image_id(digest, count), values, count
+    except VisionInputError:
+        raise
+    except Exception:
+        stop_vision()
+        raise
+    finally:
+        try:
+            img.unlink(missing_ok=True)
+            rows.unlink(missing_ok=True)
+        finally:
+            lock.release()
+
+
+def place_images(ids, images, starts, work, check):
+    """Replace image placeholders and write one request-private file for the native engine."""
+    ph = [i for i, token in enumerate(ids) if token == T_IMGPH]
     if len(ph) != len(images):
-        raise RuntimeError(f"{len(images)} pictures, {len(ph)} placeholders")
-    if not A.mmproj or not A.vis:
-        raise RuntimeError("this server reads no pictures (start it with --mmproj and --vis)")
-    enc = [encode_image(src) for src in images]
-    out, table, files, off, last = [], [], [], 0, 0
-    for (h, f, n), at in zip(enc, ph):
-        out += ids[last:at]
-        id0 = IMG_BASE + (int(h[:4], 16) << 12)
-        out += [id0 + r for r in range(n)]
-        table += [id0, n, off]
-        files.append(f)
-        off += n
-        last = at + 1
-    out += ids[last:]
-    if starts:
-        grow = [(at, n - 1) for (_, _, n), at in zip(enc, ph)]
-        starts[:] = [x + sum(g for at, g in grow if at < x) for x in starts]
-    comb = IMG_DIR / ("request-" + hashlib.sha256("".join(h for h, _, _ in enc).encode()).hexdigest()[:16] + ".f32")
-    if not comb.exists():
-        with open(comb, "wb") as w:
-            for f in files:
-                w.write(Path(f).read_bytes())
-    return out, {"img": table, "embd": str(comb)}
+        raise VisionInputError(f"{len(images)} pictures, {len(ph)} placeholders")
+    out, table, growth, offset, last = [], [], [], 0, 0
+    combined = work / "request.f32"
+    with vision_batch(), combined.open("wb") as target:
+        for src, at in zip(images, ph):
+            base, rows, count = encode_image(src, work, check)
+            if len(ids) + offset + count - len(growth) - 1 >= A.ctx - 1:
+                raise VisionInputError(f"image embeddings exceed the context of {A.ctx} tokens")
+            out.extend(ids[last:at])
+            out.extend(range(base, base + count))
+            table.extend((base, count, offset))
+            target.write(rows)
+            growth.append((at, count - 1))
+            offset += count
+            last = at + 1
+    out.extend(ids[last:])
+    starts[:] = [x + sum(delta for at, delta in growth if at < x) for x in starts]
+    return out, {"img": table, "embd": str(combined)}
 
 
 SAMPLING = int(os.environ.get("INK2_SAMPLING", "0"))   # p76: 1 = the request's temperature / min_p / seed (0: greedy)
@@ -915,9 +1116,11 @@ def reply(ids, mx, req, service, on_part=None, mode="c", stream_names=(), budget
             return out, tot, stopped
         cut = set(i for a, b in hidden for i in range(a, b))
         return [t for i, t in enumerate(out) if i not in cut], tot, stopped
+    req = dict(req)
     while True:
         t_req, t_first, final, keep = time.time(), None, None, None
         lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1), service)
+        req.pop("forget", None)
         try:
             for msg in lines:
                 if "error" in msg:
@@ -1207,7 +1410,6 @@ class H(BaseHTTPRequestHandler):
             images = []
             ids, starts = TOKENS.ids(render(body.get("messages") or [], effort_of(body), tools, images))
             t_tok = time.time() - t0
-            ids, img_req = place_images(ids, images, starts)
             stream_names = set()
             if body.get("stream") and STREAM_TOOL_ARGUMENTS:
                 for tool in tools or []:
@@ -1217,6 +1419,63 @@ class H(BaseHTTPRequestHandler):
                             stream_names.add(name)
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
+        try:
+            mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0)
+            mtp, lookup = int(body.get("mtp", MTP)), int(body.get("lookup", LOOKUP))
+        except (TypeError, ValueError, OverflowError):
+            return self._send(400, {"error": {"message": "invalid generation settings"}})
+        settings = (mx, mtp, lookup)
+        if not images:
+            return self._complete_chat(body, ids, starts, {}, stream_names, t0, t_tok, settings)
+        if not A.vis:
+            return self._send(400, {"error": {"message": "this server does not accept images"}})
+        if len(images) > MAX_IMAGES:
+            return self._send(400, {"error": {"message": f"a request may contain at most {MAX_IMAGES} images"}})
+        if not VISION_SLOTS.acquire(blocking=False):
+            return self._send(503, {"error": {"message": "vision requests are busy"}})
+        deadline = time.monotonic() + VISION_SECONDS
+        stream = ChatStream(self, "chatcmpl-" + uuid.uuid4().hex[:24], int(t0)) if body.get("stream") else None
+
+        def check_vision():
+            if self._gone():
+                raise ClientDisconnected
+            if stream:
+                stream.keepalive()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for the vision projector")
+
+        def vision_error(status, ex):
+            error = {"error": {"message": str(ex)}}
+            try:
+                if stream:
+                    stream.data(error)
+                else:
+                    return self._send(status, error)
+            except (ClientDisconnected, BrokenPipeError, ConnectionResetError):
+                pass
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="request-", dir=PRIVATE_IMAGES.name) as work:
+                try:
+                    if stream:
+                        stream.start()
+                    check_vision()
+                    ids, img_req = place_images(ids, images, starts, Path(work), check_vision)
+                except ClientDisconnected:
+                    return
+                except VisionInputError as ex:
+                    return vision_error(400, ex)
+                except TimeoutError as ex:
+                    return vision_error(504, ex)
+                except Exception as ex:
+                    return vision_error(500, ex)
+                return self._complete_chat(body, ids, starts, img_req, stream_names, t0, t_tok, settings, stream)
+        finally:
+            VISION_SLOTS.release()
+
+    def _complete_chat(self, body, ids, starts, img_req, stream_names, t0, t_tok, settings, stream=None):
+        mx, mtp, lookup = settings
+        tools = body.get("tools") if body.get("tool_choice") != "none" else None
         loop, n_ids = turn_loop(body.get("messages") or []) if tools else None, len(ids)
         if loop:
             what = " and ".join(dict.fromkeys(name for name, _ in loop[1]))
@@ -1231,19 +1490,26 @@ class H(BaseHTTPRequestHandler):
                 print(f"ink2_server: a loop across turns: the note could not be tokenized ({ex})", file=sys.stderr, flush=True)
                 loop = None
         if len(ids) >= A.ctx - 1:
-            return self._send(400, {"error": {"message": f"prompt of {len(ids)} tokens exceeds the context of {A.ctx}", "type": "exceed_context_size_error"}})
-        try:
-            mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
-            mtp, lookup = int(body.get("mtp", MTP)), int(body.get("lookup", LOOKUP))
-        except (TypeError, ValueError, OverflowError):
-            return self._send(400, {"error": {"message": "invalid generation settings"}})
-        mx = max(1, min(mx, A.ctx - len(ids) - 1))
+            error = {"error": {"message": f"prompt of {len(ids)} tokens exceeds the context of {A.ctx}",
+                               "type": "exceed_context_size_error"}}
+            if stream:
+                try:
+                    stream.data(error)
+                except ClientDisconnected:
+                    pass
+                return
+            return self._send(400, error)
+        mx = max(1, min(mx or A.ctx, A.ctx - len(ids) - 1))
         req = {"stop": [EOS], "mtp": mtp, "lookup": lookup, **img_req, **sampling_of(body),
                "ckpt": [x for x in starts if x < n_ids - 8][-4096:]}
         if loop and LOOP_DROP:
             stream_names.difference_update(name for name, _ in loop[1])
         cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(t0)
-        stream = ChatStream(self, cid, created) if body.get("stream") else None
+        new_stream = stream is None and body.get("stream")
+        if new_stream:
+            stream = ChatStream(self, cid, created)
+        elif stream:
+            cid = stream.chunk["id"]
 
         def service():
             if self._gone():
@@ -1253,7 +1519,7 @@ class H(BaseHTTPRequestHandler):
 
         acquired = False
         try:
-            if stream:
+            if new_stream:
                 stream.start()
             service()
             acquired = LOCK.acquire(blocking=False)
@@ -1309,9 +1575,14 @@ class H(BaseHTTPRequestHandler):
 
             if stream and loop and note:
                 on_part("r", note)
+            if img_req and not VIS["engine_initialized"]:
+                # A separately restarted HTTP server may attach to an engine with old image IDs.
+                req["forget"] = 1
             out, tot, stopped = reply(ids, mx, req, engine_service, on_part if stream else None,
                                       mode="r" if loop and note else "c", stream_names=stream_names,
                                       budget=think_budget(effort_of(body), bool(tools)), tools=bool(tools))
+            if img_req:
+                VIS["engine_initialized"] = True
             n = len(out)
             STATE["tokens_out"] += n
             if not tot["cuts"] and not tot.get("budget"):   # a cut reads its kept part again, so its read_s is no measure (p75 too)
@@ -1421,16 +1692,22 @@ def _stop(*_):   # the node stops a profile with SIGTERM to this process: the en
             os.kill(pid, 15)
         except OSError:
             pass
+    stop_vision()
+    if PRIVATE_IMAGES:
+        PRIVATE_IMAGES.cleanup()
     os._exit(0)
 
 
 if __name__ == "__main__":
-    import signal
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    srv = ThreadingHTTPServer((A.host, A.port), H)
-    srv.daemon_threads = True
-    if LOG_EVERY > 0:
-        threading.Thread(target=ticker, daemon=True).start()
-    print(f"ink2_server: {A.alias} on {A.host}:{A.port}, ctx {A.ctx}, engine {A.sock}", file=sys.stderr, flush=True)
-    srv.serve_forever()
+    try:
+        preload_vision()
+        srv = ThreadingHTTPServer((A.host, A.port), H)
+        srv.daemon_threads = True
+        if LOG_EVERY > 0:
+            threading.Thread(target=ticker, daemon=True).start()
+        print(f"ink2_server: {A.alias} on {A.host}:{A.port}, ctx {A.ctx}, engine {A.sock}", file=sys.stderr, flush=True)
+        srv.serve_forever()
+    finally:
+        stop_vision()

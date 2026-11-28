@@ -60,3 +60,21 @@ for cancellation between prefill chunks. These checks require rebuilding `ink2_v
 
 Measured on one machine only (2× P100 16 GB, PCIe 3.0 x16 each, 99 GiB RAM, CUDA 12.4). MIT, like the rest of the repository;
 the model's own license applies to its weights.
+
+### Vision projector device and residency
+
+The projector uses the CPU and loads on the first image by default. To use a GPU, run `build.sh` first, then run
+`bash engine-inkling2/build-vision-cuda.sh` to build the CUDA helper. The helper builds for Pascal compute capabilities
+6.0 and 6.1 by default. Set `INK2_VISION_CUDA_ARCHITECTURES` to select different targets.
+
+Run `nvidia-smi -L` to find the GPU UUID and pass it as `--vision-device GPU-…` to `run.sh`. The same option can be
+set with `INK2_VISION_DEVICE`. The projector's device selection applies to the helper process. The engine retains its
+own CUDA device selection.
+
+Use `--vision-residency` or `INK2_VISION_RESIDENCY` to choose `auto` (load the GPU projector at startup and retain it,
+load the CPU projector on first use), `resident` (preload and retain either device), or `on-demand` (release after image
+preparation and reuse recent embeddings). A GPU selection requires the CUDA helper and projector weights. The server
+reports a startup or encoding failure if the selected device is unavailable. Requests can contain up to four images,
+each up to 16 MiB encoded. The experimental multi-conversation builds continue to serve text only.
+
+Run `python3 engine-inkling2/tools/vision_device_check.py` to check device selection and lifecycle with a simulated helper.

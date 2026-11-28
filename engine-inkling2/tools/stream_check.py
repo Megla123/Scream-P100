@@ -19,7 +19,7 @@ from unittest.mock import patch
 SERVER = Path(__file__).resolve().parents[1] / "serve" / "ink2_server.py"
 
 
-def load_server(directory):
+def load_server(directory, *, extra_args=(), settings=None):
     direct = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
     extended = iter(range(256, 512))
     vocab = [chr(i if i in direct else next(extended)).encode() for i in range(256)]
@@ -33,8 +33,8 @@ def load_server(directory):
             "--tokenizer", "stub", "--gguf-py", str(directory)]
     spec = importlib.util.spec_from_file_location("ink2_server_fixture", SERVER)
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(os.environ, {"INK2_STREAM_TOOL_ARGUMENTS": "1"}), patch.dict(sys.modules, {"gguf": gguf}):
-        with patch.object(sys, "argv", [str(SERVER), *args]), patch.object(sys, "path", sys.path[:]):
+    with patch.dict(os.environ, {"INK2_STREAM_TOOL_ARGUMENTS": "1", **(settings or {})}), patch.dict(sys.modules, {"gguf": gguf}):
+        with patch.object(sys, "argv", [str(SERVER), *args, *extra_args]), patch.object(sys, "path", sys.path[:]):
             spec.loader.exec_module(module)
     module.TOKENS = SimpleNamespace(ids=lambda _: ([1, 2], []))
     module.KEEPALIVE_SECONDS = 0.05
