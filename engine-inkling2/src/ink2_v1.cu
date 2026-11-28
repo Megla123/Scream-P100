@@ -15,6 +15,7 @@
 
 #include <cublas_v2.h>
 
+#include <poll.h>
 #include <pthread.h>   // p41
 #include <sched.h>
 #include <sys/socket.h>
@@ -186,6 +187,8 @@ struct Xch {
     volatile unsigned* flag[NC];
     unsigned long long* ll[NC][2] = {};   // p52: the 8-byte word buffers (INK2_XLL)
 };
+
+struct PrefillCancelled {};
 
 struct Engine {
     GgufMin g;
@@ -3343,11 +3346,12 @@ struct Engine {
         return false;
     }
     // feeds tokens (windows of MAXT); returns the logits rows of the last window (all its rows when all_rows)
-    int feed(const int* ids, int n, bool all_rows) {
+    int feed(const int* ids, int n, bool all_rows, const std::function<bool()>* cancelled = nullptr) {
         int T = 0;
         d2_from = n_past + n - (D2WIN + DBLK);   // p74
         bool dropped = false;   // p63
         for (int i = 0; i < n; i += T) {
+            if (cancelled && (*cancelled)()) throw PrefillCancelled{};
             if (!all_rows && (n - i >= pf_min || force_pf)) {   // p3: the reading path, chunks of up to pfc (p43: always while dumping)
                 if (share1c && !dropped) {   // p63: the cache's slots in the reading path's buffers are emptied first
                     dropped = true;
@@ -3854,7 +3858,8 @@ static unsigned long long fnv_row(unsigned long long h, const float* row) {
     return h;
 }
 static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::vector<int>& stop, int eos, int lookup = 0, int mtp = 0,
-                    const std::function<bool(const int*, int)>* on_out = nullptr, const std::vector<int>* hints = nullptr) {
+                    const std::function<bool(const int*, int)>* on_out = nullptr, const std::vector<int>* hints = nullptr,
+                    const std::function<bool()>* cancelled = nullptr) {
     Gen g;
     e.want_logits = true;   // p47
     size_t sent = 0;
@@ -3932,20 +3937,21 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         }
         at = (int) same;
         for (int st : stops) {
-            e.feed(tok.data() + at, st - at, false);
+            e.feed(tok.data() + at, st - at, false, cancelled);
             at = st;
             const double tc = now_s();
             e.ck_take();
             g.ck_s += now_s() - tc;
         }
-        e.feed(tok.data() + at, n - at, false);
+        e.feed(tok.data() + at, n - at, false, cancelled);
     } else if (snap && n - (int) same >= 2) {   // p8: all but the last token, the snapshot, then the last token
-        e.feed(tok.data() + same, n - 1 - (int) same, false);
+        e.feed(tok.data() + same, n - 1 - (int) same, false, cancelled);
         e.snapshot();
-        e.feed(tok.data() + n - 1, 1, false);
+        e.feed(tok.data() + n - 1, 1, false, cancelled);
     } else {
-        e.feed(tok.data() + same, n - (int) same, false);
+        e.feed(tok.data() + same, n - (int) same, false, cancelled);
     }
+    if (cancelled && (*cancelled)()) throw PrefillCancelled{};
     g.read_s = now_s() - t0;
     {   // p21: FNV-1a of the logits after the prompt (tests compare a read after going back with a read from the start)
         unsigned long long h = 1469598103934665603ULL;
@@ -4026,6 +4032,11 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
     return g;
 }
 
+static bool peer_gone(int fd) {
+    pollfd peer{fd, 0, 0};
+    return poll(&peer, 1, 0) > 0 && (peer.revents & (POLLHUP | POLLERR | POLLNVAL));
+}
+
 static int serve(Engine& e, const std::string& path, int eos) {
     const int s = socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un a{};
@@ -4041,6 +4052,7 @@ static int serve(Engine& e, const std::string& path, int eos) {
     for (;;) {
         const int c = accept(s, nullptr, nullptr);
         if (c < 0) continue;
+        const std::function<bool()> cancelled = [c] { return peer_gone(c); };
         std::string req;
         char buf[1 << 16];
         for (;;) {
@@ -4052,6 +4064,11 @@ static int serve(Engine& e, const std::string& path, int eos) {
         if (json_int(req, "exit", 0)) {
             close(c);
             break;
+        }
+        // Requests canceled in the socket backlog can still contain a whole prompt.
+        if (cancelled()) {
+            close(c);
+            continue;
         }
         std::string rep;
         try {
@@ -4128,7 +4145,7 @@ static int serve(Engine& e, const std::string& path, int eos) {
             std::vector<int> hints;   // p21: where the prompt's messages start
             for (long long x : json_ints(req, "ckpt")) hints.push_back((int) x);
             Gen g = generate(e, tok, max, stop, json_int(req, "noeos", 0) ? -1 : eos, (int) json_int(req, "lookup", 0),
-                             (int) json_int(req, "mtp", 0), streaming ? &out_line : nullptr, &hints);   // noeos: a fixed length
+                             (int) json_int(req, "mtp", 0), streaming ? &out_line : nullptr, &hints, &cancelled);   // noeos: a fixed length
             rep = "{\"tokens\": [";
             for (size_t i = 0; i < g.out.size(); ++i) rep += (i ? ", " : "") + std::to_string(g.out[i]);
             char hd[640];
@@ -4139,6 +4156,10 @@ static int serve(Engine& e, const std::string& path, int eos) {
                           tok.size(), g.cached, g.read_s, g.write_s, g.drafted, g.accepted, g.rounds, g.draft_s, g.verify_s, g.back,
                           e.ckpts.size(), g.ck_s, g.park, e.parks.size(), e.park_bytes >> 20, g.lh, g.lh2);
             rep += hd;
+        } catch (const PrefillCancelled&) {
+            // feed() only checks between windows, with the processed prefix still valid.
+            close(c);
+            continue;
         } catch (const std::exception& ex) {
             e.reset();
             rep = std::string("{\"error\": \"") + ex.what() + "\"}\n";

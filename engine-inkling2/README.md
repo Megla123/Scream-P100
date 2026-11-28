@@ -27,6 +27,12 @@ python3 engine-inkling2/tools/conversation_check.py http://127.0.0.1:8080
 python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # with INK2_MULTI: speed at once, alone = together
 ```
 
+Streaming responses send SSE comments after 15 seconds without output, including while queued or reading the prompt.
+Set `INK2_STREAM_TOOL_ARGUMENTS=1` on the server to enable incremental arguments for declared functions in the standard
+Inkling tool format. The default sends whole tool calls. The native engine skips disconnected socket requests and checks
+for cancellation between prefill chunks. These checks require rebuilding `ink2_v1`. Run
+`python3 engine-inkling2/tools/stream_check.py` to verify the HTTP protocol and disconnect handling with a simulated engine.
+
 | Path | What |
 |---|---|
 | `src/ink2_v1.cu` | the engine: loading and splitting, the writing path, the reading path (2,048-token chunks), drafts, checkpoints and parked conversations, the socket server; since 24 Nov the one-card code (`src-1c/`) built for two cards with p38-p41 (the reading exchange's buffers on each card's NUMA node, `INK2_NUMA`); since 26 Nov also `build/ink2_1c` (`-DINK2_NC=1`), with p63 (one card: cache slots in the reading path's buffers, `INK2_1C_SHARE`) |

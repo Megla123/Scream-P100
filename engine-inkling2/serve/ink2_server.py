@@ -8,8 +8,8 @@ without "stream". The prompt is Inkling 2's chat template as text (tools go in a
 <|content_invoke_tool_json|> calls come back as tool_calls), tokens come from llama.cpp's llama-tokenize (vocabulary only), text
 back from the GGUF vocabulary (GPT-2 byte level). Pictures with --mmproj and --vis: an image_url part (a data: URL, an http(s)
 URL or a local path) goes through ink2_vis (llama.cpp's mtmd projector on the CPU, ~20 s for 1600x900 = 920 rows; the rows are
-cached by the picture's SHA-256 in INK2_IMG_DIR, default /tmp/ink2-img) and its rows take the template's picture placeholder. Greedy only: the engine
-has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 + prompt lookup 15 unless a request says
+cached by the picture's SHA-256 in INK2_IMG_DIR, default /tmp/ink2-img) and its rows take the template's picture placeholder. Greedy by default. Set
+INK2_SAMPLING=1 to enable per-request sampling. Drafts: DSpark (MTP) 3 + prompt lookup 15 unless a request says
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
 "Thinking effort level"; a request with none gets INK2_EFFORT (low = 0.2 since 23 Nov, was 0.9: on our sets low gave the best
@@ -17,7 +17,8 @@ code in the fewest tokens, medium more tokens, worse code and empty answers), an
 reasoning (the prompt ends with the answer's start). A tool call written as {"name":"X"args":{..}} (the comma before "args"
 left out, the model's own pick on some prompts) is read as the call. One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
 generation, also in a part that streams nothing (a tool call). SIGTERM stops the engine too when INK2_ENGINE_PID is set
-(run.sh does). A reasoning that falls into repeating itself word for word (greedy decoding can) is cut after its first copy
+(run.sh does). Streaming sends SSE comments during idle waits. INK2_STREAM_TOOL_ARGUMENTS=1 also streams arguments for
+recognized function calls in the standard Inkling envelope. A reasoning that falls into repeating itself word for word is cut after its first copy
 and the model writes its answer; an answer or a tool call that does so for over 16,000 characters (INK2_LOOP_TEXT) ends the
 reply (Loop, reply()). While a request runs, the log gets a line every minute (INK2_LOG_EVERY).
 With --tok the tokenizer is build/ink2_tok, started once and kept (llama-tokenize takes 0.9 s to start for every request),
@@ -124,6 +125,11 @@ METRICS = [   # name, type, help, value
      lambda: TOTALS["loop_drops"]),
 ]
 LOG_EVERY = float(os.environ.get("INK2_LOG_EVERY", "60"))
+KEEPALIVE_SECONDS = 15
+POLL_SECONDS = 1
+QUEUE_SECONDS = 3600
+ENGINE_SECONDS = 7200
+STREAM_TOOL_ARGUMENTS = os.environ.get("INK2_STREAM_TOOL_ARGUMENTS") == "1"
 
 
 def token_bytes(i):
@@ -491,25 +497,106 @@ def read_fit(cached, total, read_s):
         STATE["read_scale"] = 0.5 * STATE["read_scale"] + 0.5 * min(max(1000 * read_s / model, 0.25), 8.0)
 
 
+TOOL_HEAD = re.compile(rb'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"args"\s*:\s*(?=\{)')
+
+
+def invalid_json_constant(value):
+    raise ValueError(f"{value} is not a JSON constant")
+
+
+class ToolOutputLimit(ValueError):
+    pass
+
+
+class ToolArguments:
+    """Stream the object in a canonical tool envelope, holding its last brace until validation."""
+
+    def __init__(self, name):
+        self.name = name
+        self.decoder = codecs.getincrementaldecoder("utf-8")()
+        self.depth = 0
+        self.quoted = self.escaped = False
+        self.closed = self.started = False
+        self.pending = []
+        self.size = 0
+
+    def feed(self, data, out):
+        if self.closed:
+            return
+        text = self.decoder.decode(data)
+        end = len(text)
+        for i, char in enumerate(text):
+            if self.escaped:
+                self.escaped = False
+            elif self.quoted:
+                if char == "\\":
+                    self.escaped = True
+                elif char == '"':
+                    self.quoted = False
+            elif char == '"':
+                self.quoted = True
+            elif char == "{":
+                self.depth += 1
+            elif char == "}":
+                self.depth -= 1
+                if self.depth == 0:
+                    self.closed, end = True, i
+                    break
+        fragment = text[:end]
+        if fragment:
+            self.pending.append(fragment)
+            self.size += len(fragment)
+        if self.size >= 256:
+            out.append(("tool_args", {"name": self.name, "arguments": "".join(self.pending)}))
+            self.pending.clear()
+            self.size = 0
+            self.started = True
+
+
 class Parts:
     """Turns the reply's tokens into events: ("r", text) reasoning, ("c", text) content, ("tool", {"name", "arguments"}) a
     finished tool call (<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>). The name
-    after <|message_model|> is not text; other template tokens are dropped; text outside any part counts as content."""
+    after <|message_model|> is not text; other template tokens are dropped; text outside any part counts as content.
+    Eligible streamed calls use "tool_args" fragments followed by a validated "tool_end" fragment."""
 
-    def __init__(self):
+    def __init__(self, stream_names=()):
         self.mode = "c"
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.tool = bytearray()
+        self.stream_names = stream_names
+        self.arguments = None
+
+    def require_closed_tool(self, token_limit=False):
+        if self.arguments and self.arguments.started:
+            if token_limit:
+                raise ToolOutputLimit("output token limit reached before the streamed tool call closed")
+            raise ValueError("streamed tool call ended before its envelope was validated")
 
     def _switch(self, out, mode):
+        self.require_closed_tool()
+        self.arguments = None
         tail = self.dec.decode(b"", final=True)
         if tail and self.mode in ("r", "c"):
             out.append((self.mode, tail))
         self.mode = mode
 
     def _tool_done(self, out):
-        raw = bytes(self.tool).decode("utf-8", errors="replace")
-        self.tool = bytearray()
+        payload = bytes(self.tool)
+        args = self.arguments
+        self.tool.clear()
+        self.arguments = None
+        if args and args.started:
+            # A second root key could replace the name or arguments already published.
+            # Require one object followed directly by the outer closing brace.
+            raw = payload.decode("utf-8")
+            value = json.loads(raw, parse_constant=invalid_json_constant)
+            body = payload[TOOL_HEAD.match(payload).end():].decode("utf-8")
+            _, end = json.JSONDecoder().raw_decode(body)
+            if not args.closed or value["name"] != args.name or body[end:].strip() != "}":
+                raise ValueError("invalid streamed tool envelope")
+            out.append(("tool_end", "".join(args.pending) + "}"))
+            return
+        raw = payload.decode("utf-8", errors="replace")
         try:
             d = json.loads(raw)
             out.append(("tool", {"name": d["name"], "arguments": json.dumps(d.get("args") or {}, ensure_ascii=False)}))
@@ -519,6 +606,30 @@ class Parts:
                 out.append(("tool", {"name": lc[0], "arguments": json.dumps(lc[1], ensure_ascii=False)}))
             else:
                 out.append(("c", raw))   # not a call after all: keep its text
+
+    def _tool_token(self, data, out):
+        self.tool.extend(data)
+        if not self.stream_names:
+            return
+        if self.arguments is None:
+            if len(self.tool) > 4096:
+                return
+            head = TOOL_HEAD.match(self.tool)
+            if not head:
+                return
+            try:
+                name = json.loads(head[1])
+            except ValueError:
+                return
+            if name not in self.stream_names:
+                return
+            self.arguments = ToolArguments(name)
+            data = self.tool[head.end():]
+        try:
+            self.arguments.feed(data, out)
+        except UnicodeDecodeError:
+            self.require_closed_tool()
+            self.arguments = None
 
     def feed(self, ids):
         out = []
@@ -539,7 +650,7 @@ class Parts:
             elif i in SPECIAL or i == EOS:
                 continue
             elif self.mode == "tool":
-                self.tool += token_bytes(i)
+                self._tool_token(token_bytes(i), out)
             elif self.mode in ("r", "c"):
                 t = self.dec.decode(token_bytes(i))
                 if t:
@@ -777,23 +888,25 @@ def turn_loop2(messages):
     return None
 
 
-def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False):
+class ClientDisconnected(Exception):
+    pass
+
+
+def reply(ids, mx, req, service, on_part=None, mode="c", stream_names=(), budget=0, tools=False):
     """The engine's reply to the prompt ids, at most mx tokens: (tokens, totals, stopped). Each token's parts go to
     on_part(kind, val) as they come ("r" reasoning, "c" content, "tool" a call). A loop in the reasoning (Loop) stops
     the engine; the reasoning is kept up to the end of the block's first copy, closed by NUDGE, and the model writes its
     answer (<|end_message|><|message_model|><|content_text|>): the engine reads the kept part again from the prompt's
     snapshot (from the start when over ~3,000 tokens were written) and goes on. A second loop ends the reply (stopped), and
     so does a loop in the answer (kept up to its first copy) or in a tool call (the call is dropped).
-    mode: the part the prompt ends in ("r" when it ends inside a reasoning). gone() is asked about once a second while
-    the engine writes; True (the client closed its connection) stops the engine with ConnectionResetError, also while
-    the reply is in a part that streams nothing (a tool call). p75: budget > 0, a reasoning part over budget tokens is closed at
-    its next sentence end by BUDGET_NOTE (once a reply) and the model writes its answer."""
-    parts, guard, out = Parts(), Loop(), []
+    mode: the part the prompt ends in ("r" when it ends inside a reasoning). service() checks the client and
+    sends keepalives while the native socket is active. p75: budget > 0 closes a reasoning part that
+    exceeds its token budget at the next sentence end, then the model writes its answer."""
+    parts, guard, out = Parts(stream_names), Loop(), []
     said = False   # p77: the reply has text or a tool call
     r_n, bud = 0, False   # p75: tokens of the current reasoning part; a budget cut asked
     parts.mode = mode
     tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
-    t_gone = time.time()
     hidden = []   # (start, end) in out of the system messages the engine reads and the client never gets
 
     def shown(stopped, why=None):   # what the client gets; tot["held"]: all the engine holds
@@ -804,7 +917,7 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
         return [t for i, t in enumerate(out) if i not in cut], tot, stopped
     while True:
         t_req, t_first, final, keep = time.time(), None, None, None
-        lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1))
+        lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1), service)
         try:
             for msg in lines:
                 if "error" in msg:
@@ -814,7 +927,7 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
                     for t in msg["t"]:
                         out.append(t)
                         evs = parts.feed([t])
-                        said = said or any(k == "tool" or (k == "c" and v.strip()) for k, v in evs)   # p77
+                        said = said or any(k in ("tool", "tool_end") or (k == "c" and v.strip()) for k, v in evs)
                         if on_part:
                             for kind, val in evs:
                                 on_part(kind, val)
@@ -830,10 +943,6 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
                     STATE["n_decoded"], STATE["part"] = len(out), parts.mode
                     if keep is not None:
                         break
-                    if gone and time.time() - t_gone >= 1.0:
-                        t_gone = time.time()
-                        if gone():
-                            raise ConnectionResetError("the client left")
                 elif "tokens" in msg:
                     final = msg
         finally:
@@ -851,6 +960,7 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
             tot["read_s"] += (t_first or t_req) - t_req
             tot["write_s"] += time.time() - (t_first or t_req)
         if keep is None:
+            parts.require_closed_tool(token_limit=len(out) >= mx and out[-1] != EOS)
             if EMPTY_STEP and tools and not said and out and out[-1] == EOS:   # p77: an agent's step that would stop without a word
                 if tot.get("empty_retry"):
                     return shown(True, EMPTY_STOP)
@@ -865,7 +975,7 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
                     out = base
                     hidden.append((len(out), len(out) + len(note)))
                     out += note
-                    parts, guard, r_n = Parts(), Loop(), 0
+                    parts, guard, r_n = Parts(stream_names), Loop(), 0
                     continue
             return shown(False)
         if bud:   # p75: the reasoning over its budget, closed at a sentence end; not a loop cut
@@ -890,6 +1000,8 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
         print(f"ink2_server: a loop in {PART[guard.mode]} (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
               f"{len(out) - keep} / {len(out)}", file=sys.stderr, flush=True)
         if guard.mode in ("tool", "head"):   # cut where the call began; once a reply, the model writes on after a note
+            if parts.arguments and parts.arguments.started:
+                raise ValueError("the loop guard stopped an incomplete streamed tool call")
             at = guard.ends[0][1]
             k = next((i for i in range(min(at, len(out) - 1), -1, -1) if out[i] == T_MODEL), at)
             j = next((i for i in range(k + 1, len(out)) if out[i] == T_TOOL), len(out))
@@ -905,10 +1017,11 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
             print(f"ink2_server: the call {what} cut, the model writes on after a system message", file=sys.stderr, flush=True)
             hidden.append((len(out), len(out) + len(note)))
             out += note
-            parts, guard = Parts(), Loop()
+            parts, guard = Parts(stream_names), Loop()
             continue
         out = out[:keep]
         if guard.mode != "r":
+            parts.require_closed_tool()
             return shown(True)
         if not NUDGE_IDS:
             NUDGE_IDS.extend(i for i in tokenize(NUDGE) if i not in SPECIAL)
@@ -923,24 +1036,96 @@ def reply(ids, mx, req, on_part=None, mode="c", gone=None, budget=0, tools=False
         guard = Loop()
 
 
-def engine_lines(req):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(7200)
-    s.connect(A.sock)
-    s.sendall((json.dumps(req) + "\n").encode())
-    buf = b""
-    try:
+def engine_lines(req, service):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(POLL_SECONDS)
+        service()
+        s.connect(A.sock)
+        pending = memoryview((json.dumps(req) + "\n").encode())
+        idle_deadline = time.monotonic() + ENGINE_SECONDS
+        while pending:
+            service()
+            if time.monotonic() >= idle_deadline:
+                raise TimeoutError("the engine stopped reading the prompt")
+            try:
+                sent = s.send(pending)
+            except TimeoutError:
+                continue
+            if not sent:
+                raise ConnectionError("the engine closed while receiving the prompt")
+            pending = pending[sent:]
+            idle_deadline = time.monotonic() + ENGINE_SECONDS
+        buf = b""
         while True:
-            c = s.recv(1 << 16)
+            service()
+            if time.monotonic() >= idle_deadline:
+                raise TimeoutError("the engine stopped sending data")
+            try:
+                c = s.recv(1 << 16)
+            except TimeoutError:
+                continue
             if not c:
                 break
+            idle_deadline = time.monotonic() + ENGINE_SECONDS
             buf += c
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 if line.strip():
                     yield json.loads(line)
-    finally:
-        s.close()
+
+
+class ChatStream:
+    def __init__(self, handler, cid, created):
+        self.handler = handler
+        self.chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias}
+        self.last_write = time.monotonic()
+        self.calls = 0
+        self.pending_call = False
+
+    def start(self):
+        h = self.handler
+        h.close_connection = True
+        h.connection.settimeout(10)
+        try:
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.send_header("Cache-Control", "no-cache")
+            h.send_header("Connection", "close")
+            h.end_headers()
+        except OSError as ex:
+            raise ClientDisconnected from ex
+        self.event({"role": "assistant", "content": None})
+
+    def write(self, data):
+        try:
+            self.handler.wfile.write(data)
+            self.handler.wfile.flush()
+        except OSError as ex:
+            raise ClientDisconnected from ex
+        self.last_write = time.monotonic()
+
+    def data(self, obj):
+        self.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
+
+    def event(self, delta, finish=None, **extra):
+        self.data({**self.chunk, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], **extra})
+
+    def keepalive(self):
+        if time.monotonic() - self.last_write >= KEEPALIVE_SECONDS:
+            self.write(b": keepalive\n\n")
+
+    def part(self, kind, val):
+        if kind in ("r", "c"):
+            self.event({"reasoning_content" if kind == "r" else "content": val})
+            return
+        call = {"index": self.calls, "function": {"arguments": val if kind == "tool_end" else val["arguments"]}}
+        if not self.pending_call:
+            call.update(id="call_" + uuid.uuid4().hex[:24], type="function")
+            call["function"]["name"] = val["name"]
+        self.event({"tool_calls": [call]})
+        self.pending_call = kind == "tool_args"
+        if not self.pending_call:
+            self.calls += 1
 
 
 class H(BaseHTTPRequestHandler):
@@ -962,13 +1147,13 @@ class H(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
     def _gone(self):
-        # the request is read, so a connection that reads as ready with nothing in it was closed by the client (as llama-server
-        # checks it); a reply that streams nothing for a while (a tool call, a request without "stream") would not see it otherwise
-        try:
-            ready = select.select([self.connection], [], [], 0)[0]
-            return bool(ready) and not self.connection.recv(1, socket.MSG_PEEK)
-        except (OSError, ValueError):
-            return True
+        # A peer may shut down its write side after the request and still read
+        # the response. Watch for socket errors or full hangup. Streaming
+        # writes also detect a graceful client close once TCP reports the reset.
+        poller = select.poll()
+        poller.register(self.connection, 0)
+        return any(events & (select.POLLHUP | select.POLLERR | select.POLLNVAL)
+                   for _, events in poller.poll(0))
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -1023,6 +1208,13 @@ class H(BaseHTTPRequestHandler):
             ids, starts = TOKENS.ids(render(body.get("messages") or [], effort_of(body), tools, images))
             t_tok = time.time() - t0
             ids, img_req = place_images(ids, images, starts)
+            stream_names = set()
+            if body.get("stream") and STREAM_TOOL_ARGUMENTS:
+                for tool in tools or []:
+                    if isinstance(tool, dict) and tool.get("type", "function") == "function":
+                        name = tool.get("function", tool).get("name")
+                        if isinstance(name, str) and name:
+                            stream_names.add(name)
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
         loop, n_ids = turn_loop(body.get("messages") or []) if tools else None, len(ids)
@@ -1040,22 +1232,55 @@ class H(BaseHTTPRequestHandler):
                 loop = None
         if len(ids) >= A.ctx - 1:
             return self._send(400, {"error": {"message": f"prompt of {len(ids)} tokens exceeds the context of {A.ctx}", "type": "exceed_context_size_error"}})
-        mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
-        mx = max(1, min(mx, A.ctx - len(ids) - 1))
-        stream = bool(body.get("stream"))
-        req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req, **sampling_of(body),   # p76
-               "ckpt": [x for x in starts if x < n_ids - 8][-4096:]}   # p42: not the answer's own head (n - 1 is checkpointed)
-        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-        created = int(t0)
-        if not LOCK.acquire(blocking=False):
-            print(f"ink2_server: a request of {len(ids)} prompt tokens waits for the one before it", file=sys.stderr, flush=True)
-            if not LOCK.acquire(timeout=3600):
-                return self._send(503, {"error": "busy"})
         try:
+            mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
+            mtp, lookup = int(body.get("mtp", MTP)), int(body.get("lookup", LOOKUP))
+        except (TypeError, ValueError, OverflowError):
+            return self._send(400, {"error": {"message": "invalid generation settings"}})
+        mx = max(1, min(mx, A.ctx - len(ids) - 1))
+        req = {"stop": [EOS], "mtp": mtp, "lookup": lookup, **img_req, **sampling_of(body),
+               "ckpt": [x for x in starts if x < n_ids - 8][-4096:]}
+        if loop and LOOP_DROP:
+            stream_names.difference_update(name for name, _ in loop[1])
+        cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(t0)
+        stream = ChatStream(self, cid, created) if body.get("stream") else None
+
+        def service():
+            if self._gone():
+                raise ClientDisconnected
+            if stream:
+                stream.keepalive()
+
+        acquired = False
+        try:
+            if stream:
+                stream.start()
+            service()
+            acquired = LOCK.acquire(blocking=False)
+            if not acquired:
+                print(f"ink2_server: a request of {len(ids)} prompt tokens waits for the one before it", file=sys.stderr, flush=True)
+                limit = time.monotonic() + QUEUE_SECONDS
+                while not acquired:
+                    remaining = limit - time.monotonic()
+                    if remaining <= 0:
+                        if stream:
+                            raise TimeoutError("timed out waiting for the inference slot")
+                        return self._send(503, {"error": "busy"})
+                    service()
+                    acquired = LOCK.acquire(timeout=min(POLL_SECONDS, remaining))
+            engine_deadline = time.monotonic() + ENGINE_SECONDS
+
+            def engine_service():
+                if stream and time.monotonic() >= engine_deadline:
+                    raise TimeoutError("inference exceeded the execution deadline")
+                service()
+
+            engine_service()
             STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, part="", n_total=len(ids), n_cache=predict_cache(ids))
             STATE.update(t_start=time.time(), t_note=time.time())
             STATE["requests"] += 1
-            calls, on_part, said, dropped = [], None, [], [0]
+            said = False
+            dropped = [0]
             if loop:
                 where = {"s": "as a system message", "r": "in the reasoning"}
                 print(f"ink2_server: a loop across turns: {loop[0]} x {what} (the same call, the same result): the note "
@@ -1074,44 +1299,19 @@ class H(BaseHTTPRequestHandler):
                 dropped[0] += 1
                 print(f"ink2_server: a loop across turns: the same {val['name']} call after the note, dropped", file=sys.stderr, flush=True)
                 return True
-            if stream:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.close_connection = True
+            def on_part(kind, val):
+                nonlocal said
+                if kind == "tool" and looping(val):
+                    return
+                if kind == "c" and val.strip():
+                    said = True
+                stream.part(kind, val)
 
-                def sse(obj):
-                    self.wfile.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.flush()
-
-                sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
-                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
-
-                def on_part(kind, val):
-                    if kind == "tool" and looping(val):
-                        return
-                    if kind == "c" and val.strip():
-                        said.append(1)
-                    if kind == "tool":
-                        call = {"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                                "function": {"name": val["name"], "arguments": val["arguments"]}}
-                        calls.append(call)
-                        delta = {"tool_calls": [call]}
-                    else:
-                        delta = {"reasoning_content" if kind == "r" else "content": val}
-                    sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
-                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
-                if loop and note:
-                    on_part("r", note)
-            try:
-                out, tot, stopped = reply(ids, mx, req, on_part, mode="r" if loop and note else "c", gone=self._gone,
-                                          budget=think_budget(effort_of(body), bool(tools)), tools=bool(tools))   # p75, p77
-            except (BrokenPipeError, ConnectionResetError):   # closing the engine's socket stopped it at its next write
-                print(f"ink2_server: request: the client left after {STATE['n_decoded']} written tokens ({len(ids)} prompt tokens); "
-                      f"the engine stopped", file=sys.stderr, flush=True)
-                return
+            if stream and loop and note:
+                on_part("r", note)
+            out, tot, stopped = reply(ids, mx, req, engine_service, on_part if stream else None,
+                                      mode="r" if loop and note else "c", stream_names=stream_names,
+                                      budget=think_budget(effort_of(body), bool(tools)), tools=bool(tools))
             n = len(out)
             STATE["tokens_out"] += n
             if not tot["cuts"] and not tot.get("budget"):   # a cut reads its kept part again, so its read_s is no measure (p75 too)
@@ -1122,6 +1322,7 @@ class H(BaseHTTPRequestHandler):
             w = tot["write_s"] or 1e-9
             print(f"ink2_server: request: prompt tokens / cached / back to checkpoint / checkpoints, tokenize / read / written / write {len(ids)} / {tot['cached']} / {tot.get('back')} / {tot.get('ckpts')}, "
                   f"{1000 * t_tok:.0f} ms / {tot['read_s']:.2f} s / {n} / {w:.2f} s", file=sys.stderr, flush=True)
+            calls = []
             if not stream:
                 think, content, pp = [note] if loop and note else [], [], Parts()
                 pp.mode = "r" if loop and note else "c"
@@ -1133,18 +1334,19 @@ class H(BaseHTTPRequestHandler):
                                       "function": {"name": val["name"], "arguments": val["arguments"]}})
                     else:
                         (think if kind == "r" else content).append(val)
-            if tot.get("loop_end") and not calls and not dropped[0] and not (said if stream else "".join(content).strip()):
+            n_calls = stream.calls if stream else len(calls)
+            if tot.get("loop_end") and not n_calls and not dropped[0] and not (said if stream else "".join(content).strip()):
                 if stream:   # a reply that ended in a loop with nothing to show says so
                     on_part("c", tot["loop_end"])
                 else:
                     content.append(tot["loop_end"])
-            if dropped[0] and not calls:   # the looping call was the reply's only call
+            if dropped[0] and not n_calls:   # the looping call was the reply's only call
                 stop = ("\n\n" if (said if stream else "".join(content).strip()) else "") + LOOP_STOP.format(what=what, n=loop[0])
                 if stream:
                     on_part("c", stop)
                 else:
                     content.append(stop)
-            finish = "tool_calls" if calls else "stop" if stopped or (out and out[-1] == EOS) else "length"
+            finish = "tool_calls" if n_calls else "stop" if stopped or (out and out[-1] == EOS) else "length"
             timings = {"prompt_n": len(ids) - tot["cached"], "cache_n": tot["cached"], "prompt_ms": 1000 * tot["read_s"],
                        "prompt_per_second": (len(ids) - tot["cached"]) / max(tot["read_s"], 1e-9),
                        "predicted_n": n, "predicted_ms": 1000 * w, "predicted_per_second": max(n - 1, 0) / w,
@@ -1168,10 +1370,8 @@ class H(BaseHTTPRequestHandler):
             usage = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n,
                      "prompt_tokens_details": {"cached_tokens": tot["cached"]}}
             if stream:
-                sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
-                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "usage": usage, "timings": timings})
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                stream.event({}, finish, usage=usage, timings=timings)
+                stream.write(b"data: [DONE]\n\n")
                 return
             message = {"role": "assistant", "content": "".join(content).strip() or (None if calls else ""),
                        "reasoning_content": "".join(think).strip()}
@@ -1180,22 +1380,30 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"id": cid, "object": "chat.completion", "created": created, "model": A.alias,
                                     "choices": [{"index": 0, "finish_reason": finish, "message": message}],
                                     "usage": usage, "timings": timings})
+        except ClientDisconnected:
+            print("ink2_server: the client left", file=sys.stderr, flush=True)
         except Exception as ex:
             if stream:
+                error = {"message": str(ex)}
+                if isinstance(ex, ToolOutputLimit):
+                    # An unchanged retry has the same budget. Mark the cutoff as terminal without finalizing the tool.
+                    error.update(code="length", type="invalid_request_error")
+                    print(f"ink2_server: tool call reached the {mx}-token output limit with {len(ids)} prompt tokens",
+                          file=sys.stderr, flush=True)
                 try:
-                    self.wfile.write(b"data: " + json.dumps({"error": {"message": str(ex)}}).encode() + b"\n\n")
-                except Exception:
+                    stream.data({"error": error})
+                except ClientDisconnected:
                     pass
                 return
             return self._send(500, {"error": {"message": str(ex)}})
         finally:
-            STATE.update(busy=False)
-            LOCK.release()
+            if acquired:
+                STATE.update(busy=False)
+                LOCK.release()
 
 
 def ticker():
-    """A line every LOG_EVERY seconds (INK2_LOG_EVERY, 0: none) while a request runs: a request prints its line only at its
-    end, and a tool call streams nothing until it is whole, so a long read or reply would leave the log silent."""
+    """Log active request state every LOG_EVERY seconds (INK2_LOG_EVERY, 0: none)."""
     while True:
         time.sleep(min(5.0, LOG_EVERY))
         st = STATE
