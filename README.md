@@ -70,6 +70,9 @@ and reads at about **1,000**.
 - 🖼️ **Pictures, a 524,288-token context and an OpenAI-compatible API** through Strata v0.2.9's server.
 - 🧰 **Tools for your machine:** `tune/check.py` finds what limits it, and `tune/tune.py` measures the exact switches on it.
 
+For a single build with selectable Megla, Strata Inkling, and Strata Flash-Next backends, see the
+[unified build and profile launcher](unified/README.md) and [configuration guide](unified/CONFIGURATION.md).
+
 ## 🚀 Quick start
 
 You need Linux, two Tesla P100 16 GB, 96 GB of RAM and CUDA 12 ([requirements](#-requirements)).

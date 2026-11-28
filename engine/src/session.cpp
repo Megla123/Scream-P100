@@ -166,8 +166,8 @@ const char* finish_name(Finish f) {
 
 Session::Session(Engine& e, int K, int lookup_k, std::vector<int> eos, int turn, std::shared_ptr<ConvCache> cache, int lane)
     : e_(e), K_(K), LK_(lookup_k), eos_(std::move(eos)), turn_(turn), lane_(lane), cache_(std::move(cache)) {
-    if (K_ < 1 || K_ + 1 > MAXT) throw std::runtime_error("session: K must be 1.." + std::to_string(MAXT - 1));
-    if (LK_ < 0 || LK_ + 1 > MAXT) throw std::runtime_error("session: lookup drafts must be 0.." + std::to_string(MAXT - 1));
+    if (K_ < 0 || K_ >= MAXT) throw std::runtime_error("session: K must be 0.." + std::to_string(MAXT - 1));
+    if (LK_ < 0 || LK_ >= MAXT) throw std::runtime_error("session: lookup drafts must be 0.." + std::to_string(MAXT - 1));
     if (!cache_) throw std::runtime_error("session: no cache");
 }
 
@@ -459,13 +459,13 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     // When sampling, MTP drafts are drawn from the draft head's own distribution at s (FNX_DRAFT_SAMPLE=0: its argmax),
     // with s's penalties applied to its logits (FNX_DRAFT_PEN=0: without). Either way the output's distribution is the
     // model's: the verify accepts a draft with min(1, p / q) and otherwise draws from max(0, p - q)
-    const bool pen_drafts = penalize && env_int("FNX_DRAFT_PEN", 1) != 0;
-    const bool samp_drafts = sample && env_int("FNX_DRAFT_SAMPLE", 1) != 0;
+    const bool pen_drafts = K_ > 0 && penalize && env_int("FNX_DRAFT_PEN", 1) != 0;
+    const bool samp_drafts = K_ > 0 && sample && env_int("FNX_DRAFT_SAMPLE", 1) != 0;
     // The MTP chain's length follows acceptance: per chain position, how often a draft that got there stood (decayed,
     // so it follows the text), and each round the length 1..K with the most tokens expected per ms. A round costs about
     // ROUND_MS, a verify row DRAFT_ROW_MS more and a draft call after d1 DRAFT_CALL_MS (Q4, lab, 2026-10-25, prose with
     // K fixed at 1 / 2 / 3 / 4: 12.47 / 14.76 / 16.60 / 18.34 ms a round). FNX_DRAFT_ADAPT=0: always K
-    const bool adapt = env_int("FNX_DRAFT_ADAPT", 1) != 0;
+    const bool adapt = K_ > 0 && env_int("FNX_DRAFT_ADAPT", 1) != 0;
     const auto cost_env = [](const char* name, double dflt) {
         const char* v = std::getenv(name);
         return v ? std::atof(v) : dflt;
@@ -475,7 +475,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.7);   // a prior of 70% at every position
     // a round's measured cost by its drafts, decayed as the acceptance is: a window's time follows the expert misses and the context, the constants only start it
     // (FNX_DRAFT_COST_LIVE=0: the constants alone)
-    const bool cost_live = env_int("FNX_DRAFT_COST_LIVE", 1) != 0;
+    const bool cost_live = K_ > 0 && env_int("FNX_DRAFT_COST_LIVE", 1) != 0;
     std::vector<double> cost_sum((size_t) MAXT + 1, 0.0), cost_n((size_t) MAXT + 1, 0.0);
     double chain_draft_ms = 0.0;
     const auto round_cost = [&](int k) {
@@ -643,11 +643,13 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         ctx.insert(ctx.end(), o.begin(), o.begin() + used);
         x = o[used - 1];
         if (done) break;
-        // the draft layer reads the kept rows either way (its cells stay current for later turns)
+        // An attached draft layer reads kept rows even when speculation is disabled for a reference run.
         std::vector<int> pen_seq;   // the penalty window before the next token: the context's last pen_last_n
-        if (pen_drafts) pen_seq.assign(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
+        int d1 = -1;   // without MTP, lookup can propose the first draft
         Dist q1;
-        const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
+        if (pen_drafts) pen_seq.assign(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
+        if (K_ > 0)
+            d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
         mtp_round = false;
         if (!speculate) {
             drafts.clear(), qs.clear();
@@ -656,13 +658,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         int match = -1;
         drafts = lookup(ctx, d1, &match);
         qs.assign(drafts.size(), Dist{});
-        if (!drafts.empty()) {   // the tokens after d1 follow from it and the context: fixed
+        if (!drafts.empty()) {
             ++st.lookup_rounds;
             // memo_patch.py: the window's row 0 is x = ctx.back(), the run's third token (position match + 2), its drafts the ones after
             if (match >= 0) e_.memo_src(match + LOOKUP_N - 1);
             qs[0] = std::move(q1);
             continue;
         }
+        if (K_ == 0) continue;
         // the MTP chain: each draft from the draft layer's own row for the one before
         // every 4th chain one draft longer, so the position past the chosen length stays measured (the full K every 4th
         // chain cost prose ~0.9 ms a round)

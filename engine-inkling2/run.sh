@@ -100,7 +100,8 @@ if [ -n "${INK2_MULTI:-}" ]; then   # several conversations at once (test builds
   [ -n "$CTX_SET" ] || CTX=$([ "$INK2_MULTI" = tpb ] && echo 24576 || echo 65536)
   [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
   MODE="both cards, up to $SLOTS conversations at once (ink2_$INK2_MULTI, a slot of $CTX each, drafter $DRAFTER)"; INK2_PICTURES=0
-  export INK2_SAMPLING=0   # the multi builds write greedy (no sampling in ink2_tpb, ink2_pp)
+  export PYTHONPATH="$H/serve${PYTHONPATH:+:$PYTHONPATH}"
+  export INK2_SAMPLING=0 INK2_STRATA_SAMPLER=0   # the multi builds write greedy (no sampling in ink2_tpb, ink2_pp)
   SERVER=$B/ink2_server_multi.py; SL=(--slots "$SLOTS")
   "$D/venv/bin/python" "$H/serve/make_multi.py" "$H/serve/ink2_server.py" "$SERVER" "ink2_$INK2_MULTI" >&2 || exit 1
 fi

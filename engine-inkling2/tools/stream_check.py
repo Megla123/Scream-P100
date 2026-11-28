@@ -34,7 +34,7 @@ def load_server(directory, *, extra_args=(), settings=None):
     spec = importlib.util.spec_from_file_location("ink2_server_fixture", SERVER)
     module = importlib.util.module_from_spec(spec)
     with patch.dict(os.environ, {"INK2_STREAM_TOOL_ARGUMENTS": "1", **(settings or {})}), patch.dict(sys.modules, {"gguf": gguf}):
-        with patch.object(sys, "argv", [str(SERVER), *args, *extra_args]), patch.object(sys, "path", sys.path[:]):
+        with patch.object(sys, "argv", [str(SERVER), *args, *extra_args]), patch.object(sys, "path", [str(SERVER.parent), *sys.path]):
             spec.loader.exec_module(module)
     module.TOKENS = SimpleNamespace(ids=lambda _: ([1, 2], []))
     module.KEEPALIVE_SECONDS = 0.05

@@ -129,7 +129,7 @@ public:
     // every window graph captured now (windows of 1..MAXT rows, the draft layer's, batched windows over 1..lanes()),
     // the prompt path's buffers and every lane's rotary table:
     // their memory taken at start, not when a request first needs one. Every lane is left empty
-    void warm_graphs();
+    void warm_graphs(int solo_rows = MAXT, bool warm_batch_drafts = true);
     bool precap() const;   // FNX_PRECAP=1: layouts kept (see batch_graph_ready); warm_graphs() captures the uniform ones at the start
     double warm_capture_ms = 0.0;   // warm_graphs()'s mean capture of a batched window (host ms), 0 before it ran
     std::vector<long> free_vram_mib() const;   // per card

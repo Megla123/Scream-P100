@@ -1,0 +1,2051 @@
+--- a/src/inkling2/CMakeLists.txt
++++ b/src/inkling2/CMakeLists.txt
+@@ -8,7 +8,7 @@
+   set(CMAKE_CXX_EXTENSIONS OFF)
+   set(_ink_engine_root "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+ else()
+-  set(_ink_engine_root "${CMAKE_SOURCE_DIR}")
++  set(_ink_engine_root "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+   enable_language(C)
+ endif()
+ include(${_ink_engine_root}/cmake/strata_symbols.cmake)   # -DSTRATA_KEEP_SYMBOLS=ON: host debug information, same machine code (the release scripts keep the symbol files)
+@@ -175,9 +175,10 @@
+ endif()
+
+ # Standalone `strata-inkling` executable
+-add_executable(strata-inkling
++add_library(strata-inkling STATIC
+   ${CMAKE_CURRENT_SOURCE_DIR}/ink_main.cpp
+ )
++target_compile_definitions(strata-inkling PRIVATE main=scream_strata_inkling_main)
+ target_link_libraries(strata-inkling PRIVATE strata_inkling_core)
+ if(COMMAND strata_utf8_manifest)
+   strata_utf8_manifest(strata-inkling)
+@@ -285,7 +286,6 @@
+   target_link_libraries(ink_host_simd_bench PRIVATE strata_inkling_core)
+ endif()
+
+-install(TARGETS strata-inkling RUNTIME DESTINATION bin COMPONENT inkling2)
+
+ option(STRATA_INK_BUILD_PREFIX_TESTS "Build the GPU-free shared-prefix protocol regression" OFF)
+ if(STRATA_INK_BUILD_PREFIX_TESTS)
+--- a/src/inkling2/hybrid_doorbell.cu
++++ b/src/inkling2/hybrid_doorbell.cu
+@@ -25,7 +25,7 @@
+ #include "strata/inkling2/inkling2_loop.hpp"
+
+ #if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
+-#include <immintrin.h>
++#include <xmmintrin.h>
+ #include <pthread.h>
+ #include <sched.h>
+ #include <sys/mman.h>
+--- a/src/inkling2/ink_main.cpp
++++ b/src/inkling2/ink_main.cpp
+@@ -9,7 +9,9 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <iterator>
++#include <limits>
+ #include <numeric>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -99,7 +101,23 @@
+     return 0;
+ }
+ 
+-static int cmd_selfcheck(const std::string& model_path, bool force_cpu, bool verify_hash, const BackendOpts& bopts) {
++static bool apply_num_passes(InkModelFile& mf, int num_passes, bool use_dspark) {
++    if (num_passes > mf.m.c.num_passes) {
++        fprintf(stderr, "--num-passes exceeds the model's configured pass count (%d)\n", mf.m.c.num_passes);
++        return false;
++    }
++    if (num_passes != 0 && num_passes < mf.m.c.num_passes) {
++        if (use_dspark && mf.m.dspark.present) {
++            fprintf(stderr, "reduced pass counts require --draft off with DSpark weights\n");
++            return false;
++        }
++        mf.m.c.num_passes = num_passes;
++        mf.m.c.build_visit_schedule();
++    }
++    return true;
++}
++
++static int cmd_selfcheck(const std::string& model_path, bool force_cpu, bool verify_hash, const BackendOpts& bopts, int num_passes) {
+     auto backend = make_default_backend(force_cpu, &bopts);
+     std::string err;
+     InkModelFile mf;
+@@ -108,6 +126,7 @@
+             fprintf(stderr, "[selfcheck] FAIL open: %s\n", err.c_str());
+             return 1;
+         }
++        if (!apply_num_passes(mf, num_passes, bopts.enable_dspark)) return 2;
+         if (verify_hash) {
+             printf("[selfcheck] Verifying SHA-256 of Sections 0..5...\n");
+             if (!mf.verify_sections(err, true)) {
+@@ -128,13 +147,14 @@
+     return 0;
+ }
+ 
+-static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, int prompt_len, int gen_len, bool force_cpu, bool use_dspark) {
++static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, int prompt_len, int gen_len, bool force_cpu, bool use_dspark, int num_passes) {
+     InkModelFile mf;
+     std::string err;
+     if (!mf.open(model_path, err, false, bopts.dspark_path)) {
+         fprintf(stderr, "open: %s\n", err.c_str());
+         return 1;
+     }
++    if (!apply_num_passes(mf, num_passes, use_dspark)) return 2;
+     BackendOpts bo = bopts;
+     bo.enable_dspark = use_dspark;
+     if (prompt_len + gen_len > bo.max_ctx) {
+@@ -253,7 +273,7 @@
+ 
+ // Teacher-forced KLD/PPL/Top-1 evaluation against a binary reference file:
+ // Header: int32 n_tokens, int32 vocab_unpadded, int32 tokens[n_tokens], float ref_logits[n_tokens * vocab_unpadded]
+-static int cmd_kld_eval(const std::string& model_path, const std::string& ref_path, const BackendOpts& bopts, bool force_cpu) {
++static int cmd_kld_eval(const std::string& model_path, const std::string& ref_path, const BackendOpts& bopts, bool force_cpu, int num_passes) {
+     FILE* f = std::fopen(ref_path.c_str(), "rb");
+     if (!f) { fprintf(stderr, "kld-eval: cannot open %s\n", ref_path.c_str()); return 1; }
+     int32_t n_tok = 0, V_ref = 0;
+@@ -275,6 +295,7 @@
+     InkModelFile mf;
+     std::string err;
+     if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
++    if (!apply_num_passes(mf, num_passes, bopts.enable_dspark)) return 2;
+     auto backend = make_default_backend(force_cpu, &bopts);
+     if (!backend->init(mf, bopts, err) || !backend->alloc_slot(0, bopts.max_ctx, bopts.kv_dtype, err)) {
+         fprintf(stderr, "init: %s\n", err.c_str());
+@@ -324,10 +345,11 @@
+ 
+ // Dump teacher-forced FP32 reference logits for --kld-eval parity checks across formats & backends
+ static int cmd_dump_ref(const std::string& model_path, const std::string& out_path,
+-                        const std::string& prompt_ids_str, const BackendOpts& bopts, bool force_cpu) {
++                        const std::string& prompt_ids_str, const BackendOpts& bopts, bool force_cpu, int num_passes) {
+     InkModelFile mf;
+     std::string err;
+     if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
++    if (!apply_num_passes(mf, num_passes, bopts.enable_dspark)) return 2;
+     auto backend = make_default_backend(force_cpu, &bopts);
+     if (!backend->init(mf, bopts, err) || !backend->alloc_slot(0, bopts.max_ctx, bopts.kv_dtype, err)) {
+         fprintf(stderr, "init: %s\n", err.c_str());
+@@ -373,10 +395,11 @@
+ // different kernels, so they differ by rounding (KL below 1e-3 on SQ-class packs); a ring overwrite gives KL of order 1 and a top-1 agreement far below.
+ // Exit 0 when the median KL after the window is below 0.02 and the top-1 agreement above 90%.
+ static int32_t argmax_f32(const float* lg, int V);
+-static int cmd_ring_check(const std::string& model_path, const BackendOpts& bopts, bool force_cpu, const std::vector<int32_t>& ids, int stride) {
++static int cmd_ring_check(const std::string& model_path, const BackendOpts& bopts, bool force_cpu, const std::vector<int32_t>& ids, int stride, int num_passes) {
+     InkModelFile mf;
+     std::string err;
+     if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
++    if (!apply_num_passes(mf, num_passes, bopts.enable_dspark)) return 2;
+     auto backend = make_default_backend(force_cpu, &bopts);
+     if (!backend->init(mf, bopts, err) || !backend->alloc_slot(0, bopts.max_ctx, bopts.kv_dtype, err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
+     const int n = static_cast<int>(ids.size());
+@@ -448,10 +471,11 @@
+ // both runs see the same positions; per step it prints the KL of the batched logits against the solo logits, whether the top-1 agrees
+ // and the logit gap of the solo top-2 (a near-tie flips on rounding, a wide gap does not).  Exit 1 when a step's KL is above 1.0 (garbage logits; the Metal prefill path alone differs by about 0.1 between chunk shapes).
+ static int cmd_batch_check(const std::string& model_path, const BackendOpts& bopts, bool force_cpu,
+-                           const std::vector<int32_t>& ids, int n_gen) {
++                           const std::vector<int32_t>& ids, int n_gen, int num_passes) {
+     InkModelFile mf;
+     std::string err;
+     if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
++    if (!apply_num_passes(mf, num_passes, false)) return 2;
+     BackendOpts bo = bopts;
+     bo.enable_dspark = false;
+     const int K = std::max(1, bo.parallel);
+@@ -597,10 +621,11 @@
+     return best;
+ }
+ static int cmd_spec_check(const std::string& model_path, const BackendOpts& bopts, bool force_cpu,
+-                          const std::vector<int32_t>& ids, int n_gen) {
++                          const std::vector<int32_t>& ids, int n_gen, int num_passes) {
+     InkModelFile mf;
+     std::string err;
+     if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
++    if (!apply_num_passes(mf, num_passes, true)) return 2;
+     BackendOpts bo = bopts;
+     bo.enable_dspark = true;
+     bo.parallel = 1;
+@@ -840,7 +865,9 @@
+     bool verify_hash = false;
+     std::string info_file, export_file, export_dir, kld_ref, dump_ref, prompt_ids_str;
+     int bench_prompt = 64, bench_gen = 32, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0;
+-    float cli_temp = 0.0f;
++    std::optional<float> cli_temp;
++    bool configured_sampling = false, direct_repetition_guard = false;
++    int num_passes = 0;
+ 
+     for (int i = 1; i < argc; ++i) {
+         std::string a = argv[i];
+@@ -874,6 +901,15 @@
+             cfg.bopts.vision_path = cfg.vision_path;
+         } else if (a == "--max-context" || a == "--ctx") {
+             cfg.bopts.max_ctx = std::atoi(next().c_str());
++        } else if (a == "--num-passes") {
++            const auto value = next();
++            char* end = nullptr;
++            const long passes = std::strtol(value.c_str(), &end, 10);
++            if (!end || *end || passes < 1 || passes > std::numeric_limits<int>::max()) {
++                fprintf(stderr, "invalid --num-passes\n");
++                return 2;
++            }
++            num_passes = static_cast<int>(passes);
+         } else if (a == "--parallel" || a == "--batch" || a == "--slots") {
+             cfg.bopts.parallel = std::max(1, std::min(kMaxParallelSlots, std::atoi(next().c_str())));
+         } else if (a == "--chunk") {
+@@ -895,6 +931,15 @@
+         } else if (a == "--draft") {
+             cfg.draft_mode = next();
+             cfg.bopts.enable_dspark = (cfg.draft_mode != "off");
++        } else if (a == "--lookup") {
++            const std::string value = next();
++            char* end = nullptr;
++            const long count = std::strtol(value.c_str(), &end, 10);
++            if (end == value.c_str() || *end || count < 0 || count > kMaxPromptLookup) {
++                fprintf(stderr, "--lookup must be between 0 and %d\n", kMaxPromptLookup);
++                return 2;
++            }
++            cfg.bopts.lookup = static_cast<int>(count);
+         } else if (a == "--draft-beam") {
+             cfg.bopts.spec_beam = std::atoi(next().c_str());
+         } else if (a == "--draft-cost") {
+@@ -969,23 +1014,45 @@
+             ring_check_stride = std::atoi(next().c_str());
+         } else if (a == "--temp") {
+             cli_temp = static_cast<float>(std::atof(next().c_str()));
++        } else if (a == "--sampling") {
++            try {
++                cfg.sampling = parse_sampling_fields(next(), 128);
++                configured_sampling = true;
++            } catch (const std::runtime_error& error) {
++                fprintf(stderr, "--sampling: %s\n", error.what());
++                return 2;
++            }
+         } else if (a == "--no-anti-loop") {
+-            cfg.anti_loop = false;
++            cfg.anti_loop = direct_repetition_guard = false;
++        } else if (a == "--repetition-guard") {
++            const auto value = next();
++            if (value != "on" && value != "off") {
++                fprintf(stderr, "--repetition-guard requires on or off\n");
++                return 2;
++            }
++            cfg.anti_loop = direct_repetition_guard = (value == "on");
+         } else if (a == "--help" || a == "-h") {
+             printf("strata-inkling %s - Unified Inkling-2-Mini (.strata v1.1 / HF safetensors / .gguf) Shape Engine\n"
+                    "  --version\n"
+                    "  --info PATH [--vision VISION] [--dspark PATH]\n"
+                    "  --export-tokenizer PATH OUT_DIR\n"
+-                   "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpu N] [--gpus 1|2] [--kv auto|fp16|fp8|k8v8|k8v4]\n"
+-                   "  --bench --native PATH [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--prompt-len N] [--gen N]\n"
++                   "  --sampling FIELDS (native generation and serving defaults)\n"
++                   "  --repetition-guard on|off (native generation and serving)\n"
++                   "  --selfcheck [--native PATH] [--verify-hash] [--num-passes N] [--cpu] [--gpu N] [--gpus 1|2] [--kv auto|fp16|fp8|k8v8|k8v4]\n"
++                   "  --bench --native PATH [--num-passes N] [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--prompt-len N] [--gen N]\n"
+                    "  --kld-eval REF.bin --native PATH\n"
+-                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--draft auto|dspark|off]\n",
++                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--num-passes N] [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--draft auto|dspark|off] [--lookup 0..7]\n",
+                    INKLING_VERSION);
+             return 0;
+         } else {
+             fprintf(stderr, "unknown option: %s\n", a.c_str());
+             return 2;
+         }
++    }
++
++    if (cfg.bopts.lookup > 0 && !mode_serve) {
++        fprintf(stderr, "--lookup enables prompt lookup in --serve mode\n");
++        return 2;
+     }
+ 
+     // Read optional IK2_EP_SPLIT and IK2_GPUS env overrides (#6506)
+@@ -1038,9 +1105,9 @@
+ 
+     if (mode_info) return cmd_info(info_file, cfg.vision_path, cfg.bopts.dspark_path);
+     if (mode_export) return cmd_export_tokenizer(export_file, export_dir);
+-    if (mode_selfcheck) return cmd_selfcheck(cfg.model_path, cfg.force_cpu, verify_hash, cfg.bopts);
+-    if (!kld_ref.empty()) return cmd_kld_eval(cfg.model_path, kld_ref, cfg.bopts, cfg.force_cpu);
+-    if (!dump_ref.empty()) return cmd_dump_ref(cfg.model_path, dump_ref, prompt_ids_str, cfg.bopts, cfg.force_cpu);
++    if (mode_selfcheck) return cmd_selfcheck(cfg.model_path, cfg.force_cpu, verify_hash, cfg.bopts, num_passes);
++    if (!kld_ref.empty()) return cmd_kld_eval(cfg.model_path, kld_ref, cfg.bopts, cfg.force_cpu, num_passes);
++    if (!dump_ref.empty()) return cmd_dump_ref(cfg.model_path, dump_ref, prompt_ids_str, cfg.bopts, cfg.force_cpu, num_passes);
+     if (ring_check_stride > 0) {
+         std::vector<int32_t> rc_ids;
+         std::string rc_err;
+@@ -1048,7 +1115,7 @@
+             fprintf(stderr, "--ring-check needs --prompt-ids (a list or @file)%s%s\n", rc_err.empty() ? "" : ": ", rc_err.c_str());
+             return 2;
+         }
+-        return cmd_ring_check(cfg.model_path, cfg.bopts, cfg.force_cpu, rc_ids, ring_check_stride);
++        return cmd_ring_check(cfg.model_path, cfg.bopts, cfg.force_cpu, rc_ids, ring_check_stride, num_passes);
+     }
+     if (batch_check_n > 0) {
+         std::vector<int32_t> bc_ids;
+@@ -1057,7 +1124,7 @@
+             fprintf(stderr, "--batch-check needs --prompt-ids (a list or @file)\n");
+             return 2;
+         }
+-        return cmd_batch_check(cfg.model_path, cfg.bopts, cfg.force_cpu, bc_ids, batch_check_n);
++        return cmd_batch_check(cfg.model_path, cfg.bopts, cfg.force_cpu, bc_ids, batch_check_n, num_passes);
+     }
+     if (spec_check_n > 0) {
+         std::vector<int32_t> sc_ids;
+@@ -1066,9 +1133,9 @@
+             fprintf(stderr, "--spec-check needs --prompt-ids (a list or @file)%s%s\n", sc_err.empty() ? "" : ": ", sc_err.c_str());
+             return 2;
+         }
+-        return cmd_spec_check(cfg.model_path, cfg.bopts, cfg.force_cpu, sc_ids, spec_check_n);
+-    }
+-    if (mode_bench) return cmd_bench(cfg.model_path, cfg.bopts, bench_prompt, bench_gen, cfg.force_cpu, cfg.bopts.enable_dspark);
++        return cmd_spec_check(cfg.model_path, cfg.bopts, cfg.force_cpu, sc_ids, spec_check_n, num_passes);
++    }
++    if (mode_bench) return cmd_bench(cfg.model_path, cfg.bopts, bench_prompt, bench_gen, cfg.force_cpu, cfg.bopts.enable_dspark, num_passes);
+ 
+     if (cfg.model_path.empty()) {
+         fprintf(stderr, "error: --native <model.strata|hf_dir|model.gguf> is required\n");
+@@ -1082,6 +1149,8 @@
+         else fprintf(stderr, "open: %s\n", err.c_str());
+         return 1;
+     }
++
++    if (!apply_num_passes(mf, num_passes, cfg.bopts.enable_dspark)) return 2;
+ 
+     auto backend = make_default_backend(cfg.force_cpu, &cfg.bopts);
+     if (!backend->init(mf, cfg.bopts, err)) {
+@@ -1114,9 +1183,9 @@
+         fprintf(stderr, "prefill: %s\n", err.c_str());
+         return 1;
+     }
+-    SampleOpts so;
+-    so.temperature = cli_temp;
+-    std::mt19937_64 rng(42);
++    SampleOpts so = cfg.sampling;
++    if (cli_temp) so.temperature = *cli_temp;
++    std::mt19937_64 rng(so.seed ? so.seed : (configured_sampling ? 20261121ULL : 42ULL));
+     std::vector<int32_t> hist = ids;
+     int pos = static_cast<int>(ids.size());
+     // INK_LOGITS_HASH=1: FNV-1a of the raw logits bytes of every step on stderr (repeat-run fingerprint, bitwise).
+@@ -1131,10 +1200,12 @@
+     logits_hash(-1);
+     for (int g = 0; g < bench_gen; ++g) {
+         int32_t tok = sample_logits(logits.data(), V, so, hist, rng);
+-        printf("%d%s", tok, (g + 1 == bench_gen) ? "\n" : ",");
++        hist.push_back(tok);
++        const bool repeated = direct_repetition_guard &&
++            scream::inkling::detect_repetition_loop(hist.data() + ids.size(), hist.size() - ids.size());
++        printf("%d%s", tok, (repeated || g + 1 == bench_gen) ? "\n" : ",");
+         fflush(stdout);
+-        hist.push_back(tok);
+-        if (tok == mf.m.c.eos_token_id || tok == mf.m.c.eot_token_id) break;
++        if (repeated || tok == mf.m.c.eos_token_id || tok == mf.m.c.eot_token_id) break;
+         batch.clear();
+         batch.push(0, pos++, tok, true);
+         if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -545,7 +545,8 @@
+   target_include_directories(dflash2_attn_bench PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(dflash2_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+
+-  add_executable(strata src/program/generate.cpp)
++  add_library(strata STATIC src/program/generate.cpp)
++  target_compile_definitions(strata PRIVATE main=scream_strata_upstream_main)
+   strata_utf8_manifest(strata)
+   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+--- a/src/inkling2/ink_serve.h
++++ b/src/inkling2/ink_serve.h
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <charconv>
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
+@@ -14,6 +15,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <deque>
++#include <fstream>
+ #include <iostream>
+ #include <memory>
+ #include <mutex>
+@@ -27,6 +29,10 @@
+ #include "ink_backend.h"
+ #include "ink_batch.h"
+ #include "ink_manifest.h"
++#include "inkling_sampling.hpp"
++#include "inkling_lookup.hpp"
++#include "inkling_repetition.hpp"
++#include <string_view>
+ #include "ink_vision.h"
+ 
+ namespace ink2 {
+@@ -49,125 +55,6 @@
+     fflush(stdout);
+ }
+ 
+-struct SampleOpts {
+-    float temperature = 0.0f;
+-    float top_p = 1.0f;
+-    int top_k = 64;
+-    float min_p = 0.0f;
+-    float rep = 1.0f;
+-    float freq = 0.0f;
+-    float pres = 0.0f;
+-    int last_n = 64;
+-    uint64_t seed = 0;
+-    int hold_budget = 0;       // hold=N:ID reasoning budget
+-    int32_t hold_token_id = -1;
+-    int pen_from = 0;
+-
+-    bool greedy() const noexcept { return temperature <= 0.0f; }
+-    bool penalties() const noexcept { return rep != 1.0f || freq != 0.0f || pres != 0.0f; }
+-};
+-
+-// The K best token ids of lg[0..V-1], best first: larger logit first, the smaller id first on equal logits.  Exactly what
+-// std::partial_sort over an iota with that order leaves in idx[0..K-1], but one pass over the row (about 0.1 ms for V = 200058
+-// instead of a few ms), because every sampled token of every slot pays it on the host (#6779: 16..64 slots, temperature > 0).
+-inline void ink_top_k_ids(const float* lg, int V, int K, std::vector<int>& idx) {
+-    K = std::max(0, std::min(K, V));
+-    idx.assign((size_t)K, 0);
+-    if (K == 0) return;
+-    std::vector<float> val((size_t)K);
+-    int n = 0;
+-    for (int i = 0; i < V; ++i) {
+-        const float v = lg[i];
+-        if (n == K && !(v > val[K - 1])) continue;   // a later id with an equal logit sorts after the kept ones
+-        int j = (n < K) ? n++ : K - 1;
+-        while (j > 0 && v > val[j - 1]) { val[j] = val[j - 1]; idx[j] = idx[j - 1]; --j; }
+-        val[j] = v;
+-        idx[j] = i;
+-    }
+-}
+-
+-// The sampling step once the K best candidates are known: tv[i] is the logit of token ti[i], best first (larger logit first, the
+-// smaller id first on equal logits), K = min(top_k, vocab, 128).  Shared by sample_logits (candidates found on the host) and the
+-// candidate rows a backend returns (forward_batch_cand), so both give the same token for the same seed.
+-inline int32_t ink_sample_top(const float* tv, const int* ti, int K, const SampleOpts& s, std::mt19937_64& rng) {
+-    std::vector<double> p(K);
+-    double mx = tv[0], sum = 0.0;
+-    for (int i = 0; i < K; ++i) {
+-        p[i] = std::exp((tv[i] - mx) / static_cast<double>(s.temperature));
+-        sum += p[i];
+-    }
+-    for (double& x : p) x /= sum;
+-    int keep = K;
+-    if (s.min_p > 0.0f) {
+-        const double thr = static_cast<double>(s.min_p) * p[0];
+-        keep = 1;
+-        while (keep < K && p[keep] >= thr) ++keep;
+-    }
+-    if (s.top_p < 1.0f) {
+-        double c = 0.0;
+-        int k2 = 0;
+-        while (k2 < keep) {
+-            c += p[k2++];
+-            if (c >= static_cast<double>(s.top_p)) break;
+-        }
+-        keep = std::max(1, k2);
+-    }
+-    double z = 0.0;
+-    for (int i = 0; i < keep; ++i) z += p[i];
+-    std::uniform_real_distribution<double> u(0.0, z);
+-    const double r = u(rng);
+-    double c = 0.0;
+-    for (int i = 0; i < keep; ++i) {
+-        c += p[i];
+-        if (r <= c) return ti[i];
+-    }
+-    return ti[keep - 1];
+-}
+-
+-// Sampling from a candidate row (ink2::CandRows, `cand` = the row's kInkCandidates entries).  Only for a slot without penalties:
+-// a penalty changes logits anywhere in the row before the best are picked, so such a slot needs its full row.
+-inline int32_t sample_candidates(const float* cv, const int32_t* ci, int V, const SampleOpts& s, std::mt19937_64& rng) {
+-    if (s.greedy()) return ci[0];
+-    const int K = std::min(std::max(1, s.top_k), std::min(V, 128));
+-    return ink_sample_top(cv, ci, K, s, rng);
+-}
+-
+-inline int32_t sample_logits(float* lg, int V, const SampleOpts& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+-    if (s.penalties() && s.last_n > 0) {
+-        size_t start = static_cast<size_t>(std::max(0, s.pen_from));
+-        if (hist.size() > start) {
+-            size_t from = (hist.size() - start > static_cast<size_t>(s.last_n)) ? (hist.size() - static_cast<size_t>(s.last_n)) : start;
+-            std::unordered_map<int32_t, int> cnt;
+-            for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+-            for (const auto& kv : cnt) {
+-                if (kv.first < 0 || kv.first >= V) continue;
+-                float& x = lg[kv.first];
+-                if (s.rep != 1.0f) x = (x > 0.0f) ? (x / s.rep) : (x * s.rep);
+-                x -= static_cast<float>(kv.second) * s.freq + (s.pres != 0.0f ? s.pres : 0.0f);
+-            }
+-        }
+-    }
+-    if (s.greedy()) {
+-        int32_t best = 0;
+-        float mx = lg[0];
+-        for (int i = 1; i < V; ++i) {
+-            if (lg[i] > mx) { mx = lg[i]; best = i; }
+-        }
+-        return best;
+-    }
+-    const int K = std::min(std::max(1, s.top_k), std::min(V, 128));
+-    std::vector<int> idx;
+-    ink_top_k_ids(lg, V, K, idx);
+-    std::vector<float> tv((size_t)K);
+-    for (int i = 0; i < K; ++i) tv[(size_t)i] = lg[idx[(size_t)i]];
+-    return ink_sample_top(tv.data(), idx.data(), K, s, rng);
+-}
+-
+-inline bool finite_logits(const float* lg, int V) noexcept {
+-    for (int i = 0; i < V; i += 67) if (!std::isfinite(lg[i])) return false;
+-    return true;
+-}
+-
+ // Exact lossless speculative verification sampler for DSpark (Leviathan et al., 2023):
+ // Given target logits `lg[0..V-1]` and a deterministic draft token `draft_tok`:
+ //   - If greedy: picks argmax and accepts iff argmax == draft_tok.
+@@ -254,33 +141,17 @@
+     return last_valid;
+ }
+ 
+-// Anti-loop repetition detector: detects pathological n-gram stalling while avoiding false positives on structured YAML/JSON (#6620)
+-inline bool detect_repetition_loop(const std::vector<int32_t>& gen_ids) noexcept {
+-    const size_t n = gen_ids.size();
+-    if (n < 96) return false;
+-    for (size_t period = 1; period <= 32; ++period) {
+-        const size_t need_reps = (period <= 4) ? 24 : 10;
+-        if (n < period * need_reps) continue;
+-        bool match = true;
+-        for (size_t k = 0; k < period * (need_reps - 1); ++k) {
+-            if (gen_ids[n - 1 - k] != gen_ids[n - 1 - k - period]) {
+-                match = false;
+-                break;
+-            }
+-        }
+-        if (match) return true;
+-    }
+-    return false;
+-}
+-
+ struct ParsedGen {
+     std::string cmd;      // GEN, BGEN, GENERATE
+     int slot = 0;         // for BGEN <slot> ...
+     std::string req_id;   // for GENERATE <req_id> ...
+     int max_new = 128;
++    int lookup = 0;
++    size_t reply_prefix = 0;  // already emitted tokens at the end of a resumed request's input
+     SampleOpts s;
+     std::vector<int32_t> ids;
+     std::vector<std::string> images;
++    std::string image_embeddings;
+     int pin = 0;          // shared-prefix checkpoint boundary (tokens)
+     bool prefill_only = false;
+     bool slot_read = false;
+@@ -316,6 +187,8 @@
+     }
+     if (w.empty()) return false;
+     r.cmd = w[0];
++    const bool external_images = r.cmd == "GENI" || r.cmd == "BGENI";
++    if (external_images) r.cmd.pop_back();
+     size_t arg_idx = 1;
+     if (r.cmd == "BGEN") {
+         if (w.size() < 4) { err = "expected: BGEN <slot> <max_new> [k=v ...] <ids>"; return false; }
+@@ -338,7 +211,17 @@
+     if (*e || mn < 0) { err = "bad max_new"; return false; }
+     r.max_new = static_cast<int>(mn);
+ 
+-    for (size_t k = arg_idx + 1; k + 1 < w.size(); ++k) {
++    size_t key_end = w.size() - 1;
++    if (external_images) {
++        if (arg_idx + 1 >= key_end) { err = "GENI requires an embeddings file and token ids"; return false; }
++        r.image_embeddings = pct_decode(w[--key_end]);
++        if (r.image_embeddings.find('\0') != std::string::npos) {
++            err = "invalid GENI embeddings path";
++            return false;
++        }
++    }
++
++    for (size_t k = arg_idx + 1; k < key_end; ++k) {
+         size_t eq = w[k].find('=');
+         if (eq == std::string::npos) { err = "bad key " + w[k]; return false; }
+         std::string key = w[k].substr(0, eq), val = w[k].substr(eq + 1);
+@@ -353,6 +236,22 @@
+         else if (key == "penalty_last_n") r.s.last_n = static_cast<int>(d);
+         else if (key == "pen_from") r.s.pen_from = static_cast<int>(d);
+         else if (key == "seed") r.s.seed = std::strtoull(val.c_str(), nullptr, 10);
++        else if (key == "reply_prefix") {
++            const auto [end, error] = std::from_chars(val.data(), val.data() + val.size(), r.reply_prefix);
++            if (error != std::errc{} || end != val.data() + val.size()) {
++                err = "bad reply_prefix";
++                return false;
++            }
++        }
++        else if (key == "lookup") {
++            char* end = nullptr;
++            const long n = std::strtol(val.c_str(), &end, 10);
++            if (end == val.c_str() || *end || n < 0 || n > kMaxPromptLookup) {
++                err = "lookup must be an integer from 0 to " + std::to_string(kMaxPromptLookup);
++                return false;
++            }
++            r.lookup = static_cast<int>(n);
++        }
+         else if (key == "pin") {
+             char* end = nullptr;
+             const long n = std::strtol(val.c_str(), &end, 10);
+@@ -379,7 +278,66 @@
+             return false;
+         }
+     }
+-    return parse_id_list(w.back(), r.ids, err);
++    if (external_images && !r.images.empty()) {
++        err = "GENI requires embeddings without image= paths";
++        return false;
++    }
++    if (!parse_id_list(w.back(), r.ids, err)) return false;
++    if (r.reply_prefix >= r.ids.size()) {
++        err = "reply_prefix must leave at least one original prompt token";
++        return false;
++    }
++    return true;
++}
++
++// Read Strata's SVE1 records in prompt order. The adapter expands each picture's placeholder before GENI.
++inline bool read_inkling_embeddings(const std::string& path, const std::vector<int32_t>& ids,
++                                    int image_pad, int hidden, std::vector<int32_t>& img_idx,
++                                    std::vector<float>& embeddings, std::string& err) {
++    std::ifstream input(path, std::ios::binary | std::ios::ate);
++    const auto end = input.tellg();
++    if (!input || end <= std::streampos(0)) { err = "cannot read image embeddings"; return false; }
++    const size_t pads = std::count(ids.begin(), ids.end(), image_pad);
++    const size_t row_bytes = (size_t)hidden * sizeof(float);
++    if (pads == 0 || ids.back() == image_pad ||
++        (uint64_t)end > pads * (row_bytes + 5 * sizeof(int32_t))) {
++        err = "image embeddings do not match the prompt";
++        return false;
++    }
++    input.seekg(0);
++    img_idx.assign(ids.size(), -1);
++    embeddings.clear();
++    size_t rows = 0, pos = 0;
++    while (input.tellg() < end) {
++        int32_t h[5]{};
++        if (!input.read(reinterpret_cast<char*>(h), sizeof(h)) ||
++            h[0] != 0x31455653 || h[1] <= 0 || h[2] <= 0 || h[3] <= 0 ||
++            (int64_t)h[2] * h[3] != h[1] || h[4] != hidden || (size_t)h[1] > pads - rows) {
++            err = "invalid SVE1 image embeddings record";
++            return false;
++        }
++        while (pos < ids.size() && ids[pos] != image_pad) ++pos;
++        const size_t count = (size_t)h[1];
++        for (size_t i = 0; i < count; ++i, ++pos) {
++            if (pos >= ids.size() || ids[pos] != image_pad) {
++                err = "image embeddings do not match the prompt";
++                return false;
++            }
++            img_idx[pos] = static_cast<int32_t>(rows + i);
++        }
++        const size_t bytes = count * row_bytes;
++        if ((uint64_t)(end - input.tellg()) < bytes) { err = "short image embeddings record"; return false; }
++        embeddings.resize((rows + count) * hidden);
++        float* first = embeddings.data() + rows * hidden;
++        if (!input.read(reinterpret_cast<char*>(first), bytes) ||
++            !std::all_of(first, first + count * hidden, [](float v) { return std::isfinite(v); })) {
++            err = "invalid image embedding values";
++            return false;
++        }
++        rows += count;
++    }
++    if (rows != pads) { err = "image embeddings do not match the prompt"; return false; }
++    return true;
+ }
+ 
+ // ---- Non-blocking stdin reader thread ----
+@@ -470,9 +428,11 @@
+     double decode_t0 = 0.0;
+     int drafts_offered = 0;
+     int drafts_accepted = 0;
++    int lookup_max = 0;
++    int lookup_width = 0;
++    int lookup_cooldown = 0;
+     bool cancelled = false;
+     bool admitted = false;
+-    bool slot_read = false;
+     // STRATA_INK_SPEC=adapt governor state (measurement experiment, see run_serve_loop)
+     int gov_plain_left = 0;    // plain decode steps still to run before the next speculative probe
+     int gov_calib_left = 0;    // plain steps to run first to learn what one plain step costs
+@@ -485,6 +445,7 @@
+     std::string model_path;
+     std::string vision_path;
+     BackendOpts bopts;
++    SampleOpts sampling;
+     std::string draft_mode = "auto";  // auto | dspark | off
+     bool force_cpu = false;
+     bool anti_loop = true;
+@@ -505,6 +466,10 @@
+     bool cand_ok = !(std::getenv("STRATA_INK_NO_CAND") && std::getenv("STRATA_INK_NO_CAND")[0] == '1');
+     if (const char* e = std::getenv("STRATA_INK_PREFILL_CAP"); e && *e) prefill_cap = std::max(0, std::atoi(e));
+     const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
++    if (cfg.bopts.lookup > 0 && !backend.supports_prompt_lookup()) {
++        proto("ERR --lookup needs a verifier with rollback support (CPU or CUDA without layer split)");
++        return 2;
++    }
+     // STRATA_INK_SPEC=block: measurement switch, greedy requests use the linear block-8 drafter + batch verify instead of the beam tree
+     const char* spec_env = std::getenv("STRATA_INK_SPEC");
+     const bool spec_tree = !(spec_env && std::string(spec_env) == "block");
+@@ -559,12 +524,12 @@
+         if (kd == KvDtype::K8V4)     return "k8v4";
+         return "fp16";
+     }();
+-    proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 shared_prefix=%d kv_dtype=%s drafter=%s drafting=%s images=%d image_pad=%d parallel=%d ckpt_key=1",
++    proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 shared_prefix=%d kv_dtype=%s drafter=%s drafting=%s images=%d image_pad=%d image_embd=1 parallel=%d ckpt_key=1 lookup=%d reply_prefix=1",
+           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
+           P, backend.supports_shared_checkpoint() ? 1 : 0, kv_str,
+           mf.m.dspark.present ? "dspark" : "none",
+           use_dspark ? "dspark" : "off",
+-          images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
++          images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots, cfg.bopts.lookup);
+     proto("READY %d stop hold holdb", eff_max_ctx);
+ 
+     std::vector<ActiveReq> reqs(P);
+@@ -576,28 +541,41 @@
+         return tok == c.eos_token_id || tok == c.eot_token_id;
+     };
+ 
++    auto speculative_finish = [&](const ActiveReq& rq, int32_t tok, int pos) -> const char* {
++        if (is_stop_tok(tok)) return "stop";
++        const bool loop = cfg.anti_loop && scream::inkling::detect_repetition_loop(rq.gen_ids);
++        if (rq.is_ext_gen && loop) return "loop";
++        if (!rq.is_ext_gen && rq.s.hold_budget > 0 && rq.generated >= rq.s.hold_budget &&
++            tok != rq.s.hold_token_id) return "hold";
++        if (rq.generated >= rq.max_new || pos + 1 >= eff_max_ctx) return "length";
++        return loop ? "loop" : nullptr;
++    };
++
+     auto finish_req = [&](ActiveReq& rq, const char* reason) {
++        const bool loop_stop = std::string_view(reason) == "loop";
++        const char* detail = loop_stop ? " loop_stop=1" : "";
++        if (loop_stop) reason = "stop";
+         const double dec_ms = (rq.decode_t0 > 0.0) ? (now_s() - rq.decode_t0) * 1000.0 : 0.0;
+         if (rq.is_solo) {
+             // Emit full 9-field DONE line so server.py _parse_done() records drafts_accepted, drafts_offered, reused (#6633, #6627)!
+-            proto("DONE %d %d %.1f %.1f %s %d %d %d",
++            proto("DONE %d %d %.1f %.1f %s %d %d %d%s",
+                   rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+-                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
++                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens, detail);
+         } else if (rq.is_ext_gen) {
+-            proto("DONE %s %d %d %.1f %.1f %s %d %d %d",
++            proto("DONE %s %d %d %.1f %.1f %s %d %d %d%s",
+                   rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+-                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
++                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens, detail);
+             req_id_to_slot.erase(rq.req_id);
+         } else {
+             if (!rq.admitted) {
+-                proto("DONE %d %d %.1f 0.0 %s %d %d %d",
++                proto("DONE %d %d %.1f 0.0 %s %d %d %d%s",
+                       rq.generated, rq.prompt_len, rq.prompt_ms, reason,
+-                      rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
++                      rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens, detail);
+                 proto("BADM %d 0", rq.slot);
+             } else {
+                 char dstr[64] = "";
+                 if (rq.drafts_offered > 0) snprintf(dstr, sizeof(dstr), " drafts=%d:%d", rq.drafts_offered, rq.drafts_accepted);
+-                proto("BDONE %d %d %s %.1f read=%.1f%s", rq.slot, rq.generated, reason, dec_ms, rq.prompt_ms, dstr);
++                proto("BDONE %d %d %s %.1f read=%.1f%s%s", rq.slot, rq.generated, reason, dec_ms, rq.prompt_ms, dstr, detail);
+             }
+         }
+         rq.active = false;
+@@ -615,9 +593,11 @@
+         rq.rng.seed(pg.s.seed ? pg.s.seed : 20261121ULL);
+         rq.cancelled = false;
+         rq.admitted = false;
+-        rq.slot_read = pg.slot_read;
+         rq.drafts_offered = 0;
+         rq.drafts_accepted = 0;
++        rq.lookup_max = std::min(pg.lookup, cfg.bopts.lookup);
++        rq.lookup_width = std::min(rq.lookup_max, 4);
++        rq.lookup_cooldown = 0;
+         rq.t_start = now_s();
+         rq.prompt_ms = 0.0;
+         rq.decode_t0 = 0.0;
+@@ -625,7 +605,20 @@
+         rq.img_embeds.clear();
+         rq.prompt_img_idx.clear();
+ 
+-        if (!pg.images.empty()) {
++        const bool has_images = !pg.images.empty() || !pg.image_embeddings.empty();
++        if (!pg.image_embeddings.empty()) {
++            if (pg.ids.size() >= static_cast<size_t>(eff_max_ctx)) {
++                err = "image prompt exceeds the context window";
++                rq.active = false;
++                return false;
++            }
++            if (!read_inkling_embeddings(pg.image_embeddings, pg.ids, c.image_token_id, c.hidden,
++                                         rq.prompt_img_idx, rq.img_embeds, err)) {
++                rq.active = false;
++                return false;
++            }
++            rq.prompt_ids = pg.ids;
++        } else if (!pg.images.empty()) {
+             if (!images_ok) {
+                 err = "image: engine started without --vision Inkling-2-Mini-Vision.strata";
+                 rq.active = false;
+@@ -663,7 +656,15 @@
+             rq.active = false;
+             return false;
+         }
+-        if (pg.images.empty() && pg.pin >= rq.prompt_len) {
++        if (pg.reply_prefix != 0) {
++            if (cfg.anti_loop) {
++                const size_t guard_tokens = std::min(pg.reply_prefix, scream::inkling::repetition_guard_history);
++                rq.gen_ids.assign(rq.prompt_ids.end() - guard_tokens, rq.prompt_ids.end());
++            }
++            // Plain sampling and lookup consume one target draw per token. DSpark uses rejection sampling.
++            if (!use_dspark && !rq.s.greedy()) skip_target_draws(rq.rng, pg.reply_prefix);
++        }
++        if (!has_images && pg.pin >= rq.prompt_len) {
+             err = "bad pin boundary";
+             rq.active = false;
+             return false;
+@@ -672,7 +673,7 @@
+         // Because prompt_ckpt_prefix is saved at prompt_len - 1 before generation, BOTH multi-turn follow-ups
+         // (even if hidden thinking or stop tokens differed) AND exact repeats reuse the full prior prompt!
+         int reuse = 0;
+-        if (pg.images.empty()) {
++        if (!has_images) {
+             int full_match = 0;
+             if (!rq.cached_prefix.empty() && static_cast<int>(rq.cached_prefix.size()) < rq.prompt_len) {
+                 const int clen = static_cast<int>(rq.cached_prefix.size());
+@@ -721,12 +722,12 @@
+             proto("RESUME %d", reuse);
+         }
+         if (reuse < static_cast<int>(rq.shared_prefix.size())) rq.shared_prefix.clear();
+-        rq.pin = pg.images.empty() ? pg.pin : 0;
++        rq.pin = !has_images ? pg.pin : 0;
+         rq.shared_pending = rq.pin > reuse && static_cast<int>(rq.shared_prefix.size()) != rq.pin;
+         rq.reused_tokens = reuse;
+         // ckpt=0 (a later pass of one request: the thinking budget's wrap-up, a reply written again): the checkpoint of the
+         // request's first pass, at the end of the prompt the client sends back, stays; this pass's longer prompt would replace it.
+-        rq.ckpt_pending = (pg.images.empty() && !pg.no_ckpt && rq.prompt_len >= 16 && reuse < rq.prompt_len - 1);
++        rq.ckpt_pending = (!has_images && !pg.no_ckpt && rq.prompt_len >= 16 && reuse < rq.prompt_len - 1);
+         rq.prefill_pos = reuse;
+         rq.cur_pos = reuse;
+         rq.hist = rq.prompt_ids;
+@@ -789,8 +790,11 @@
+             }
+             return true;
+         }
+-        if (line.rfind("GEN ", 0) == 0 || line.rfind("BGEN ", 0) == 0 || line.rfind("GENERATE ", 0) == 0) {
++        if (line.rfind("GEN ", 0) == 0 || line.rfind("BGEN ", 0) == 0 || line.rfind("GENERATE ", 0) == 0 ||
++            line.rfind("GENI ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+             ParsedGen pg;
++            pg.s = cfg.sampling;
++            pg.lookup = cfg.bopts.lookup;
+             std::string perr;
+             if (!parse_gen_cmd(line, pg, perr)) {
+                 proto("ERR %s", perr.c_str());
+@@ -873,14 +877,30 @@
+             continue;
+         }
+ 
+-        // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
+-        if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
+-            reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
+-            reqs[sole_slot].cur_pos + 8 < eff_max_ctx &&
+-            !(spec_adapt && (reqs[sole_slot].gov_plain_left > 0 || reqs[sole_slot].gov_calib_left > 0))) {
++        // One active slot can use the shared verification scratch. Multiple active slots retain continuous batching.
++        const bool can_verify = n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
++                                reqs[sole_slot].max_new - reqs[sole_slot].generated > 1;
++        const bool try_dspark = can_verify && use_dspark && reqs[sole_slot].cur_pos + 8 < eff_max_ctx &&
++                               !(spec_adapt && (reqs[sole_slot].gov_plain_left > 0 || reqs[sole_slot].gov_calib_left > 0));
++        std::vector<int32_t> lookup;
++        if (can_verify && reqs[sole_slot].lookup_max > 0) {
++            auto& rq = reqs[sole_slot];
++            const int cap = backend.kv_capacity_tokens();
++            int max_d = std::min({rq.lookup_width, rq.max_new - rq.generated - 1, eff_max_ctx - rq.cur_pos - 2});
++            // Grow elastic KV on the regular decode path, so a speculative tail never ends a request early.
++            if (cap > 0) max_d = std::min(max_d, cap - rq.cur_pos - 1);
++            if (rq.lookup_cooldown > 0) {
++                --rq.lookup_cooldown;
++            } else if (max_d > 0) {
++                int match = 0;
++                lookup = scream::inkling::prompt_lookup(rq.hist, max_d, V, &match, c.image_token_id);
++                if (try_dspark && match < 6) lookup.clear();
++            }
++        }
++        if (!lookup.empty() || try_dspark) {
+             auto& rq = reqs[sole_slot];
+             // 2a. Zero-D2H fused greedy Beam Tree speculative step (when greedy, no penalties, and headroom >= 12)
+-            if (spec_tree && rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
++            if (lookup.empty() && spec_tree && rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
+                 int32_t emitted[16]{};
+                 int drafted = 0;
+                 std::string serr;
+@@ -910,9 +930,8 @@
+                         else if (rq.is_ext_gen) proto("T %s %d", rq.req_id.c_str(), tok);
+                         else proto("BT %d %d", rq.slot, tok);
+ 
+-                        if (is_stop_tok(tok)) { fin = "stop"; done = true; break; }
+-                        if (rq.generated >= rq.max_new) { fin = "length"; done = true; break; }
+-                        if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; break; }
++                        fin = speculative_finish(rq, tok, rq.cur_pos + kept);
++                        if (fin) { done = true; break; }
+                     }
+                     if (!done) {
+                         rq.next_tok = emitted[n_emit - 1];
+@@ -931,28 +950,44 @@
+             std::string derr;
+             const int max_d = std::min(7, rq.max_new - rq.generated - 1);
+             const double gov_b0 = now_s();
+-            int nd = backend.dspark_draft(rq.slot, rq.next_tok, rq.cur_pos, max_d, draft_ids, derr);
++            const bool from_lookup = !lookup.empty();
++            const int nd = from_lookup ? static_cast<int>(lookup.size()) :
++                           backend.dspark_draft(rq.slot, rq.next_tok, rq.cur_pos, max_d, draft_ids, derr);
++            if (from_lookup) std::copy(lookup.begin(), lookup.end(), draft_ids);
+             if (nd > 0) {
+                 backend.snapshot_slot(rq.slot);
+                 batch.clear();
+-                batch.capture_taps = true;
++                batch.capture_taps = use_dspark;
+                 batch.push(rq.slot, rq.cur_pos, rq.next_tok, true);
+                 for (int i = 0; i < nd; ++i) {
+                     batch.push(rq.slot, rq.cur_pos + 1 + i, draft_ids[i], true);
+                 }
+-                logits_buf.resize(static_cast<size_t>(nd + 1) * V);
+                 std::string ferr;
+-                if (!backend.forward_batch(batch, logits_buf.data(), nullptr, ferr)) {
++                CandRows candidates;
++                bool use_cand = from_lookup && cand_ok && backend.supports_candidates() && !rq.s.penalties();
++                bool fwd_ok = true;
++                if (use_cand) {
++                    fwd_ok = backend.forward_batch_cand(batch, candidates, ferr);
++                    if (!fwd_ok && candidates.rows == 0) {
++                        cand_ok = false;
++                        use_cand = false;
++                    }
++                }
++                if (!use_cand) {
++                    logits_buf.resize(static_cast<size_t>(nd + 1) * V);
++                    fwd_ok = backend.forward_batch(batch, logits_buf.data(), nullptr, ferr);
++                }
++                if (!fwd_ok) {
+                     proto("ERR fatal GPU error: %s", ferr.c_str());
+                     return 1;
+                 }
+                 rq.drafts_offered += nd;
+-                int accepted = 0;
++                int kept = 0, accepted = 0;
+                 bool done = false;
+                 const char* fin = nullptr;
+                 for (int i = 0; i <= nd; ++i) {
+-                    float* lg = logits_buf.data() + static_cast<size_t>(i) * V;
+-                    if (!finite_logits(lg, V)) {
++                    float* lg = use_cand ? nullptr : logits_buf.data() + static_cast<size_t>(i) * V;
++                    if (use_cand ? candidates.finite[i] == 0 : !finite_logits(lg, V)) {
+                         // Never leave poisoned KV/ShortConv prefix cached across retries (#879)!
+                         rq.cached_prefix.clear();
+                         rq.prompt_ckpt_prefix.clear();
+@@ -963,9 +998,16 @@
+                         break;
+                     }
+                     bool draft_ok = false;
+-                    int32_t tok = (i < nd)
+-                        ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok)
+-                        : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
++                    int32_t tok;
++                    if (i < nd && !from_lookup) {
++                        tok = verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok);
++                    } else {
++                        const size_t offset = static_cast<size_t>(i) * InkBackend::kInkCandidates;
++                        tok = use_cand ? sample_candidates(candidates.val.data() + offset, candidates.idx.data() + offset, V, rq.s, rq.rng)
++                                       : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
++                        // Lookup uses the same single target draw as plain decode, including its seed and penalties.
++                        draft_ok = i < nd && tok == draft_ids[i];
++                    }
+                     rq.hist.push_back(tok);
+                     rq.gen_ids.push_back(tok);
+                     rq.cached_prefix.push_back(i == 0 ? rq.next_tok : draft_ids[i - 1]);
+@@ -974,27 +1016,30 @@
+                     else if (rq.is_ext_gen) proto("T %s %d", rq.req_id.c_str(), tok);
+                     else proto("BT %d %d", rq.slot, tok);
+ 
+-                    if (is_stop_tok(tok)) { fin = "stop"; done = true; ++accepted; break; }
+-                    if (rq.generated >= rq.max_new) { fin = "length"; done = true; ++accepted; break; }
+-                    if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; ++accepted; break; }
+-                    if (i < nd && draft_ok) {
++                    ++kept;
++                    if (draft_ok) {
+                         ++accepted;
+                         ++rq.drafts_accepted;
+-                    } else {
++                    }
++                    fin = speculative_finish(rq, tok, rq.cur_pos + kept);
++                    if (fin || !draft_ok) {
+                         rq.next_tok = tok;
+-                        ++accepted;
+                         break;
+                     }
+                 }
+-                if (!done) {
+-                    if (accepted <= nd) {
+-                        // Rolled back to anchor + accepted tokens
+-                        backend.rollback_slot(rq.slot, rq.cur_pos + accepted);
++                if (!done) {   // nonfinite already reset the whole slot
++                    rq.cur_pos += kept;
++                    if (kept <= nd) backend.rollback_slot(rq.slot, rq.cur_pos);
++                    else backend.discard_snapshot(rq.slot);
++                    if (fin) {
++                        finish_req(rq, fin);
++                    } else if (from_lookup) {
++                        const int width = accepted == nd ? std::max(2, rq.lookup_width * 2) : std::max(2, accepted + 1);
++                        rq.lookup_width = std::min(rq.lookup_max, width);
++                        if (accepted == 0 && !use_dspark) rq.lookup_cooldown = 4;
++                    } else if (spec_adapt) {
++                        gov_step(rq, kept, (now_s() - gov_b0) * 1000.0);
+                     }
+-                    rq.cur_pos += accepted;
+-                    if (spec_adapt) gov_step(rq, accepted, (now_s() - gov_b0) * 1000.0);
+-                } else if (fin) {
+-                    finish_req(rq, fin);
+                 }
+                 continue;
+             }
+@@ -1175,7 +1220,7 @@
+             const bool stop = is_stop_tok(tok);
+             const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= eff_max_ctx);
+             const bool hit_hold = (rq.s.hold_budget > 0 && rq.generated >= rq.s.hold_budget && tok != rq.s.hold_token_id);
+-            const bool hit_loop = cfg.anti_loop && detect_repetition_loop(rq.gen_ids);
++            const bool hit_loop = cfg.anti_loop && scream::inkling::detect_repetition_loop(rq.gen_ids);
+ 
+             if (rq.is_solo) {
+                 if (just_finished_prefill) rq.decode_t0 = now_s();
+@@ -1183,35 +1228,33 @@
+                 if (stop) finish_req(rq, "stop");
+                 else if (hit_hold) finish_req(rq, "hold");
+                 else if (hit_len) finish_req(rq, "length");
+-                else if (hit_loop) finish_req(rq, "stop");
++                else if (hit_loop) finish_req(rq, "loop");
+             } else if (rq.is_ext_gen) {
+                 if (just_finished_prefill) rq.decode_t0 = now_s();
+                 proto("T %s %d", rq.req_id.c_str(), tok);
+-                if (stop || hit_loop) finish_req(rq, "stop");
++                if (stop) finish_req(rq, "stop");
++                else if (hit_loop) finish_req(rq, "loop");
+                 else if (hit_len) finish_req(rq, "length");
+             } else {
+-                // Native Strata BGEN slot protocol: first token goes on control lines (T + DONE + BADM <slot> <cont>),
+-                // subsequent tokens stream asynchronously on slot lines (BT <slot> <id> ... BDONE <slot> ...)
++                // BGEN without slot_read admits with a token on the control lines. slot_read already admitted it.
+                 if (!rq.admitted) {
+                     rq.decode_t0 = now_s();
+-                    const bool cont = !(stop || hit_len || hit_hold || hit_loop);
+-                    if (!rq.slot_read) proto("T %d", tok);
+-                    const char* fin = stop ? "stop" : hit_hold ? "hold" : hit_len ? "length" : hit_loop ? "stop" : "admit";
+-                    proto("DONE %d %d %.1f 0.0 %s 0 0 %d", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin, rq.reused_tokens);
+-                    proto("BADM %d %d", rq.slot, cont ? 1 : 0);
+-                    if (rq.slot_read) proto("BT %d %d", rq.slot, tok);
+-                    rq.admitted = true;
+-                    if (!cont) {
+-                        if (rq.slot_read) proto("BDONE %d %d %s 0.0 read=%.1f", rq.slot, rq.generated, fin, rq.prompt_ms);
+-                        rq.active = false;
++                    proto("T %d", tok);
++                    const char* reason = stop ? "stop" : hit_hold ? "hold" : hit_len ? "length" : hit_loop ? "loop" : nullptr;
++                    if (reason) {
++                        finish_req(rq, reason);
++                        continue;
+                     }
++                    proto("DONE 1 %d %.1f 0.0 admit 0 0 %d", rq.prompt_len, rq.prompt_ms, rq.reused_tokens);
++                    proto("BADM %d 1", rq.slot);
++                    rq.admitted = true;
+                 } else {
+                     if (just_finished_prefill) rq.decode_t0 = now_s();
+                     proto("BT %d %d", rq.slot, tok);
+                     if (stop) finish_req(rq, "stop");
+                     else if (hit_hold) finish_req(rq, "hold");
+                     else if (hit_len) finish_req(rq, "length");
+-                    else if (hit_loop) finish_req(rq, "stop");
++                    else if (hit_loop) finish_req(rq, "loop");
+                 }
+             }
+         }
+--- a/src/inkling2/ink_manifest.h
++++ b/src/inkling2/ink_manifest.h
+@@ -8,6 +8,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <stdexcept>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -16,6 +17,7 @@
+ #include "ink_json.h"
+ #include "ink_safetensors_loader.h"
+ #include "strata/artifact/strata_reader.hpp"
++#include "strata/inkling2/loop_schedule.hpp"
+ #include "strata/quant/sk_codecs.hpp"
+
+ namespace ink2 {
+@@ -136,31 +138,27 @@
+     int n_swa_visits = 40;
+     int n_global_visits = 8;
+
++    scream::inkling::LoopSchedule loop_schedule() const {
++        return {n_phys, core_start, core_end, num_passes};
++    }
++
+     void build_visit_schedule() {
+-        const int core_len = core_end - core_start;
+-        n_visits = core_start + num_passes * core_len + (n_phys - core_end);
++        const auto schedule = loop_schedule();
++        if (!schedule.valid()) throw std::invalid_argument("invalid Inkling loop geometry");
++        n_visits = schedule.visit_count();
+         visit_to_phys.resize(n_visits);
+         visit_to_pass.resize(n_visits);
+         visit_is_swa.resize(n_visits);
+         visit_kv_slot.resize(n_visits);
+         int swa_idx = 0, glob_idx = 0;
+-        for (int v = 0; v < n_visits; ++v) {
+-            int ip = 0, p = 0;
+-            if (v < core_start) {
+-                ip = v; p = 0;
+-            } else if (v < core_start + num_passes * core_len) {
+-                ip = core_start + ((v - core_start) % core_len);
+-                p = (v - core_start) / core_len;
+-            } else {
+-                ip = core_end + (v - core_start - num_passes * core_len);
+-                p = 0;
+-            }
+-            visit_to_phys[v] = ip;
+-            visit_to_pass[v] = p;
+-            const uint8_t swa = (ip < static_cast<int>(is_swa.size())) ? is_swa[ip] : 1;
+-            visit_is_swa[v] = swa;
+-            visit_kv_slot[v] = swa ? swa_idx++ : glob_idx++;
+-        }
++        schedule.walk([&](scream::inkling::LayerVisit visit) {
++            visit_to_phys[visit.index] = visit.layer;
++            visit_to_pass[visit.index] = visit.pass;
++            const uint8_t swa = (visit.layer < static_cast<int>(is_swa.size())) ? is_swa[visit.layer] : 1;
++            visit_is_swa[visit.index] = swa;
++            visit_kv_slot[visit.index] = swa ? swa_idx++ : glob_idx++;
++            return true;
++        }, [](int) {});
+         n_swa_visits = swa_idx;
+         n_global_visits = glob_idx;
+     }
+--- a/src/inkling2/ink_cpu_backend.cpp
++++ b/src/inkling2/ink_cpu_backend.cpp
+@@ -149,6 +149,7 @@
+         model_ = &model;
+         opts_ = opts;
+         c_ = model.m.c;
++        lookup_swa_slack_ = opts.lookup > 0 ? kMaxPromptLookup : 0;
+         dspark_cfg_ = model.m.dspark;
+         default_kv_dtype_ = opts.kv_dtype;
+ 
+@@ -310,7 +311,8 @@
+         auto& sl = slots_[slot];
+         sl.allocated = true;
+         sl.max_ctx = max_ctx;
+-        sl.kv.init(c_.n_swa_visits, c_.n_global_visits, c_.n_kv * c_.head_dim, c_.swa_win, kv_dtype);
++        // The attention span stays c_.swa_win. Keep trailing speculative writes out of the live ring.
++        sl.kv.init(c_.n_swa_visits, c_.n_global_visits, c_.n_kv * c_.head_dim, c_.swa_win + lookup_swa_slack_, kv_dtype);
+         sl.sconv.init(c_.n_visits, c_.n_kv * c_.head_dim, c_.hidden);
+         sl.sconv_snaps.clear();
+         sl.snap_seq_len = -1;
+@@ -365,6 +367,13 @@
+         sl.recording_snaps = false;
+         sl.snap_seq_len = -1;
+         return true;
++    }
++
++    bool supports_prompt_lookup() const override { return lookup_swa_slack_ > 0; }
++
++    void discard_snapshot(int slot) override {
++        slots_[slot].recording_snaps = false;
++        slots_[slot].snap_seq_len = -1;
+     }
+ 
+     void snapshot_slot(int slot) override {
+@@ -800,19 +809,10 @@
+ 
+             // 2-visit Router Lookahead (v+1, v+2): enqueue late-binding 512 KiB chunked prefetches for future visits!
+             if (cold_store_.is_open() && B == 1) {
+-                auto next_phys_layer = [&](int v_idx) -> int {
+-                    if (v_idx < c_.core_start) return v_idx;
+-                    const int core_len = c_.core_end - c_.core_start;
+-                    const int rel = v_idx - c_.core_start;
+-                    if (rel < core_len * c_.num_passes) return c_.core_start + (rel % core_len);
+-                    const int post = rel - core_len * c_.num_passes;
+-                    const int pl = c_.core_end + post;
+-                    return (pl < c_.n_phys) ? pl : -1;
+-                };
+                 for (int ahead = 1; ahead <= 2; ++ahead) {
+                     const int nv = visit + ahead;
+-                    const int nlp = next_phys_layer(nv);
+-                    if (nlp < 0) break;
++                    if (nv >= c_.n_visits) break;
++                    const int nlp = c_.visit_to_phys[nv];
+                     const std::string np = "model.llm.layers." + std::to_string(nlp);
+                     auto it_gw = trunk_f32_.find(np + ".mlp.gate.weight");
+                     auto it_gb = trunk_f32_.find(np + ".mlp.gate.bias");
+@@ -956,44 +956,29 @@
+             return true;
+         };
+ 
+-        // Prelude: physical layers 0..5
+-        for (int ip = 0; ip < c_.core_start; ++ip) {
+-            if (!run_visit(ip, 0, nullptr)) return false;
+-        }
+-
+-        // Looped Core: physical layers 6..17 x 3 passes
+-        prelude = cur;
+-        prelude_blocks = blocks;
+-        for (int p_idx = 0; p_idx < c_.num_passes; ++p_idx) {
+-            if (p_idx > 0) {
++        if (!c_.loop_schedule().walk([&](scream::inkling::LayerVisit step) {
++            if (step.pass == 0) return run_visit(step.layer, 0, nullptr);
++            std::vector<float> msgs(static_cast<size_t>(B) * 4 * D);
++            const float* mq = msg_queries_[step.layer].data();
++            #pragma omp parallel for schedule(static) if (B > 1)
++            for (int b = 0; b < B; ++b) {
++                std::vector<const float*> bank_ptrs(bank.size());
++                for (size_t k = 0; k < bank.size(); ++k) bank_ptrs[k] = bank[k].data() + static_cast<size_t>(b) * D;
++                attn_res_mix_f32(bank_ptrs, bank_out.data() + static_cast<size_t>(b) * D,
++                                 mq, 4, D, msgs.data() + static_cast<size_t>(b) * 4 * D);
++            }
++            return run_visit(step.layer, step.pass, &msgs);
++        }, [&](int pass) {
++            if (pass == 0) {
++                prelude = cur;
++                prelude_blocks = blocks;
++            } else {
+                 bank.assign(blocks.begin() + static_cast<ptrdiff_t>(prelude_blocks.size() + 1), blocks.end());
+                 bank_out = cur;
+                 cur = prelude;
+                 blocks = prelude_blocks;
+             }
+-            for (int ip = c_.core_start; ip < c_.core_end; ++ip) {
+-                std::vector<float> msgs;
+-                const std::vector<float>* msgs_ptr = nullptr;
+-                if (p_idx > 0) {
+-                    msgs.resize(static_cast<size_t>(B) * 4 * D);
+-                    const float* mq = msg_queries_[ip].data();
+-                    #pragma omp parallel for schedule(static) if (B > 1)
+-                    for (int b = 0; b < B; ++b) {
+-                        std::vector<const float*> bank_ptrs(bank.size());
+-                        for (size_t k = 0; k < bank.size(); ++k) bank_ptrs[k] = bank[k].data() + static_cast<size_t>(b) * D;
+-                        attn_res_mix_f32(bank_ptrs, bank_out.data() + static_cast<size_t>(b) * D,
+-                                         mq, 4, D, msgs.data() + static_cast<size_t>(b) * 4 * D);
+-                    }
+-                    msgs_ptr = &msgs;
+-                }
+-                if (!run_visit(ip, p_idx, msgs_ptr)) return false;
+-            }
+-        }
+-
+-        // Coda: physical layers 18..23
+-        for (int ip = c_.core_end; ip < c_.n_phys; ++ip) {
+-            if (!run_visit(ip, 0, nullptr)) return false;
+-        }
++        })) return false;
+ 
+         // 3. Output depth mix + output_norm
+         const auto& out_q = trunk_f32_.at("model.llm.attn_res.output_query");
+@@ -1312,6 +1297,7 @@
+     DsparkCfg dspark_cfg_;
+     KvDtype default_kv_dtype_ = KvDtype::FP16;
+     bool has_dspark_ = false;
++    int lookup_swa_slack_ = 0;
+ 
+     std::unordered_map<std::string, std::vector<float>> trunk_f32_;
+     std::unordered_map<std::string, PackedTensor> packed_trunk_;
+--- a/src/inkling2/ep_dual_gpu.cu
++++ b/src/inkling2/ep_dual_gpu.cu
+@@ -1460,37 +1460,28 @@
+             return true;
+         };
+
+-        // Prelude (0..core_start-1)
+-        for (int ip = 0; ip < c_.core_start; ++ip) if (!run_visit(ip, 0, nullptr)) return false;
+-        // Looped Core (core_start..core_end-1 x num_passes)
+-        prelude = cur;
+-        prelude_blocks = blocks;
+-        for (int p_idx = 0; p_idx < c_.num_passes; ++p_idx) {
+-            if (p_idx > 0) {
++        if (!c_.loop_schedule().walk([&](scream::inkling::LayerVisit step) {
++            if (step.pass == 0) return run_visit(step.layer, 0, nullptr);
++            std::vector<float> msgs(static_cast<size_t>(B) * 4 * D);
++            const float* mq = msg_queries_[step.layer].data();
++            for (int b = 0; b < B; ++b) {
++                std::vector<const float*> bank_ptrs(bank.size());
++                for (size_t k = 0; k < bank.size(); ++k) bank_ptrs[k] = bank[k].data() + static_cast<size_t>(b) * D;
++                attn_res_mix_f32(bank_ptrs, bank_out.data() + static_cast<size_t>(b) * D,
++                                 mq, 4, D, msgs.data() + static_cast<size_t>(b) * 4 * D);
++            }
++            return run_visit(step.layer, step.pass, &msgs);
++        }, [&](int pass) {
++            if (pass == 0) {
++                prelude = cur;
++                prelude_blocks = blocks;
++            } else {
+                 bank.assign(blocks.begin() + static_cast<ptrdiff_t>(prelude_blocks.size() + 1), blocks.end());
+                 bank_out = cur;
+                 cur = prelude;
+                 blocks = prelude_blocks;
+             }
+-            for (int ip = c_.core_start; ip < c_.core_end; ++ip) {
+-                std::vector<float> msgs;
+-                const std::vector<float>* msgs_ptr = nullptr;
+-                if (p_idx > 0) {
+-                    msgs.resize(static_cast<size_t>(B) * 4 * D);
+-                    const float* mq = msg_queries_[ip].data();
+-                    for (int b = 0; b < B; ++b) {
+-                        std::vector<const float*> bank_ptrs(bank.size());
+-                        for (size_t k = 0; k < bank.size(); ++k) bank_ptrs[k] = bank[k].data() + static_cast<size_t>(b) * D;
+-                        attn_res_mix_f32(bank_ptrs, bank_out.data() + static_cast<size_t>(b) * D,
+-                                         mq, 4, D, msgs.data() + static_cast<size_t>(b) * 4 * D);
+-                    }
+-                    msgs_ptr = &msgs;
+-                }
+-                if (!run_visit(ip, p_idx, msgs_ptr)) return false;
+-            }
+-        }
+-        // Coda (core_end..n_phys-1)
+-        for (int ip = c_.core_end; ip < c_.n_phys; ++ip) if (!run_visit(ip, 0, nullptr)) return false;
++        })) return false;
+
+         // Output depth mix + output_norm
+         const auto& out_q = trunk_f32_.at("model.llm.attn_res.output_query");
+--- a/src/inkling2/cuda/ink_runner.cuh
++++ b/src/inkling2/cuda/ink_runner.cuh
+@@ -14,6 +14,7 @@
+ #include "strata/artifact/strata_reader.hpp"
+ #include "strata/core/ink_kv_grow.hpp"
+ #include "strata/core/ink_kv_reserve.hpp"
++#include "strata/inkling2/loop_schedule.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -1890,7 +1891,13 @@
+     int max_passes_override = 0;  // 0 = full 3 passes (48 visits); 1 or 2 = early-pass exit probe!
+     InkKvDtype kv_dtype = InkKvDtype::FP16;
+ 
+-    // KV Cache (48 visits: 40 SWA in VRAM, 8 Global split across VRAM + zero-copy mapped pinned host RAM!)
++    bool uses_kv_slot(int visit) const noexcept {
++        const auto& cfg = m.man.c;
++        const scream::inkling::LoopSchedule schedule{cfg.n_phys, cfg.core_start, cfg.core_end, cfg.num_passes};
++        return schedule.uses_trained_slot(visit, scream::inkling::inkling2_mini);
++    }
++
++    // Trained slot IDs stay stable. Inactive KV descriptors keep zero capacity.
+     InkKvVisitDesc kv_desc[kInkVisits]{};
+     void* host_kv_raw_k[kInkVisits]   = {};
+     void* host_kv_raw_v[kInkVisits]   = {};
+@@ -2252,15 +2259,21 @@
+                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
+             }
+             const size_t per_visit_pos = kv_bytes_per_visit_pos(kv_dtype);
+-            int n_swa_g0 = 0, n_glob_g0 = 0;
++            int n_swa_g0 = 0, n_glob_g0 = 0, n_glob_all = 0, n_sconv_g0 = 0;
+             for (int v = 0; v < kInkVisits; ++v) {
+                 const int ip = ink_visit_phys(v);
+-                if (!m.ls_active || m.layer_owner[ip] == 0) {
+-                    if (m.man.c.is_swa[ip]) ++n_swa_g0; else ++n_glob_g0;
++                const bool first_stage = !m.ls_active || m.layer_owner[ip] == 0;
++                if (first_stage) ++n_sconv_g0;
++                if (!uses_kv_slot(v)) continue;
++                if (m.man.c.is_swa[ip]) {
++                    if (first_stage) ++n_swa_g0;
++                } else {
++                    ++n_glob_all;
++                    if (first_stage) ++n_glob_g0;
+                 }
+             }
+             const size_t swa_kv_bytes = (size_t)n_swa_g0 * max_slots * swa_ring * per_visit_pos;
+-            const size_t sconv_bytes  = (size_t)(n_swa_g0 + n_glob_g0) * max_slots * 3 * kInkSconvCh * 4;
++            const size_t sconv_bytes = (size_t)n_sconv_g0 * max_slots * 3 * kInkSconvCh * 4;
+             const size_t wddm_fl = InkCudaModel::wddm_safety_floor(vtot);
+             // the workspaces the runner still allocates after the K/V (strata/core/ink_kv_reserve.hpp: v0.2.20's values)
+             const size_t ws_reserve = strata::core::ink_runner_ws_reserve_bytes(max_slots, m.man.has_dspark)
+@@ -2273,10 +2286,10 @@
+                 ? (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63)
+                 : max_ctx;
+ 
+-            // Check mapped host RAM budget for Host KV Offloading (8 global visits total!)
++            // Check the mapped host RAM budget across all active global visits.
+             const uint64_t host_avail = ink_ram_available_bytes();
+             const uint64_t host_os_res = 2ull << 30;
+-            const size_t per_pos_all_glob = (size_t)8 * max_slots * per_visit_pos;
++            const size_t per_pos_all_glob = (size_t)n_glob_all * max_slots * per_visit_pos;
+             const int host_fit_ctx = (host_avail > host_os_res)
+                 ? (int)std::min<size_t>((size_t)max_ctx, ((size_t)(host_avail - host_os_res) / std::max<size_t>(1, per_pos_all_glob)) & ~(size_t)63)
+                 : max_ctx;
+@@ -2286,8 +2299,8 @@
+                 kv_dev_ctx = 0;
+                 kv_host_ctx = max_ctx;
+                 kv_alloc_ctx = max_ctx;
+-                std::fprintf(stderr, "[InkCUDA] Host KV Offload ON (kv_fmt=%d): 8 global visits = 0 VRAM + %d mapped host tokens (%.1f MiB host RAM)\n",
+-                             (int)kv_dtype, kv_host_ctx, (double)((size_t)kv_host_ctx * per_pos_all_glob) / (1024.0 * 1024.0));
++                std::fprintf(stderr, "[InkCUDA] Host KV Offload ON (kv_fmt=%d): %d global visits = 0 VRAM + %d mapped host tokens (%.1f MiB host RAM)\n",
++                             (int)kv_dtype, n_glob_all, kv_host_ctx, (double)((size_t)kv_host_ctx * per_pos_all_glob) / (1024.0 * 1024.0));
+             } else if (vram_fit_ctx >= max_ctx) {
+                 kv_dev_ctx = std::max(256, std::min(max_ctx, (max_slots == 1) ? 8192 : 4096));
+                 kv_host_ctx = 0;
+@@ -2324,9 +2337,10 @@
+             const int ip = ink_visit_phys(v);
+             const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
+             INK_CK(cudaSetDevice(dev));
+-            const bool swa = m.man.c.is_swa[ip] != 0;
+-            const int dcap = swa ? swa_ring : kv_dev_ctx;
+-            const int hcap = swa ? 0 : kv_host_ctx;
++            const bool active = uses_kv_slot(v);
++            const bool swa = active && m.man.c.is_swa[ip] != 0;
++            const int dcap = !active ? 0 : (swa ? swa_ring : kv_dev_ctx);
++            const int hcap = (!active || swa) ? 0 : kv_host_ctx;
+             kv_desc[v] = {};
+             kv_desc[v].cap_pos  = dcap + hcap;
+             kv_desc[v].dev_cap  = dcap;
+@@ -2582,37 +2596,47 @@
+     // Returns false cleanly if VRAM is exhausted (NEVER aborts with exit(3)!).
+     bool ensure_global_kv_cap(int needed_pos) {
+         if (needed_pos <= kv_alloc_ctx) return true;
+-        if (needed_pos > max_ctx) return false;
++        if (needed_pos > max_ctx || kv_host_ctx > 0) return false;
+         const int old_cap = kv_alloc_ctx;
+         int new_cap = strata::core::ink_kv_next_cap(old_cap, needed_pos, max_ctx);
+ 
+-        const size_t per_pos = kv_bytes_per_visit_pos(kv_dtype);
++        auto publish_kv = [&] {
++            INK_CK(cudaSetDevice(m.primary_gpu));
++            INK_CK(cudaMemcpy(d_kv_desc_arr, kv_desc, sizeof(kv_desc), cudaMemcpyHostToDevice));
++            for (auto& e : graph_cache) if (e.exec) cudaGraphExecDestroy(e.exec);
++            graph_cache.clear();
++        };
++        const size_t bytes_per_pos = (size_t)max_slots * kv_bytes_per_visit_pos(kv_dtype);
++        // The replacement for one visit coexists with its old buffers. Earlier visits contribute only
++        // their net growth. Use each visit's capacity so a retry can reuse replacements already made.
++        auto peak_growth = [&](int stage, int target) {
++            size_t net = 0, peak = 0;
++            for (int v = 0; v < kInkVisits; ++v) {
++                const auto& kv = kv_desc[v];
++                if (!uses_kv_slot(v) || kv.is_swa || kv.dev_cap >= target) continue;
++                if (m.ls_active && m.layer_owner[ink_visit_phys(v)] != stage) continue;
++                peak = net + (size_t)target * bytes_per_pos;
++                net += (size_t)(target - kv.dev_cap) * bytes_per_pos;
++            }
++            return peak;
++        };
+         for (int s = 0; s < (m.ls_active ? m.n_stages : 1); ++s) {
+-            int n_glob_s = 0;
+-            for (int v = 0; v < kInkVisits; ++v) {
+-                const int ip = ink_visit_phys(v);
+-                if (!m.man.c.is_swa[ip] && (!m.ls_active || m.layer_owner[ip] == s)) ++n_glob_s;
+-            }
+-            if (n_glob_s == 0) continue;
++            const size_t peak = peak_growth(s, new_cap);
++            if (peak == 0) continue;
+             size_t vf = 0, vt = 0;
+             const int dev = m.ls_active ? m.stage_gpu[s] : m.primary_gpu;
+             if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess) return false;
+             const size_t floor_b = 256ull << 20;
+-            // #6770: the visits grow one at a time (new buffer, copy, free the old one), so the card needs the net growth
+-            // plus one held old visit, not the whole new K/V next to the old one (that refused growth at about half the context).
+-            if (!strata::core::ink_kv_grow_fits(vf, floor_b, n_glob_s, max_slots, old_cap, new_cap, per_pos)) {
+-                const int tight_cap = std::min(max_ctx, ((needed_pos + 255) & ~255));
+-                if (tight_cap <= old_cap ||
+-                    !strata::core::ink_kv_grow_fits(vf, floor_b, n_glob_s, max_slots, old_cap, tight_cap, per_pos)) {
++            if (vf <= floor_b + peak) {
++                const int tight_cap = std::min(new_cap, ((needed_pos + 255) & ~255));
++                const size_t tight_peak = peak_growth(s, tight_cap);
++                if (tight_peak > 0 && vf <= floor_b + tight_peak) {
+                     // VRAM cannot grow global KV further: seamlessly spill tail [kv_dev_ctx..new_cap-1] into mapped pinned host RAM!
+                     // The whole rest of the context first, so the K/V never has to grow again (a tail sized to just this request made the next, longer
+                     // request end the engine, #6905); only when that does not fit in host memory, just what this request needs.
+-                    if (kv_offload_mode >= 0 && kv_host_ctx == 0) {
+-                      const int tails[2] = {strata::core::ink_kv_host_tail_full(kv_dev_ctx, max_ctx), strata::core::ink_kv_host_tail_need(kv_dev_ctx, new_cap)};
+-                      for (int ti = 0; ti < 2; ++ti) {
+-                        const int hcap = tails[ti];
+-                        if (ti == 1 && hcap == tails[0]) break;
+-                        if (hcap > 0) {
++                    if (kv_offload_mode >= 0) {
++                      for (int target : {max_ctx, new_cap}) {
++                        if (target > kv_dev_ctx) {
+                             if (m.ls_active) {
+                                 for (int ss = 0; ss < m.n_stages; ++ss) {
+                                     cudaSetDevice(m.stage_gpu[ss]);
+@@ -2624,10 +2648,11 @@
+                             }
+                             bool all_ok = true;
+                             for (int v = 0; v < kInkVisits && all_ok; ++v) {
+-                                if (kv_desc[v].is_swa) continue;
++                                if (!uses_kv_slot(v) || kv_desc[v].is_swa) continue;
+                                 const int ip = ink_visit_phys(v);
+                                 const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
+                                 cudaSetDevice(dev);
++                                const int hcap = std::max(0, target - kv_desc[v].dev_cap);
+                                 const size_t helems = (size_t)max_slots * hcap * kInkKVHeads * kInkHeadDim;
+                                 if (kv_dtype == InkKvDtype::FP16) {
+                                     all_ok = alloc_mapped_host<__half>(helems, host_kv_raw_k[v], kv_desc[v].h_k_f16)
+@@ -2644,22 +2669,20 @@
+                             cudaSetDevice(m.primary_gpu);
+                             if (all_ok) {
+                                 for (int v = 0; v < kInkVisits; ++v) {
+-                                    if (kv_desc[v].is_swa) continue;
+-                                    kv_desc[v].dev_cap  = kv_dev_ctx;
+-                                    kv_desc[v].host_cap = hcap;
+-                                    kv_desc[v].cap_pos  = kv_dev_ctx + hcap;
++                                    if (!uses_kv_slot(v) || kv_desc[v].is_swa) continue;
++                                    kv_desc[v].host_cap = std::max(0, target - kv_desc[v].dev_cap);
++                                    kv_desc[v].cap_pos  = kv_desc[v].dev_cap + kv_desc[v].host_cap;
+                                 }
+-                                INK_CK(cudaMemcpy(d_kv_desc_arr, kv_desc, sizeof(kv_desc), cudaMemcpyHostToDevice));
+-                                for (auto& e : graph_cache) if (e.exec) cudaGraphExecDestroy(e.exec);
+-                                graph_cache.clear();
+-                                kv_host_ctx = hcap;
+-                                kv_alloc_ctx = kv_dev_ctx + hcap;
++                                publish_kv();
++                                kv_host_ctx = target - kv_dev_ctx;
++                                kv_alloc_ctx = target;
+                                 std::fprintf(stderr, "[InkCUDA] Elastic global KV spilled to mapped host RAM: %d VRAM + %d host = %d tokens\n",
+                                              kv_dev_ctx, kv_host_ctx, kv_alloc_ctx);
+                                 return true;
+                             }
+                             for (int v = 0; v < kInkVisits; ++v) if (!kv_desc[v].is_swa) free_host_kv_visit(v);
+                         }
++                        if (target == new_cap) break;
+                       }
+                     }
+                     return false;
+@@ -2678,15 +2701,26 @@
+             cudaStreamSynchronize(st);
+         }
+ 
++        bool replaced = false;
++        auto allocation_failed = [&] {
++            cudaGetLastError();
++            // Some visits may already have replaced their buffers. Keep their new strides and
++            // publish the descriptors before serving another request at the old logical limit.
++            if (replaced) publish_kv();
++            else INK_CK(cudaSetDevice(m.primary_gpu));
++            return false;
++        };
+         for (int v = 0; v < kInkVisits; ++v) {
+-            if (kv_desc[v].is_swa) continue;
++            if (!uses_kv_slot(v) || kv_desc[v].is_swa) continue;
++            const int old_dev_cap = kv_desc[v].dev_cap;
++            if (old_dev_cap >= new_cap) continue;
+             const int ip = ink_visit_phys(v);
+             const int s  = m.ls_active ? m.layer_owner[ip] : 0;
+             const int dev = m.ls_active ? m.stage_gpu[s] : m.primary_gpu;
+             cudaStream_t vst = m.ls_active ? ls_stages[s].st : st;
+             cudaSetDevice(dev);
+ 
+-            const size_t old_slot_el = (size_t)old_cap * kInkKVHeads * kInkHeadDim;
++            const size_t old_slot_el = (size_t)old_dev_cap * kInkKVHeads * kInkHeadDim;
+             const size_t new_slot_el = (size_t)new_cap * kInkKVHeads * kInkHeadDim;
+             const size_t new_tot_el  = (size_t)max_slots * new_slot_el;
+ 
+@@ -2696,9 +2730,7 @@
+                     cudaMalloc(&nv, new_tot_el * sizeof(__half)) != cudaSuccess) {
+                     if (nk) cudaFree(nk);
+                     if (nv) cudaFree(nv);
+-                    cudaGetLastError();
+-                    cudaSetDevice(m.primary_gpu);
+-                    return false;
++                    return allocation_failed();
+                 }
+                 for (int sl = 0; sl < max_slots; ++sl) {
+                     cudaMemcpyAsync(nk + (size_t)sl * new_slot_el, kv_desc[v].k_f16 + (size_t)sl * old_slot_el,
+@@ -2715,7 +2747,7 @@
+                 const bool v4 = (kv_dtype == InkKvDtype::K8V4);
+                 const size_t old_v_b = v4 ? (old_slot_el / 2u) : old_slot_el;
+                 const size_t new_v_b = v4 ? (new_slot_el / 2u) : new_slot_el;
+-                const size_t old_sc  = (size_t)old_cap * kInkKVHeads;
++                const size_t old_sc  = (size_t)old_dev_cap * kInkKVHeads;
+                 const size_t new_sc  = (size_t)new_cap * kInkKVHeads;
+                 uint8_t *nk = nullptr, *nv = nullptr;
+                 float *nks = nullptr, *nvs = nullptr;
+@@ -2725,9 +2757,7 @@
+                     cudaMalloc(&nvs, (size_t)max_slots * new_sc * sizeof(float)) != cudaSuccess) {
+                     if (nk) cudaFree(nk); if (nv) cudaFree(nv);
+                     if (nks) cudaFree(nks); if (nvs) cudaFree(nvs);
+-                    cudaGetLastError();
+-                    cudaSetDevice(m.primary_gpu);
+-                    return false;
++                    return allocation_failed();
+                 }
+                 for (int sl = 0; sl < max_slots; ++sl) {
+                     cudaMemcpyAsync(nk + (size_t)sl * new_slot_el, kv_desc[v].k_f8 + (size_t)sl * old_slot_el,
+@@ -2747,11 +2777,10 @@
+             }
+             kv_desc[v].cap_pos = new_cap;
+             kv_desc[v].dev_cap = new_cap;
+-        }
+-        cudaSetDevice(m.primary_gpu);
+-        INK_CK(cudaMemcpy(d_kv_desc_arr, kv_desc, sizeof(kv_desc), cudaMemcpyHostToDevice));
+-        for (auto& e : graph_cache) if (e.exec) cudaGraphExecDestroy(e.exec);
+-        graph_cache.clear();
++            replaced = true;
++        }
++        if (replaced) publish_kv();
++        else INK_CK(cudaSetDevice(m.primary_gpu));
+         kv_dev_ctx = new_cap;
+         kv_alloc_ctx = new_cap;
+         std::fprintf(stderr, "[InkCUDA] Elastic global KV grown: %d -> %d tokens (max_ctx=%d)\n", old_cap, new_cap, max_ctx);
+@@ -3671,7 +3700,6 @@
+ 
+         const float* block_ptrs[8] = {};
+         int n_blocks = 0;
+-        int visit = 0;
+ 
+         auto maybe_tap = [&](int v, const float* src) {
+             if (!want_taps) return;
+@@ -3688,74 +3716,54 @@
+             }
+         };
+ 
+-        // 1. Prelude: physical layers 0..5 (visits 0..5)
+-        for (int ip = 0; ip < m.man.c.core_start; ++ip) {
+-            if (m.ls_active && m.layer_owner[ip] != cur_stage) {
+-                switch_stage_handoff(m.layer_owner[ip], M, mode, n_blocks, block_ptrs, nullptr, 0);
+-            }
+-            maybe_tap(visit, d_cur);
+-            run_visit(visit, ip, nullptr, M, mode, slot0, tree_p0, n_blocks, block_ptrs);
+-            ++visit;
+-        }
+-
+-        // Save prelude state & prelude_blocks on Stage 0
+-        if (m.ls_active && cur_stage != 0) {
+-            switch_stage_handoff(0, M, mode, n_blocks, block_ptrs, nullptr, 0);
+-        }
+-        INK_CK(cudaMemcpyAsync(d_prelude, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+-        const int n_pre_blk = n_blocks;
+-        for (int b = 0; b < n_pre_blk; ++b) {
+-            INK_CK(cudaMemcpyAsync(d_prelude_blocks[b], block_ptrs[b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+-        }
+-
+-        // 2. Looped Core: physical layers 6..17 x 3 passes (visits 6..41)
+-        const int n_passes = (max_passes_override > 0 && max_passes_override < m.man.c.num_passes)
+-                                 ? max_passes_override
+-                                 : m.man.c.num_passes;
+-        int n_bank = 0;
+-        for (int pass = 0; pass < n_passes; ++pass) {
+-            if (pass > 0) {
+-                if (m.ls_active && cur_stage != 0) {
+-                    switch_stage_handoff(0, M, mode, n_blocks, block_ptrs, nullptr, 0);
+-                }
+-                n_bank = n_blocks - (n_pre_blk + 1);
+-                for (int b = 0; b < n_bank; ++b) {
+-                    INK_CK(cudaMemcpyAsync(d_bank[b], block_ptrs[n_pre_blk + 1 + b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+-                }
+-                INK_CK(cudaMemcpyAsync(d_bank_out, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+-                INK_CK(cudaMemcpyAsync(d_cur, d_prelude, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+-                n_blocks = n_pre_blk;
++        const auto& cfg = m.man.c;
++        const int passes = (max_passes_override > 0 && max_passes_override < cfg.num_passes)
++                               ? max_passes_override : cfg.num_passes;
++        const scream::inkling::LoopSchedule schedule{cfg.n_phys, cfg.core_start, cfg.core_end, passes};
++        constexpr auto trained = scream::inkling::inkling2_mini;
++        static_assert(trained.physical_layers == kInkPhysLayers && trained.core_begin == kInkCoreStart &&
++                      trained.core_end == kInkCoreEnd && trained.passes == kInkCorePasses &&
++                      trained.visit_count() == kInkVisits);
++        int n_pre_blk = 0, n_bank = 0;
++        DepthStatePtrs bst{};
++        schedule.walk([&](scream::inkling::LayerVisit step) {
++            // KV and ShortConv pools use trained slot IDs, including the coda after a shortened run.
++            const int slot = schedule.trained_slot(step, trained);
++            auto* bank_ptr = step.pass > 0 ? &bst : nullptr;
++            if (m.ls_active && m.layer_owner[step.layer] != cur_stage) {
++                switch_stage_handoff(m.layer_owner[step.layer], M, mode, n_blocks, block_ptrs,
++                                     bank_ptr, bank_ptr ? n_bank : 0);
++            }
++            maybe_tap(slot, d_cur);
++            run_visit(slot, step.layer, bank_ptr, M, mode, slot0, tree_p0, n_blocks, block_ptrs);
++            return true;
++        }, [&](int pass) {
++            if (m.ls_active && cur_stage != 0) {
++                switch_stage_handoff(0, M, mode, n_blocks, block_ptrs, nullptr, n_bank);
++            }
++            if (pass == 0) {
++                INK_CK(cudaMemcpyAsync(d_prelude, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
++                n_pre_blk = n_blocks;
+                 for (int b = 0; b < n_pre_blk; ++b) {
+-                    INK_CK(cudaMemcpyAsync(d_blocks[b], d_prelude_blocks[b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+-                    block_ptrs[b] = d_blocks[b];
+-                }
+-            }
+-            DepthStatePtrs bst{};
+-            if (pass > 0) {
+-                for (int b = 0; b < n_bank; ++b) bst.p[b] = d_bank[b];
+-                bst.p[n_bank] = d_bank_out;
+-                bst.count = n_bank + 1;
+-            }
+-            for (int ip = m.man.c.core_start; ip < m.man.c.core_end; ++ip) {
+-                if (m.ls_active && m.layer_owner[ip] != cur_stage) {
+-                    switch_stage_handoff(m.layer_owner[ip], M, mode, n_blocks, block_ptrs, (pass > 0) ? &bst : nullptr, n_bank);
+-                }
+-                maybe_tap(visit, d_cur);
+-                run_visit(visit, ip, (pass > 0) ? &bst : nullptr, M, mode, slot0, tree_p0, n_blocks, block_ptrs);
+-                ++visit;
+-            }
+-        }
+-
+-        // 3. Coda: physical layers 18..23 (visits 42..47)
+-        visit = 42;
+-        for (int ip = m.man.c.core_end; ip < m.man.c.n_phys; ++ip) {
+-            if (m.ls_active && m.layer_owner[ip] != cur_stage) {
+-                switch_stage_handoff(m.layer_owner[ip], M, mode, n_blocks, block_ptrs, nullptr, 0);
+-            }
+-            maybe_tap(visit, d_cur);
+-            run_visit(visit, ip, nullptr, M, mode, slot0, tree_p0, n_blocks, block_ptrs);
+-            ++visit;
+-        }
++                    INK_CK(cudaMemcpyAsync(d_prelude_blocks[b], block_ptrs[b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
++                }
++                return;
++            }
++            n_bank = n_blocks - (n_pre_blk + 1);
++            for (int b = 0; b < n_bank; ++b) {
++                INK_CK(cudaMemcpyAsync(d_bank[b], block_ptrs[n_pre_blk + 1 + b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
++            }
++            INK_CK(cudaMemcpyAsync(d_bank_out, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
++            INK_CK(cudaMemcpyAsync(d_cur, d_prelude, n_hid * 4, cudaMemcpyDeviceToDevice, st));
++            n_blocks = n_pre_blk;
++            for (int b = 0; b < n_pre_blk; ++b) {
++                INK_CK(cudaMemcpyAsync(d_blocks[b], d_prelude_blocks[b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
++                block_ptrs[b] = d_blocks[b];
++            }
++            for (int b = 0; b < n_bank; ++b) bst.p[b] = d_bank[b];
++            bst.p[n_bank] = d_bank_out;
++            bst.count = n_bank + 1;
++        });
+ 
+         // Return to Stage 0 for Output Depth Mix + Output RMSNorm -> d_h_norm (and tap 48!)
+         if (m.ls_active && cur_stage != 0) {
+--- a/src/inkling2/cuda/ink_cuda_backend.cu
++++ b/src/inkling2/cuda/ink_cuda_backend.cu
+@@ -115,6 +115,16 @@
+     }
+ 
+     bool init(const InkModelFile& mf, const BackendOpts& opts, std::string& err) override {
++        constexpr auto trained = scream::inkling::inkling2_mini;
++        const auto schedule = mf.m.c.loop_schedule();
++        if (!schedule.fits_trained_slots(trained)) {
++            err = "the portable CUDA path requires Inkling 2 Mini's trained layer and core geometry";
++            return false;
++        }
++        if (schedule.passes < trained.passes && opts.enable_dspark && mf.m.dspark.present) {
++            err = "reduced CUDA pass counts require --draft off with DSpark weights";
++            return false;
++        }
+         if (const char* e = std::getenv("STRATA_INK_SPEC_BEAM")) spec_cfg_.beam = std::atoi(e);
+         if (const char* e = std::getenv("STRATA_INK_SPEC_COST")) spec_cfg_.cost = (float)std::atof(e);
+         if (const char* e = std::getenv("STRATA_INK_SPEC_PLAIN")) spec_cfg_.plain = (float)std::atof(e);
+@@ -209,9 +219,15 @@
+             : ((kv_offload_mode == 0 && prop.totalGlobalMem <= (13ull << 30))
+                 ? std::min(std::max(256, opts.max_ctx), 2048)
+                 : std::max(256, std::min(std::max(256, opts.max_ctx), (max_slots_ == 1) ? 8192 : 4096)));
+-        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * per_visit_pos
++        int n_swa = 0, n_global = 0;
++        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
++            if (!schedule.uses_trained_slot(v, trained)) continue;
++            if (mf.m.c.is_swa[strata::ink::ink_visit_phys(v)]) ++n_swa;
++            else ++n_global;
++        }
++        const size_t min_kv_bytes = (size_t)n_swa * max_slots_ * swa_r * per_visit_pos
+                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
+-                                  + (size_t)8 * max_slots_ * init_glob * per_visit_pos;
++                                  + (size_t)n_global * max_slots_ * init_glob * per_visit_pos;
+         // Include O(1) prefill ws (~114 MiB) + DSpark (~224 MiB when enabled) + activation ws (WDDM floor added inside loader!)
+         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
+         const size_t dspark_pad = build_screen ? (224ull << 20) : 0ull;
+@@ -630,6 +646,12 @@
+         ckpt_sync();
+         return true;
+     }
++
++    bool supports_prompt_lookup() const override {
++        return initialized_ && !model_.ls_active && d_sconv_snap_ && runner_->max_batch > ink2::kMaxPromptLookup;
++    }
++
++    void discard_snapshot(int slot) override { snap_active_[slot] = false; }
+ 
+     void snapshot_slot(int slot) override {
+         if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return;
+--- a/src/inkling2/ink_backend.h
++++ b/src/inkling2/ink_backend.h
+@@ -13,6 +13,8 @@
+ namespace ink2 {
+ 
+ struct ImageRec;  // defined in ink_vision.h
++
++inline constexpr int kMaxPromptLookup = 7;   // one anchor plus seven proposals per verify window
+ 
+ struct BackendOpts {
+     int max_ctx = 32768;
+@@ -34,6 +36,7 @@
+     bool kv_dtype_auto = true;   // default lossless FP16; Host KV Offload handles VRAM capacity (#552)
+     std::string kv_offload = "auto"; // "auto" | "on" | "off" (zero-copy mapped pinned host global KV spill)
+     bool enable_dspark = true;
++    int lookup = 0;
+     int spec_beam = -1;          // --draft-beam N: 1 = one linear chain (the block drafter), 4 = the beam tree (default); < 0 = STRATA_INK_SPEC_BEAM or 4
+     double spec_cost = -1.0;     // --draft-cost R: the MoE share of a verify step in the window-size model (default 4.2)
+     double spec_plain = -1.0;    // --draft-plain X: > 0 lets a step fall back to one plain token when the drafter's expected tokens do not pay for the window (1.0 = break-even)
+@@ -89,6 +92,8 @@
+     // Speculative rollback: restore KV + ShortConv state to `keep_len` (requires snapshot taken before verify!)
+     virtual void snapshot_slot(int slot) = 0;
+     virtual void rollback_slot(int slot, int keep_len) = 0;
++    virtual bool supports_prompt_lookup() const { return false; }
++    virtual void discard_snapshot(int slot) { (void)slot; }
+ 
+     // Optional prompt-end conversation checkpoint (#6627): saves/restores SWA KV + ShortConv + DSpark state at `seq_len`
+     // so multi-turn chats and exact repeats reuse the cached prompt even when hidden thinking or trailing tokens diverge.
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1,4 +1,5 @@
+ #include "strata/core/logit_bias.hpp"
++#include "inference_sampling_fields.hpp"
+ // src/program/generate.cpp - P2.S6: `strata generate`.
+ //
+ // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
+@@ -753,6 +754,8 @@
+     return true;
+ }
+ 
++constexpr int kPenaltyWindowCap = 4096;
++
+ struct Options {
+     std::string pack = "pack/full";
+     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
+@@ -763,6 +766,7 @@
+     int top_k = 20;
+     float top_p = 0.95f;
+     float temperature = 1.0f;
++    scream::SamplingFields sampling_defaults;
+     std::string dump_logits;          // one line of logits per generated position
+     int64_t logits_stride = 1;        // storage selection; all prompt tokens remain conditioned
+     /// **THE RESIDUAL, SO THE HEAD CAN BE CHECKED WITHOUT THE LAYERS.**
+@@ -1280,6 +1284,7 @@
+                  "  --greedy             argmax (the default)\n"
+                  "  --seed S             enable sampling with this Philox seed\n"
+                  "  --top-k N --top-p F --temperature F\n"
++                 "  --sampling FIELDS   profile sampler defaults (dash keeps the backend default)\n"
+                  "  --dump-logits PATH   write one line of raw logits per position\n"
+                  "  --logits-stride N    store every Nth row plus final input (default 1); N>1 requires --max-new 1\n"
+                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
+@@ -3883,6 +3888,22 @@
+         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
+         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
+         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
++        else if (a == "--sampling") {
++            try {
++                o.sampling_defaults = scream::read_sampling_fields(next("--sampling"), 64, kPenaltyWindowCap);
++            } catch (const std::runtime_error& e) {
++                std::fprintf(stderr, "--sampling: %s\n", e.what());
++                return 2;
++            }
++            const auto& s = o.sampling_defaults;
++            if (s.temperature) {
++                o.temperature = *s.temperature;
++                o.greedy = o.temperature <= 0.0f;
++            }
++            o.top_k = s.top_k.value_or(o.top_k);
++            o.top_p = s.top_p.value_or(o.top_p);
++            o.seed = s.seed.value_or(o.seed);
++        }
+         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
+         else if (a == "--logits-stride") {
+             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
+@@ -4274,6 +4295,10 @@
+         }
+         }
+     }
++    const auto& sampling = o.sampling_defaults;
++    const bool startup_penalties = sampling.repetition_penalty.value_or(1.0f) != 1.0f ||
++                                   sampling.frequency_penalty.value_or(0.0f) != 0.0f ||
++                                   sampling.presence_penalty.value_or(0.0f) != 0.0f;
+     {   // --ram-keep-gib W (or STRATA_RAM_KEEP_GIB, for a program that cannot pass the flag; the flag wins): the RAM to leave free.  It also
+         // raises the headroom of the explicit RAM modes (--resident-budget-gib, --resident-experts) to at least W, unless
+         // STRATA_RESIDENT_HEADROOM_GIB is set (that value wins).
+@@ -10638,6 +10663,45 @@
+     sp.top_k = o.top_k;
+     sp.top_p = o.top_p;
+     sp.temperature = o.temperature;
++    sp.min_p = sampling.min_p.value_or(0.0f);
++    if (!o.serve && startup_penalties) {
++        sp.penalty_repeat = sampling.repetition_penalty.value_or(1.0f);
++        sp.penalty_freq = sampling.frequency_penalty.value_or(0.0f);
++        sp.penalty_present = sampling.presence_penalty.value_or(0.0f);
++        sp.penalty_last_n = sampling.penalty_last_n.value_or(64);
++    }
++    // The direct token and verification paths share the same consumed history. Allocate only for an active penalty.
++    int direct_hist_device = -1;
++    int32_t* history_device_memory = nullptr;
++    const std::size_t history_size = (std::size_t) sp.penalty_last_n * std::max(1, o.spec);
++    std::vector<int32_t> direct_history_stage(history_size), direct_consumed;
++    if (history_size > 0 &&
++        (cudaGetDevice(&direct_hist_device) != cudaSuccess ||
++         cudaMalloc(&history_device_memory, history_size * sizeof(int32_t)) != cudaSuccess)) {
++        std::fprintf(stderr, "strata generate: the penalty-history allocation failed\n");
++        return 1;
++    }
++    const auto free_direct_history = [direct_hist_device](int32_t* ptr) {
++        const strata::core::OnDevice on(direct_hist_device);
++        cudaFree(ptr);
++    };
++    const std::unique_ptr<int32_t, decltype(free_direct_history)> direct_history(history_device_memory, free_direct_history);
++    if (direct_history && strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"))) {
++        const auto end = o.tokens.end() - 1;
++        const std::size_t n = std::min<std::size_t>(o.tokens.size() - 1, sp.penalty_last_n);
++        direct_consumed.assign(end - n, end);
++    }
++    auto upload_direct_history = [&](const int32_t* window, int rows, cudaStream_t stream) {
++        strata::kernels::penalty_rows(direct_consumed.data(), (int64_t) direct_consumed.size(), window,
++                                      rows, sp.penalty_last_n, direct_history_stage.data());
++        const strata::core::OnDevice on(direct_hist_device);
++        const cudaError_t status = cudaMemcpyAsync(direct_history.get(), direct_history_stage.data(),
++                                                    (std::size_t) rows * sp.penalty_last_n * sizeof(int32_t),
++                                                    cudaMemcpyHostToDevice, stream);
++        if (status != cudaSuccess)
++            std::fprintf(stderr, "strata generate: the penalty-history copy failed: %s\n", cudaGetErrorString(status));
++        return status == cudaSuccess;
++    };
+     // what this run actually samples with (the speculative loop below gets the same parameters); serve samples
+     // per request instead
+     if (!o.serve) {
+@@ -13210,7 +13274,6 @@
+         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
+         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
+         // neutral path (no upload, no buffer handed to the sampler).
+-        constexpr int kPenaltyWindowCap = 4096;
+         // (the widest window the run can have: a batch of more than kVerifyNarrowT slots is one way to a wider one, a
+         // prompt-lookup window longer than that (--lookup-max-t) the other)
+         const size_t kHistSlots = (size_t) kPenaltyWindowCap *
+@@ -18823,12 +18886,13 @@
+             const long long max_new = bgen_rewritten ? 1LL : std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
+             // penalty_last_n=N, penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N (text requests
+-            // only).  Absent keys keep today's behavior: greedy, no penalties.
+-            float req_temperature = 0.0f, req_top_p = 1.0f;
+-            int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
+-            unsigned long long req_seed = 0;
+-            float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
+-            int req_penalty_last_n = 0;
++            // only). A per-request value supersedes the native startup sampling block.
++            float req_temperature = sampling.temperature.value_or(0.0f), req_top_p = sampling.top_p.value_or(1.0f);
++            int req_top_k = sampling.top_k.value_or(20);
++            std::optional<uint64_t> req_seed = sampling.seed;
++            float req_min_p = sampling.min_p.value_or(0.0f), req_penalty_repeat = sampling.repetition_penalty.value_or(1.0f);
++            float req_penalty_freq = sampling.frequency_penalty.value_or(0.0f), req_penalty_present = sampling.presence_penalty.value_or(0.0f);
++            int req_penalty_last_n = sampling.penalty_last_n.value_or(startup_penalties ? 64 : 0);
+             long long req_pen_from = -1;   // pen_from=N: this request continues one that began at token N (the last token of the original prompt): the penalty window starts there
+             std::string req_bias_text;
+             bool req_bias_present = false;
+@@ -18918,7 +18982,11 @@
+                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
+                     else if (key == "penalty_freq") req_penalty_freq = fv;
+                     else if (key == "penalty_present") req_penalty_present = fv;
+-                    else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
++                    else if (key == "seed") {
++                        const uint64_t seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
++                        if (seed != 0) req_seed = seed;
++                        else req_seed.reset();  // retain the protocol's random seed=0 convention
++                    }
+                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
+                     else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_min_p_set = true; }
+                     else if (key == "draft") req_draft = tok.substr(eq + 1);
+@@ -18955,8 +19023,8 @@
+                 s.temperature = req_temperature;
+                 s.top_p = req_top_p;
+                 s.top_k = req_top_k;
+-                s.seed = req_seed ? req_seed
+-                                  : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
++                s.seed = req_seed ? *req_seed
++                                  : (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+                 s.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
+                 s.penalty_last_n = std::max(req_penalty_last_n, 0);
+                 s.penalty_repeat = req_penalty_repeat;
+@@ -24399,7 +24467,16 @@
+         // The draw is Philox(seed, position), as in a verify window (row t at pos0 draws pos0 + t): a seed gives
+         // the same text whether a token comes from this path or from the speculative loop below.
+         sp.counter = (uint64_t) pos;
+-        strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
++        const bool penalized = direct_history && pos >= n_prompt - 1;
++        if (penalized) {
++            const int32_t token = (int32_t) tok;
++            if (!upload_direct_history(&token, 1, (cudaStream_t) token_stream)) return 1;
++            direct_consumed.push_back(token);
++        }
++        auto row_sampling = sp;
++        if (!penalized) row_sampling.penalty_last_n = 0;
++        strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, penalized ? direct_history.get() : nullptr,
++                                       row_sampling.penalty_last_n, row_sampling, d_next, token_stream);
+         if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
+                             (cudaStream_t) token_stream) != cudaSuccess ||
+             cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess) {
+@@ -24537,7 +24614,8 @@
+         }
+         const bool draft_on = use_mtp || use_df2;   // some drafter proposes (--draft-fallback none: DFlash2 alone, use_mtp false)
+         mem_mark("the verifier and the drafter's binding");
+-        ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
++        ver.set_sampling(sp);
++        if (direct_history) ver.set_history(direct_history.get(), sp.penalty_last_n);
+         if (use_mtp) mtp.set_draft_sampling(sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+         ver.set_split(o.spec_split);
+         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
+@@ -24848,6 +24926,8 @@
+         strata::core::MtpDrafter::DraftResult generation;
+         strata::core::gated::Packet proposal;
+         {   // Non-native prefill already emitted x; draft_first(cell=p-1) samples at p.
++            if (direct_history && use_mtp && !first_window && mtp.coupled())
++                mtp.set_draft_history(direct_consumed.data(), (int64_t) direct_consumed.size(), x);
+             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p, o.max_context);
+             if (use_mtp && !first_window &&
+                 !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
+@@ -25122,6 +25202,7 @@
+                     std::fprintf(stderr, "strata: fetch verify: %lld admitted slots read back, %lld differ\n",
+                                  (long long) checked, (long long) bad);
+             }
++            if (direct_history && !upload_direct_history(window.data(), T, ver.stream())) return 1;
+             if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+             // the MTP's q lists judge only candidates the MTP drew: DFlash2's are a deterministic pick (exact-match path)
+             else if (strata::spec::mtp_q_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp) && o.spec_corrupt <= 0)
+@@ -25131,6 +25212,11 @@
+                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
+                 // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
+                 if (T > 2 && !first_window && !gated_proposal && err.find("out of memory") != std::string::npos) {
++                    // A failed graph capture may return before the queued history upload has consumed its host buffer.
++                    if (direct_history && cudaStreamSynchronize(ver.stream()) != cudaSuccess) {
++                        std::fprintf(stderr, "strata generate: the penalty-history stream did not finish\n");
++                        return 1;
++                    }
+                     win_cap = T - 1;
+                     --window_hist[(size_t) T];
+                     std::fprintf(stderr, "strata generate: not enough VRAM left for a %d-token verify window: windows are %d tokens at most from here\n", T, win_cap);
+@@ -25196,6 +25282,7 @@
+                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                 return 1;
+             }
++            if (direct_history) direct_consumed.insert(direct_consumed.end(), window.begin(), window.begin() + a + 1);
+             ++rounds;
+             drafts_total += T - 1;
+             drafts_ok += a;
+@@ -25216,6 +25303,8 @@
+                 break;
+             }
+             generation = {};
++            if (direct_history && use_mtp && mtp.coupled() && (int64_t) produced.size() < max_new)
++                mtp.set_draft_history(direct_consumed.data(), (int64_t) direct_consumed.size(), outv[(size_t) a]);
+             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
+             const bool drafted = !draft_on || (int64_t) produced.size() >= max_new || draft_next(T, a);
+             if (adapt_thr.joinable()) adapt_thr.join();

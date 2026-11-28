@@ -3,6 +3,11 @@
 # setup.sh wrote (DATA/profile.json). The engine loads in about 5 minutes; then GET /health says "loaded": true and the
 # OpenAI-compatible API is at http://HOST:PORT/v1. Stop it with Ctrl+C, then check with nvidia-smi that the cards are free.
 set -euo pipefail
+if [ "${1:-}" = --unified ]; then
+  shift
+  exec python3 "$(dirname "$0")/unified/scream.py" "$@"
+fi
+
 say() { echo "run.sh: $*"; }
 die() { echo "run.sh: $*" >&2; exit 1; }
 

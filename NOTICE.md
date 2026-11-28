@@ -9,6 +9,7 @@
 | `engine/data/draft_vocab_sl.bin` | ours: `draft_vocab_en.bin` plus 8,621 token ids chosen with Strata's `tools/draft_vocab.py --corpus` from 1,483 random articles of the Slovenian Wikipedia (the text is not included) | MIT (ours) |
 | `engine/data/coder_mask.txt` | the experts ISTA-DASLab's Coder release keeps, from its allocation list (Hugging Face `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`), rewritten by our `scripts/coder_mask.py` | Apache-2.0, [third_party/ista-daslab/](third_party/ista-daslab/) |
 | `engine/p100_compat.h`, `engine/src/p100_*`, the changes to the other files | ours | MIT (ours) |
+| `shared/inkling_sampling.hpp`, `shared/inkling_repetition.hpp` | Strata v0.2.22's Inkling host sampler and repetition guard from `engine/src/inkling2/ink_serve.h`, adapted for Megla's draft windows | MIT: Strata's notice, [LICENSE](LICENSE) |
 | `CMakeLists.txt`, `build.sh`, `setup.sh`, `run.sh`, `scripts/`, `profile/`, `bench/`, `docs/`, `history/` | ours; `bench/bench.py` reads its texts from a Strata checkout at run time | MIT (ours) |
 | `engine-32g/` | ours: the low-RAM engine's four patches and `ssd.hpp` (the 32 GB and 64 GB modes), which `build.sh --32g` applies to a copy of `engine/` | MIT (ours) |
 

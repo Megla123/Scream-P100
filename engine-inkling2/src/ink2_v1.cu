@@ -12,9 +12,14 @@
 #include "ink2_dspark.cuh"
 #include "ink2_dflash2.cuh"   // p74
 #include "gguf_min.hpp"
+#include "../../shared/inkling_lookup.hpp"
+#include "../../shared/inkling_loop.hpp"
+#include "../../shared/inkling_repetition.hpp"
+#include "../../shared/inkling_sampling.hpp"
 
 #include <cublas_v2.h>
 
+#include <optional>
 #include <poll.h>
 #include <pthread.h>   // p41
 #include <sched.h>
@@ -190,7 +195,30 @@ struct Xch {
 
 struct PrefillCancelled {};
 
+struct TokenPicker {
+    SampleOpts settings;
+    std::optional<std::mt19937_64> rng;
+    std::vector<float> penalized;
+
+    TokenPicker(SampleOpts options, int prompt_size) : settings(options) {
+        settings.pen_from = prompt_size;
+        if (!settings.greedy() || settings.penalties()) {
+            rng.emplace(settings.seed ? settings.seed : 20261121ULL);
+        }
+    }
+
+    int pick(float* logits, const std::vector<int>& history, size_t end) {
+        if (settings.penalties()) {
+            penalized.assign(logits, logits + NVU);
+            logits = penalized.data();
+        }
+        return sample_logits(logits, NVU, settings, history, *rng, end);
+    }
+};
+
 struct Engine {
+    const scream::inkling::LoopSchedule schedule;
+    const int active_slots;
     GgufMin g;
     Card cards[NC];
     Xch X;
@@ -920,8 +948,8 @@ struct Engine {
             }
         }
         // caches and states
-        for (int s = 0; s < NSLOT; ++s) {
-            const int p = s < NPHYS ? s : LS + (s - NPHYS) % NCORE;
+        for (int s = 0; s < active_slots; ++s) {
+            const int p = schedule.layer_for_physical_first_slot(s);
             const size_t rows = K.L[p].full ? (size_t) ctx : (size_t) RING;
             vt[c] = K.L[p].full ? "kv-polno" : "kv-okno";
             if (kv8 && K.L[p].full) {   // p18: rows below f0 in f16, the rest in int8
@@ -945,10 +973,10 @@ struct Engine {
             }
             vt[c] = "vmesni";
             if (s == 0) {   // p5a: all slots' convolution states in one buffer (a draft window's snapshot is one copy)
-                K.stbuf = dev(K, (size_t) NSLOT * SLOTST);
-                K.stbak = dev(K, (size_t) NSLOT * SLOTST);
-                K.stsnap = dev(K, (size_t) NSLOT * SLOTST);
-                K.hist = dev(K, (size_t) NSLOT * HISTS);
+                K.stbuf = dev(K, (size_t) active_slots * SLOTST);
+                K.stbak = dev(K, (size_t) active_slots * SLOTST);
+                K.stsnap = dev(K, (size_t) active_slots * SLOTST);
+                K.hist = dev(K, (size_t) active_slots * HISTS);
             }
             K.sk[s] = K.stbuf + (size_t) s * SLOTST;
             K.sv[s] = K.sk[s] + 3 * KVC;
@@ -1012,7 +1040,8 @@ struct Engine {
         CK(cudaMemset(K.dtok, 0, 4));
     }
 
-    Engine(const std::string& path, int ctx_, const std::string& mtp = "") : g(path), ctx(ctx_) {
+    Engine(const std::string& path, int ctx_, const std::string& mtp = "", int passes = NPASS)
+        : schedule{NPHYS, LS, LE, passes}, active_slots(schedule.visit_count()), g(path), ctx(ctx_) {
         ds_ring = getenv("INK2_DS_RING") ? atoi(getenv("INK2_DS_RING")) != 0 : (NC == 1 || ctx > 65536);   // p14 (p33: always with one card)
         kv8 = getenv("INK2_KV8") ? atoi(getenv("INK2_KV8")) != 0 : ctx > 262144;   // p18
         if (getenv("INK2_KV8_F16")) kv8_f16 = std::max(0, atoi(getenv("INK2_KV8_F16")));
@@ -3081,22 +3110,21 @@ struct Engine {
     // earlier chunks' layer k (their cache rows and convolution states), and each chunk's own steps keep pf_card's order, so
     // every value is the one pf_card gives chunk after chunk
     struct PfRun { int C, p0; bool last; int nprel; const float* hx0; const int* hpos; const float* htau; const char* hraw; };
-    static constexpr int NLAY = LS + NPASS * NCORE + (NPHYS - LE);   // a chunk's layers in order (= NSLOT)
-    static void pf_layer_of(int k, int& p, int& slot, bool& loop) {
+    void pf_layer_of(int k, int& p, int& slot, bool& loop) const {
         if (k < LS) {
             p = slot = k;
             loop = false;
-        } else if (k < LS + NPASS * NCORE) {
+        } else if (k < LS + schedule.passes * NCORE) {
             const int pass = (k - LS) / NCORE, ip = LS + (k - LS) % NCORE;
             p = ip;
-            slot = pass == 0 ? ip : NPHYS + (pass - 1) * NCORE + (ip - LS);
+            slot = schedule.physical_first_slot({0, ip, pass});
             loop = pass > 0;
         } else {
-            p = slot = LE + (k - LS - NPASS * NCORE);
+            p = slot = LE + (k - schedule.coda_begin());
             loop = false;
         }
     }
-    void pf_step(int c, PfRun& R, int i) {   // step i of 0 .. 2 NLAY
+    void pf_step(int c, PfRun& R, int i) {   // step i of 0 .. 2 * active_slots
         Card& K = cards[c];
         PFB& P = K.P;
         const int C = R.C;
@@ -3121,14 +3149,14 @@ struct Engine {
             layer_pf(K, p, slot, loop, R.p0, C, 2);
         }
         const int k = i / 2;
-        if (k == NLAY) {
+        if (k == active_slots) {
             pf_tail(c, C, R.p0, R.last);
             return;
         }
         if (k == LS) {   // pf_card's copies between the layers
             CK(cudaMemcpyAsync(P.prel, P.cur, CN * 4, cudaMemcpyDeviceToDevice, K.st));
             R.nprel = K.nb;
-        } else if (k > LS && k < LS + NPASS * NCORE && (k - LS) % NCORE == 0) {
+        } else if (k > LS && k < LS + schedule.passes * NCORE && (k - LS) % NCORE == 0) {
             CK(cudaMemcpyAsync(P.bankS, P.B[R.nprel + 1], CN * 4, cudaMemcpyDeviceToDevice, K.st));
             CK(cudaMemcpyAsync(P.bankO, P.cur, CN * 4, cudaMemcpyDeviceToDevice, K.st));
             CK(cudaMemcpyAsync(P.cur, P.prel, CN * 4, cudaMemcpyDeviceToDevice, K.st));
@@ -3145,7 +3173,7 @@ struct Engine {
         for (int j = 0, p = p0; j < n; p += Cs[j], ++j)
             R[j] = PfRun{Cs[j], p, last && j == n - 1, 0, j ? h_x0z[j] : h_x0, j ? h_posz[j] : h_pos, j ? h_tauz[j] : h_tau,
                          j ? h_rawz[j].data() : nullptr};
-        for (int i = 0; i <= 2 * NLAY; ++i)
+        for (int i = 0; i <= 2 * active_slots; ++i)
             for (int j = 0; j < n; ++j) {
                 zip_load(K, j);
                 pf_step(c, R[j], i);
@@ -3168,14 +3196,14 @@ struct Engine {
         for (int p = 0; p < LS; ++p) layer_pf(K, p, p, false, p0, C);
         CK(cudaMemcpyAsync(P.prel, P.cur, CN * 4, cudaMemcpyDeviceToDevice, K.st));
         const int nprel = K.nb;
-        for (int pass = 0; pass < NPASS; ++pass) {
+        for (int pass = 0; pass < schedule.passes; ++pass) {
             if (pass > 0) {
                 CK(cudaMemcpyAsync(P.bankS, P.B[nprel + 1], CN * 4, cudaMemcpyDeviceToDevice, K.st));
                 CK(cudaMemcpyAsync(P.bankO, P.cur, CN * 4, cudaMemcpyDeviceToDevice, K.st));
                 CK(cudaMemcpyAsync(P.cur, P.prel, CN * 4, cudaMemcpyDeviceToDevice, K.st));
                 K.nb = nprel;
             }
-            for (int ip = LS; ip < LE; ++ip) layer_pf(K, ip, pass == 0 ? ip : NPHYS + (pass - 1) * NCORE + (ip - LS), pass > 0, p0, C);
+            for (int ip = LS; ip < LE; ++ip) layer_pf(K, ip, schedule.physical_first_slot({0, ip, pass}), pass > 0, p0, C);
         }
         for (int p = LE; p < NPHYS; ++p) layer_pf(K, p, p, false, p0, C);
         pf_tail(c, C, p0, last);
@@ -3258,7 +3286,7 @@ struct Engine {
         for (int p = 0; p < LS; ++p) layer(K, p, p, false, T, nparts);
         copy(K, K.prel, K.cur, T);
         const int nprel = K.nb;
-        for (int pass = 0; pass < NPASS; ++pass) {
+        for (int pass = 0; pass < schedule.passes; ++pass) {
             if (pass > 0) {
                 copy(K, K.bankS, K.B[nprel + 1], T);
                 copy(K, K.bankO, K.cur, T);
@@ -3266,7 +3294,7 @@ struct Engine {
                 K.nb = nprel;
             }
             for (int ip = LS; ip < LE; ++ip) {
-                const int slot = pass == 0 ? ip : NPHYS + (pass - 1) * NCORE + (ip - LS);
+                const int slot = schedule.physical_first_slot({0, ip, pass});
                 layer(K, ip, slot, pass > 0, T, nparts);
             }
         }
@@ -3434,7 +3462,7 @@ struct Engine {
         both([&](int c) {
             Card& K = cards[c];
             CK(cudaSetDevice(K.dev));
-            CK(cudaMemcpyAsync(K.stsnap, K.stbuf, (size_t) NSLOT * SLOTST * 4, cudaMemcpyDeviceToDevice, K.st));
+            CK(cudaMemcpyAsync(K.stsnap, K.stbuf, (size_t) active_slots * SLOTST * 4, cudaMemcpyDeviceToDevice, K.st));
             CK(cudaStreamSynchronize(K.st));
         });
         snap_n = n_past;
@@ -3444,7 +3472,7 @@ struct Engine {
         both([&](int c) {
             Card& K = cards[c];
             CK(cudaSetDevice(K.dev));
-            CK(cudaMemcpyAsync(K.stbuf, K.stsnap, (size_t) NSLOT * SLOTST * 4, cudaMemcpyDeviceToDevice, K.st));
+            CK(cudaMemcpyAsync(K.stbuf, K.stsnap, (size_t) active_slots * SLOTST * 4, cudaMemcpyDeviceToDevice, K.st));
             CK(cudaStreamSynchronize(K.st));
         });
         n_past = snap_n;
@@ -3454,8 +3482,8 @@ struct Engine {
     // p21: the checkpoints
     bool win_slot(int s) const { return !cards[0].L[s < NPHYS ? s : LS + (s - NPHYS) % NCORE].full; }
     size_t ck_bytes() const {
-        size_t b = (size_t) NSLOT * SLOTST * 4;
-        for (int s = 0; s < NSLOT; ++s)
+        size_t b = (size_t) active_slots * SLOTST * 4;
+        for (int s = 0; s < active_slots; ++s)
             if (win_slot(s)) b += (size_t) 2 * SWA * KVC * 2;
         if (ds_on && ds_ring) b += (size_t) (2 * DS_TAIL + DS_WIN1) * NKVD * 2 * 2;
         if (d2_on) b += (size_t) D2L * 2 * D2WIN * NKVD * 2;   // p74
@@ -3477,9 +3505,9 @@ struct Engine {
             }
             h += (size_t) W * rb;
         };
-        mv(K.stbuf, h, (size_t) NSLOT * SLOTST * 4);
-        h += (size_t) NSLOT * SLOTST * 4;
-        for (int s = 0; s < NSLOT; ++s)
+        mv(K.stbuf, h, (size_t) active_slots * SLOTST * 4);
+        h += (size_t) active_slots * SLOTST * 4;
+        for (int s = 0; s < active_slots; ++s)
             if (win_slot(s)) {
                 rows(K.kc[s], SWA, RING, (size_t) KVC * 2);
                 rows(K.vc[s], SWA, RING, (size_t) KVC * 2);
@@ -3576,7 +3604,7 @@ struct Engine {
     std::vector<KvArr> kv_arrays(int c) {
         Card& K = cards[c];
         std::vector<KvArr> a;
-        for (int s = 0; s < NSLOT; ++s) {
+        for (int s = 0; s < active_slots; ++s) {
             if (win_slot(s)) continue;
             const KV8& q = K.q8[s];
             const int fk = q.k ? q.f0 : ctx, fv = q.v ? q.f0 : ctx;
@@ -3694,24 +3722,26 @@ struct Engine {
         both([&](int c) {
             Card& K = cards[c];
             CK(cudaSetDevice(K.dev));
-            CK(cudaMemsetAsync(K.stbuf, 0, (size_t) NSLOT * SLOTST * 4, K.st));
+            CK(cudaMemsetAsync(K.stbuf, 0, (size_t) active_slots * SLOTST * 4, K.st));
             CK(cudaStreamSynchronize(K.st));
         });
     }
     // p5a: tokens win[0..T) through the writing path with every row's logits; win[0] is the pending token, win[1..] drafts. Returns
     // how many drafts were right (row i's argmax == win[i + 1]); the caches then hold win[0..keep] (keep = right + 1) and the
     // convolutions' states are set back to that point. out_next = the argmax after the last kept token
-    int verify(const int* win, int T, int& out_next) {
+    template<class KeepDraft>
+    int verify(const int* win, int T, int& out_next, TokenPicker& picker, KeepDraft&& keep_draft) {
         both([&](int c) {
             Card& K = cards[c];
             CK(cudaSetDevice(K.dev));
-            CK(cudaMemcpyAsync(K.stbak, K.stbuf, (size_t) NSLOT * SLOTST * 4, cudaMemcpyDeviceToDevice, K.st));
+            CK(cudaMemcpyAsync(K.stbak, K.stbuf, (size_t) active_slots * SLOTST * 4, cudaMemcpyDeviceToDevice, K.st));
             K.keep_hist = true;
         });
         feed(win, T, true);
-        int right = 0;
-        while (right + 1 < T && amax_row(right) == win[right + 1]) ++right;
-        out_next = amax_row(right);
+        const size_t before = processed.size() - T;
+        const int right = sample_draft_prefix(win, T, out_next, [&](int row) {
+            return picker.rng ? picker.pick(h_logits + (size_t) row * NV, processed, before + row + 1) : amax_row(row);
+        }, keep_draft);
         const int keep = right + 1;
         if (ds_on && !dev_amax)   // p6: the drafter's context is the last kept row's f_rnn (the rejected rows' caches are rewritten later)
             both([&](int c) {
@@ -3727,7 +3757,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(K.D.ctxv, K.D.frnn + (size_t) right * N, N * 4, cudaMemcpyDeviceToDevice, K.st));
             K.keep_hist = false;
             if (keep < T) {
-                const size_t n = (size_t) NSLOT * SLOTST;
+                const size_t n = (size_t) active_slots * SLOTST;
                 k_conv_roll<<<(unsigned) ((n + 255) / 256), 256, 0, K.st>>>(K.stbuf, K.stbak, K.hist, keep);
             }
             CK(cudaStreamSynchronize(K.st));
@@ -3819,6 +3849,7 @@ static long long json_int(const std::string& j, const std::string& key, long lon
 
 struct Gen {
     std::vector<int> out;
+    bool loop_stop = false;
     int cached = 0, drafted = 0, accepted = 0, rounds = 0;
     double read_s = 0, write_s = 0, draft_s = 0, verify_s = 0;   // p6: time in the drafter and in the target's windows
     int park = 0;    // p21b: the request started from a parked conversation
@@ -3826,30 +3857,6 @@ struct Gen {
     double ck_s = 0;
     unsigned long long lh = 0, lh2 = 1469598103934665603ULL;   // p22b: lh2 over every step's logits (g_lhall)
 };
-// p5a: draft tokens from the history: the latest earlier place where the last 3 tokens (then 2) occurred, and what followed it
-// p7: the longest suffix of the history (3..NG_MAX tokens) that occurred before, at its most recent place, and the tokens that
-// followed it there (p5a took the latest 3-token match: in code that is often a common trigram elsewhere). *len = match length
-static constexpr int NG_MAX = 16;
-static std::vector<int> ngram_draft(const std::vector<int>& h, int D, int* len = nullptr) {
-    std::vector<int> d;
-    if (len) *len = 0;
-    const int n = (int) h.size();
-    if (D <= 0 || n < 4) return d;
-    int best = 0, at = -1;
-    for (int p = n - 2; p >= 0 && best < NG_MAX; --p) {
-        if (h[p] != h[n - 1]) continue;
-        int l = 1;
-        while (l < NG_MAX && p - l >= 0 && h[p - l] == h[n - 1 - l]) ++l;
-        if (l > best) {
-            best = l;
-            at = p;
-        }
-    }
-    if (best < 3) return d;
-    if (len) *len = best;
-    for (int i = at + 1; i < n && (int) d.size() < D && h[i] < NVU; ++i) d.push_back(h[i]);   // p17: not image rows
-    return d;
-}
 // p15: on_out(new tokens) after each step when given (the server streams them); false stops the generation (the client left)
 static bool g_lhall = false;   // p22b (tests): hash the logits of every step
 static unsigned long long fnv_row(unsigned long long h, const float* row) {
@@ -3859,7 +3866,7 @@ static unsigned long long fnv_row(unsigned long long h, const float* row) {
 }
 static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::vector<int>& stop, int eos, int lookup = 0, int mtp = 0,
                     const std::function<bool(const int*, int)>* on_out = nullptr, const std::vector<int>* hints = nullptr,
-                    const std::function<bool()>* cancelled = nullptr) {
+                    const std::function<bool()>* cancelled = nullptr, SampleOpts sampling = {}, bool repetition_guard = false) {
     Gen g;
     e.want_logits = true;   // p47
     size_t sent = 0;
@@ -3960,8 +3967,10 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         g.lh = h;
     }
     const double t1 = now_s();
-    int next = e.row_raw ? e.sample_row(e.h_logits, e.n_past) : Engine::argmax(e.h_logits);   // p76: the reading path's raw row
-    e.want_logits = !e.dev_amax || g_lhall;   // p47
+    TokenPicker picker(sampling, n);
+    int next = picker.rng ? picker.pick(e.h_logits, e.processed, e.processed.size()) :
+               e.row_raw ? e.sample_row(e.h_logits, e.n_past) : Engine::argmax(e.h_logits);   // p76: the reading path's raw row
+    e.want_logits = !e.dev_amax || g_lhall || picker.rng.has_value();   // p47
     auto ends = [&](int t) { return t == eos || std::find(stop.begin(), stop.end(), t) != stop.end(); };
     int dcur = std::min(lookup, 4), cool = 0;   // p5a: the draft length follows the last window; after a miss no drafts for a while
     static const int ng_min = getenv("INK2_NG_MIN") ? atoi(getenv("INK2_NG_MIN")) : 6;   // p7: n-gram match that beats the drafter
@@ -3969,13 +3978,17 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         g.out.push_back(next);
         if (!flush()) break;
         if (ends(next) || (int) g.out.size() >= max || e.n_past >= e.ctx) break;
+        if (repetition_guard && scream::inkling::detect_repetition_loop(g.out)) {
+            g.loop_stop = true;
+            break;
+        }
         std::vector<int> hist = e.processed;
         hist.push_back(next);
         std::vector<int> d;
         if (lookup > 0) {   // n-grams first (p6d: with mtp too, where the history has a match; p7: with mtp only a match of ng_min)
             int ml = 0;
             if (cool > 0) --cool;
-            else d = ngram_draft(hist, std::min(dcur, std::min(MAXT - 1, max - (int) g.out.size())), &ml);
+            else d = scream::inkling::prompt_lookup(hist, std::min({dcur, MAXT - 1, max - (int) g.out.size()}), NVU, &ml);
             if (mtp > 0 && ml < ng_min) d.clear();
         }
         bool mtpd = false;
@@ -3989,7 +4002,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         if ((int) d.size() > e.ctx - e.n_past - 1) d.resize(std::max(0, e.ctx - e.n_past - 1));
         if (d.empty()) {
             e.feed(&next, 1, false);
-            next = e.amax_row(0);   // p47 (= Engine::argmax(e.h_logits) without INK2_AMAX)
+            next = picker.rng ? picker.pick(e.h_logits, e.processed, e.processed.size()) : e.amax_row(0);   // p47 (= Engine::argmax(e.h_logits) without INK2_AMAX)
             if (g_lhall) g.lh2 = fnv_row(g.lh2, e.h_logits);
             continue;
         }
@@ -3997,7 +4010,9 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         win.insert(win.end(), d.begin(), d.end());
         int nn = 0;
         const double tv = now_s();
-        const int right = e.verify(win.data(), (int) win.size(), nn);
+        const int right = e.verify(win.data(), (int) win.size(), nn, picker, [&](int count) {
+            return !repetition_guard || !scream::inkling::detect_repetition_loop(g.out, d.data(), count);
+        });
         if (g_lhall)
             for (int i = 0; i <= right; ++i) g.lh2 = fnv_row(g.lh2, e.h_logits + (size_t) i * NV);
         g.verify_s += now_s() - tv;
@@ -4037,7 +4052,8 @@ static bool peer_gone(int fd) {
     return poll(&peer, 1, 0) > 0 && (peer.revents & (POLLHUP | POLLERR | POLLNVAL));
 }
 
-static int serve(Engine& e, const std::string& path, int eos) {
+static int serve(Engine& e, const std::string& path, int eos, bool shared_sampler,
+                 const SampleOpts& default_sampling, bool repetition_guard) {
     const int s = socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un a{};
     a.sun_family = AF_UNIX;
@@ -4136,7 +4152,7 @@ static int serve(Engine& e, const std::string& path, int eos) {
             }
             g_lhall = json_int(req, "lhall", 0) != 0;
             {   // p36: sampling (temp_milli 0 = greedy)
-                const long long tm = json_int(req, "temp_milli", 0);
+                const long long tm = shared_sampler ? 0 : json_int(req, "temp_milli", 0);
                 e.s_invT = tm > 0 ? 1000.0f / (float) tm : 0.0f;
                 e.s_seed = (unsigned long long) json_int(req, "seed", 0);
                 const long long mp = json_int(req, "minp_milli", 0);   // p76
@@ -4144,17 +4160,19 @@ static int serve(Engine& e, const std::string& path, int eos) {
             }
             std::vector<int> hints;   // p21: where the prompt's messages start
             for (long long x : json_ints(req, "ckpt")) hints.push_back((int) x);
+            const std::string fields = shared_sampler ? json_str(req, "sampling") : "";
+            const SampleOpts sampling = fields.empty() ? default_sampling : parse_sampling_fields(fields, 64);
             Gen g = generate(e, tok, max, stop, json_int(req, "noeos", 0) ? -1 : eos, (int) json_int(req, "lookup", 0),
-                             (int) json_int(req, "mtp", 0), streaming ? &out_line : nullptr, &hints, &cancelled);   // noeos: a fixed length
+                             (int) json_int(req, "mtp", 0), streaming ? &out_line : nullptr, &hints, &cancelled, sampling, repetition_guard);
             rep = "{\"tokens\": [";
             for (size_t i = 0; i < g.out.size(); ++i) rep += (i ? ", " : "") + std::to_string(g.out[i]);
             char hd[640];
             std::snprintf(hd, sizeof hd,
                           "], \"prompt_n\": %zu, \"cached\": %d, \"read_s\": %.4f, \"write_s\": %.4f, \"drafted\": %d, \"accepted\": %d, "
                           "\"rounds\": %d, \"draft_s\": %.4f, \"verify_s\": %.4f, \"back\": %d, \"ckpts\": %zu, \"ck_s\": %.4f, "
-                          "\"park\": %d, \"parks\": %zu, \"park_mb\": %zu, \"lh\": \"%016llx\", \"lh2\": \"%016llx\"}\n",
+                          "\"park\": %d, \"parks\": %zu, \"park_mb\": %zu, \"lh\": \"%016llx\", \"lh2\": \"%016llx\"%s}\n",
                           tok.size(), g.cached, g.read_s, g.write_s, g.drafted, g.accepted, g.rounds, g.draft_s, g.verify_s, g.back,
-                          e.ckpts.size(), g.ck_s, g.park, e.parks.size(), e.park_bytes >> 20, g.lh, g.lh2);
+                          e.ckpts.size(), g.ck_s, g.park, e.parks.size(), e.park_bytes >> 20, g.lh, g.lh2, g.loop_stop ? ", \"loop_stop\": true" : "");
             rep += hd;
         } catch (const PrefillCancelled&) {
             // DFlash retains only the drafter rows close to the planned end of prefill.
@@ -4177,14 +4195,17 @@ static int serve(Engine& e, const std::string& path, int eos) {
 
 }  // namespace ink2
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     using namespace ink2;
     setenv("CUDA_MODULE_LOADING", "EAGER", 1);
     if (getenv("INK2_RTRACE")) g_rtrace = std::fopen(getenv("INK2_RTRACE"), "a");   // p31
     signal(SIGPIPE, SIG_IGN);   // p15: a client that left makes write() fail instead of ending the server   // lazy loading can sync a context on a kernel's first launch (a cross-card wait deadlocks)
     std::string model, tokens, dump, sock, logits_out, mtp;   // --mtp F: the DSpark drafter (dspark-Inkling-2-Mini-Q8_0.gguf)   // --logits F: the last row's logits after the prompt (logiti.bin format)
-    int gen = 0, ctx = 32768;
-    bool logits_all = false;
+    std::optional<std::string> sampling_fields;
+    int gen = 0, ctx = 32768, num_passes = NPASS;
+    bool logits_all = false, repetition_guard = false;
+    const char* sampler_env = std::getenv("INK2_STRATA_SAMPLER");
+    bool shared_sampler = sampler_env && std::strcmp(sampler_env, "1") == 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto nx = [&]() -> std::string {
@@ -4196,6 +4217,30 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::stoi(nx());
         else if (a == "--dump") dump = nx();
         else if (a == "--ctx") ctx = std::stoi(nx());
+        else if (a == "--sampler") {
+            const auto value = nx();
+            if (value != "native" && value != "strata-inkling") {
+                throw std::runtime_error("--sampler must be native or strata-inkling");
+            }
+            shared_sampler = value == "strata-inkling";
+        } else if (a == "--sampling") sampling_fields = nx();
+        else if (a == "--repetition-guard") {
+            const auto value = nx();
+            if (value != "on" && value != "off") throw std::runtime_error("--repetition-guard requires on or off");
+            repetition_guard = value == "on";
+        }
+        else if (a == "--num-passes") {
+            const auto value = nx();
+            size_t parsed = 0;
+            try {
+                num_passes = std::stoi(value, &parsed);
+            } catch (const std::logic_error&) {
+                num_passes = 0;
+            }
+            if (parsed != value.size() || num_passes < 1 || num_passes > NPASS) {
+                throw std::runtime_error("--num-passes must be between 1 and " + std::to_string(NPASS));
+            }
+        }
         else if (a == "--serve") sock = nx();
         else if (a == "--logits") logits_out = nx();
         else if (a == "--logits-all") { logits_out = nx(); logits_all = true; }   // every row of the last window (writing path)
@@ -4203,10 +4248,20 @@ int main(int argc, char** argv) {
         else if (a == "--draft-vocab") g_draft_vocab = nx();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
-    if (model.empty()) { std::fprintf(stderr, "usage: ink2_v1 --model M.gguf (--tokens zetoni.bin [--gen N] [--dump DIR] | --serve SOCK) [--ctx C]\n"); return 1; }
-    Engine e(model, ctx, mtp);
+    if (sampling_fields && !shared_sampler) throw std::runtime_error("--sampling requires --sampler strata-inkling");
+    const SampleOpts default_sampling = sampling_fields ? parse_sampling_fields(*sampling_fields, 64) : SampleOpts{};
+    if (model.empty()) {
+        std::fprintf(stderr, "usage: ink2_v1 --model M.gguf (--tokens zetoni.bin [--gen N] [--dump DIR] | --serve SOCK)\n"
+                             "              [--ctx C] [--num-passes N] [--sampler native|strata-inkling] [--sampling FIELDS]\n"
+                             "              [--repetition-guard on|off]\n");
+        return 1;
+    }
+    if (num_passes != NPASS && (!mtp.empty() || !dump.empty())) {
+        throw std::runtime_error("reduced pass counts require disabling the model drafter and layer dumps");
+    }
+    Engine e(model, ctx, mtp, num_passes);
     const int eos = (int) e.g.i("tokenizer.ggml.eos_token_id");
-    if (!sock.empty()) return serve(e, sock, eos);
+    if (!sock.empty()) return serve(e, sock, eos, shared_sampler, default_sampling, repetition_guard);
     FILE* f = std::fopen(tokens.c_str(), "rb");
     if (!f) { std::fprintf(stderr, "cannot read %s\n", tokens.c_str()); return 1; }
     int32_t n = 0;
@@ -4225,7 +4280,7 @@ int main(int argc, char** argv) {
     const double t1 = now_s();
     std::printf("poziv %d zetonov v %.3f s (%.1f tok/s)\n", n, t1 - t0, n / (t1 - t0));
     if (!dump.empty()) {
-        for (int s = 0; s < NSLOT; ++s) {
+        for (int s = 0; s < e.active_slots; ++s) {
             write_dump(dump + "/l_out-" + std::to_string(s) + ".bin", e.d_lout[s], N);
             write_dump(dump + "/attn_out-" + std::to_string(s) + ".bin", e.d_aout[s], N);
             write_dump(dump + "/ffn_out-" + std::to_string(s) + ".bin", e.d_fout[s], N);
@@ -4248,14 +4303,19 @@ int main(int argc, char** argv) {
         for (int r = logits_all ? 0 : nr - 1; r < nr; ++r) std::fwrite(e.h_logits + (size_t) r * NV, 4, NVU, lf);
         std::fclose(lf);
     }
-    int next = Engine::argmax(e.h_logits + (size_t) (nr - 1) * NV);
+    TokenPicker picker(default_sampling, n);
+    auto pick = [&](float* logits) {
+        return picker.rng ? picker.pick(logits, e.processed, e.processed.size()) : Engine::argmax(logits);
+    };
+    int next = pick(e.h_logits + (size_t) (nr - 1) * NV);
     std::printf("prvi %d\n", next);
     if (gen > 0) {
         std::vector<int> out{next};
         const double t2 = now_s();
         for (int i = 1; i < gen && next != eos; ++i) {
             e.feed(&next, 1, false);
-            next = Engine::argmax(e.h_logits);
+            if (repetition_guard && scream::inkling::detect_repetition_loop(out)) break;
+            next = pick(e.h_logits);
             out.push_back(next);
         }
         const double t3 = now_s();
@@ -4264,4 +4324,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
     return 0;
+} catch (const std::exception& ex) {
+    std::fprintf(stderr, "ink2_v1: %s\n", ex.what());
+    return 2;
 }

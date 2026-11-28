@@ -55,6 +55,9 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ink2_sampling import SAMPLING_ALIASES, SAMPLING_BASE, sampling_fields, sampling_values
+from inkling_tool_stream import CanonicalToolStream
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, required=True)
 ap.add_argument("--host", default="127.0.0.1")
@@ -593,6 +596,20 @@ def place_images(ids, images, starts, work, check):
     return out, {"img": table, "embd": str(combined)}
 
 
+STRATA_SAMPLER = os.environ.get("INK2_STRATA_SAMPLER") == "1"
+SAMPLING_DEFAULTS = SAMPLING_BASE.copy()
+if STRATA_SAMPLER:
+    try:
+        configured = json.loads(os.environ.get("INK2_SAMPLING_DEFAULTS", "{}"))
+        if not isinstance(configured, dict):
+            raise ValueError("sampling defaults must be a JSON object")
+        unknown = configured.keys() - SAMPLING_BASE.keys() - SAMPLING_ALIASES.keys()
+        if unknown:
+            raise ValueError(f"unknown sampling default {min(unknown)}")
+        SAMPLING_DEFAULTS.update(sampling_values(configured))
+    except ValueError as ex:
+        ap.error(str(ex))
+
 SAMPLING = int(os.environ.get("INK2_SAMPLING", "0"))   # p76: 1 = the request's temperature / min_p / seed (0: greedy)
 MIN_P = float(os.environ.get("INK2_MIN_P", "0.05"))     # p76: a sampled request's min-p when it names none
 
@@ -698,60 +715,8 @@ def read_fit(cached, total, read_s):
         STATE["read_scale"] = 0.5 * STATE["read_scale"] + 0.5 * min(max(1000 * read_s / model, 0.25), 8.0)
 
 
-TOOL_HEAD = re.compile(rb'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"args"\s*:\s*(?=\{)')
-
-
-def invalid_json_constant(value):
-    raise ValueError(f"{value} is not a JSON constant")
-
-
 class ToolOutputLimit(ValueError):
     pass
-
-
-class ToolArguments:
-    """Stream the object in a canonical tool envelope, holding its last brace until validation."""
-
-    def __init__(self, name):
-        self.name = name
-        self.decoder = codecs.getincrementaldecoder("utf-8")()
-        self.depth = 0
-        self.quoted = self.escaped = False
-        self.closed = self.started = False
-        self.pending = []
-        self.size = 0
-
-    def feed(self, data, out):
-        if self.closed:
-            return
-        text = self.decoder.decode(data)
-        end = len(text)
-        for i, char in enumerate(text):
-            if self.escaped:
-                self.escaped = False
-            elif self.quoted:
-                if char == "\\":
-                    self.escaped = True
-                elif char == '"':
-                    self.quoted = False
-            elif char == '"':
-                self.quoted = True
-            elif char == "{":
-                self.depth += 1
-            elif char == "}":
-                self.depth -= 1
-                if self.depth == 0:
-                    self.closed, end = True, i
-                    break
-        fragment = text[:end]
-        if fragment:
-            self.pending.append(fragment)
-            self.size += len(fragment)
-        if self.size >= 256:
-            out.append(("tool_args", {"name": self.name, "arguments": "".join(self.pending)}))
-            self.pending.clear()
-            self.size = 0
-            self.started = True
 
 
 class Parts:
@@ -766,6 +731,7 @@ class Parts:
         self.tool = bytearray()
         self.stream_names = stream_names
         self.arguments = None
+        self.tool_decoder = None
 
     def require_closed_tool(self, token_limit=False):
         if self.arguments and self.arguments.started:
@@ -787,50 +753,34 @@ class Parts:
         self.tool.clear()
         self.arguments = None
         if args and args.started:
-            # A second root key could replace the name or arguments already published.
-            # Require one object followed directly by the outer closing brace.
-            raw = payload.decode("utf-8")
-            value = json.loads(raw, parse_constant=invalid_json_constant)
-            body = payload[TOOL_HEAD.match(payload).end():].decode("utf-8")
-            _, end = json.JSONDecoder().raw_decode(body)
-            if not args.closed or value["name"] != args.name or body[end:].strip() != "}":
-                raise ValueError("invalid streamed tool envelope")
-            out.append(("tool_end", "".join(args.pending) + "}"))
+            self.tool_decoder.decode(b"", final=True)
+            suffix, _ = args.finish()
+            out.append(("tool_end", suffix))
             return
         raw = payload.decode("utf-8", errors="replace")
         try:
             d = json.loads(raw)
             out.append(("tool", {"name": d["name"], "arguments": json.dumps(d.get("args") or {}, ensure_ascii=False)}))
         except (ValueError, KeyError, TypeError):
-            lc = loose_call(raw)   # p37
-            if lc:
-                out.append(("tool", {"name": lc[0], "arguments": json.dumps(lc[1], ensure_ascii=False)}))
+            call = loose_call(raw)
+            if call:
+                out.append(("tool", {"name": call[0], "arguments": json.dumps(call[1], ensure_ascii=False)}))
             else:
-                out.append(("c", raw))   # not a call after all: keep its text
+                out.append(("c", raw))
 
     def _tool_token(self, data, out):
         self.tool.extend(data)
-        if not self.stream_names:
-            return
         if self.arguments is None:
-            if len(self.tool) > 4096:
-                return
-            head = TOOL_HEAD.match(self.tool)
-            if not head:
-                return
-            try:
-                name = json.loads(head[1])
-            except ValueError:
-                return
-            if name not in self.stream_names:
-                return
-            self.arguments = ToolArguments(name)
-            data = self.tool[head.end():]
+            return
         try:
-            self.arguments.feed(data, out)
+            text = self.tool_decoder.decode(data)
         except UnicodeDecodeError:
             self.require_closed_tool()
             self.arguments = None
+            return
+        fragment = self.arguments.feed(text)
+        if fragment:
+            out.append(("tool_args", {"name": self.arguments.name, "arguments": fragment}))
 
     def feed(self, ids):
         out = []
@@ -844,6 +794,9 @@ class Parts:
             elif i == T_TOOL:
                 self._switch(out, "tool")
                 self.tool = bytearray()
+                if self.stream_names:
+                    self.arguments = CanonicalToolStream(self.stream_names)
+                    self.tool_decoder = codecs.getincrementaldecoder("utf-8")()
             elif i == T_END:
                 if self.mode == "tool":
                     self._tool_done(out)
@@ -1180,6 +1133,8 @@ def reply(ids, mx, req, service, on_part=None, mode="c", stream_names=(), budget
                     out += note
                     parts, guard, r_n = Parts(stream_names), Loop(), 0
                     continue
+            if final.get("loop_stop") is True:
+                return shown(True, LOOP_END)
             return shown(False)
         if bud:   # p75: the reasoning over its budget, closed at a sentence end; not a loop cut
             bud = False
@@ -1363,7 +1318,8 @@ class H(BaseHTTPRequestHandler):
         if path == "/health":
             return self._send(200, {"status": "ok"})
         if path == "/props":
-            return self._send(200, {"default_generation_settings": {"n_ctx": A.ctx, "params": {"temperature": 0.0}}, "total_slots": 1,
+            params = SAMPLING_DEFAULTS if STRATA_SAMPLER else {"temperature": 0.0}
+            return self._send(200, {"default_generation_settings": {"n_ctx": A.ctx, "params": params}, "total_slots": 1,
                                     "model_path": A.model, "model_alias": A.alias, "chat_template": TEMPLATE, "build_info": "ink2_v1",
                                     "modalities": {"vision": bool(A.mmproj and A.vis), "audio": False}})
         if path == "/slots":
@@ -1424,7 +1380,12 @@ class H(BaseHTTPRequestHandler):
             mtp, lookup = int(body.get("mtp", MTP)), int(body.get("lookup", LOOKUP))
         except (TypeError, ValueError, OverflowError):
             return self._send(400, {"error": {"message": "invalid generation settings"}})
-        settings = (mx, mtp, lookup)
+        try:
+            sampling = ({"sampling": sampling_fields({**SAMPLING_DEFAULTS, **sampling_values(body)})} if STRATA_SAMPLER
+                        else sampling_of(body))
+        except ValueError as ex:
+            return self._send(400, {"error": {"message": str(ex), "type": "invalid_request_error"}})
+        settings = (mx, mtp, lookup, sampling)
         if not images:
             return self._complete_chat(body, ids, starts, {}, stream_names, t0, t_tok, settings)
         if not A.vis:
@@ -1474,7 +1435,7 @@ class H(BaseHTTPRequestHandler):
             VISION_SLOTS.release()
 
     def _complete_chat(self, body, ids, starts, img_req, stream_names, t0, t_tok, settings, stream=None):
-        mx, mtp, lookup = settings
+        mx, mtp, lookup, sampling = settings
         tools = body.get("tools") if body.get("tool_choice") != "none" else None
         loop, n_ids = turn_loop(body.get("messages") or []) if tools else None, len(ids)
         if loop:
@@ -1500,7 +1461,7 @@ class H(BaseHTTPRequestHandler):
                 return
             return self._send(400, error)
         mx = max(1, min(mx or A.ctx, A.ctx - len(ids) - 1))
-        req = {"stop": [EOS], "mtp": mtp, "lookup": lookup, **img_req, **sampling_of(body),
+        req = {"stop": [EOS], "mtp": mtp, "lookup": lookup, **img_req, **sampling,
                "ckpt": [x for x in starts if x < n_ids - 8][-4096:]}
         if loop and LOOP_DROP:
             stream_names.difference_update(name for name, _ in loop[1])
