@@ -198,7 +198,7 @@
     "num_passes": {
       "kind": "setting",
       "summary": "Select the number of times the looped layers are visited.",
-      "values": "Positive integer or null (default, trained count). Flash-Next takes one pass. Inkling is capped at its trained count. Reduced Inkling counts require disabling the DSpark drafter and, for Megla, layer dumps.",
+      "values": "Positive integer or null (default, trained count). Flash-Next takes one pass. Inkling is capped at its trained count. Reduced Inkling counts require disabling model drafters and, for Megla, layer dumps.",
       "related": [
         "backend",
         "engine_options.draft",

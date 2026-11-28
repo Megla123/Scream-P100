@@ -290,7 +290,7 @@ Select the number of times the looped layers are visited.
 - **JSON paths** `settings.num_passes, profiles.<profile>.settings.num_passes`
 - **Command line** `--num-passes VALUE`
 - **Environment** `SP100_NUM_PASSES`
-- **Valid values** Positive integer or null (default, trained count). Flash-Next takes one pass. Inkling is capped at its trained count. Reduced Inkling counts require disabling the DSpark drafter and, for Megla, layer dumps.
+- **Valid values** Positive integer or null (default, trained count). Flash-Next takes one pass. Inkling is capped at its trained count. Reduced Inkling counts require disabling model drafters and, for Megla, layer dumps.
 - **Legacy names and notes** SCREAM_NUM_PASSES
 - **Related settings** `backend, engine_options.draft, engine_options.mtp`
 
